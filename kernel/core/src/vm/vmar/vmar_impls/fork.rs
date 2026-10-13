@@ -22,7 +22,12 @@ impl Vmar {
         let new_vmar = VmarHandle::new(ProcessVm::fork_from(&vmar.process_vm, &heap_guard));
 
         {
-            let inner = vmar.inner.read();
+            // Hold the write lock to block page faults in the parent until the fork completes.
+            // Otherwise, a COW fault on an already-copied mapping would freeze that mapping's
+            // content in the child while later mappings keep changing, so the child would see an
+            // inconsistent snapshot of memory. Linux holds `mmap_write_lock` in `dup_mmap` for
+            // the same reason.
+            let inner = vmar.inner.write();
             let mut new_inner = new_vmar.inner.write();
 
             let mut rss_delta = RssDelta::new(&new_vmar);
