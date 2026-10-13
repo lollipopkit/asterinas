@@ -676,11 +676,12 @@ impl Socket for StreamSocket {
             warn!("unsupported flags: {:?}", flags);
         }
 
-        let (received_bytes, _) = self.block_on_unless(
-            flags.contains(RecvFlags::MSG_DONTWAIT),
-            IoEvents::IN,
+        let (received_bytes, ()) = self.recv_stream(
+            writer,
+            flags,
             self.timeouts.recv_timeout(),
-            || self.try_recv(writer, flags),
+            |writer| self.try_recv(writer, flags).map(|(len, _)| (len, ())),
+            |()| false,
         )?;
 
         // TODO: Receive control message

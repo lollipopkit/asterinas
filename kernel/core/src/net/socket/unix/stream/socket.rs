@@ -528,13 +528,33 @@ impl Socket for UnixStreamSocket {
             warn!("unsupported flags: {:?}", flags);
         }
 
-        let (output, control_messages) = self.block_on_unless(
-            flags.contains(RecvFlags::MSG_DONTWAIT),
-            IoEvents::IN,
+        // Like Linux, `MSG_WAITALL` is ignored for `SOCK_SEQPACKET` sockets.
+        let flags = if self.is_seqpacket() {
+            flags - RecvFlags::MSG_WAITALL
+        } else {
+            flags
+        };
+
+        // Like Linux, stop receiving more data once any control message is received.
+        //
+        // TODO: Linux continues to receive data from the same writer if only credentials are
+        // received (e.g., `SO_PASSCRED` is enabled).
+        let (len, (output, control_messages)) = self.recv_stream(
+            writer,
+            flags,
             self.timeouts.recv_timeout(),
-            || self.try_recv(writer, flags),
+            |writer| {
+                self.try_recv(writer, flags)
+                    .map(|(output, control_messages)| (output.len(), (output, control_messages)))
+            },
+            |(_, control_messages)| !control_messages.is_empty(),
         )?;
 
+        let output = if len == output.len() {
+            output
+        } else {
+            RecvOutput::new_for_stream(len)
+        };
         let message_header = MessageHeader::new(None, control_messages);
 
         Ok((output, message_header))
