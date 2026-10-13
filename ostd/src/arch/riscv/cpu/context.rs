@@ -206,6 +206,14 @@ impl UserContextApiInternal for UserContext {
                 Trap::Interrupt(interrupt) => {
                     handle_irq(&self.as_trap_frame(), interrupt, PrivilegeLevel::User);
                     crate::arch::irq::enable_local();
+                    // The CPU was interrupted in user mode, so it has passed a quiescent state.
+                    // Report it here. Otherwise, a CPU that keeps running a user task without
+                    // switching tasks would block grace periods forever.
+                    //
+                    // SAFETY: The CPU is not executing in an RCU read-side critical section.
+                    unsafe {
+                        crate::sync::finish_grace_period();
+                    }
                 }
                 Trap::Exception(Exception::UserEnvCall) => {
                     crate::arch::irq::enable_local();
