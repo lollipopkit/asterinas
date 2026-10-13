@@ -29,4 +29,8 @@ impl Signal for FaultSignal {
         info.set_si_addr(self.addr.unwrap_or_default() as Vaddr);
         info
     }
+
+    fn is_forced(&self) -> bool {
+        true
+    }
 }

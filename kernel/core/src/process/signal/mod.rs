@@ -181,10 +181,13 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                 do_exit_group(TermStatus::Killed(SIGSEGV), ctx, user_ctx);
             }
         }
-        SigAction::Dfl if ctx.process.is_init_process() => {
+        SigAction::Dfl if ctx.process.is_init_process() && !signal.is_forced() => {
             // From Linux man pages "kill(2)":
             // "The only signals that can be sent to process ID 1, the init process, are those for
             // which init has explicitly installed signal handlers."
+            //
+            // Forced signals are exceptions. Otherwise, init would fault again forever.
+            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/signal.c#L1323>
         }
         SigAction::Dfl => {
             let sig_default_action = SigDefaultAction::from_signum(sig_num);
@@ -475,9 +478,16 @@ pub(crate) fn handle_user_signal(
     // Perform CPU architecture-dependent logic.
     cfg_select! {
         target_arch = "x86_64" => {
-            // Clear the DF flag. This is to conform to x86-64 calling conventions.
-            const X86_RFLAGS_DF: usize = 1 << 10; // Bit 10 is the DF flag.
-            user_ctx.set_rflags(user_ctx.rflags() & !X86_RFLAGS_DF);
+            // Clear the DF flag to conform to x86-64 calling conventions. Also clear the TF and
+            // RF flags so that the handler does not start with single-stepping enabled.
+            //
+            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/arch/x86/kernel/signal.c#L284>
+            const X86_RFLAGS_TF: usize = 1 << 8;
+            const X86_RFLAGS_DF: usize = 1 << 10;
+            const X86_RFLAGS_RF: usize = 1 << 16;
+            user_ctx.set_rflags(
+                user_ctx.rflags() & !(X86_RFLAGS_TF | X86_RFLAGS_DF | X86_RFLAGS_RF),
+            );
         }
         _ => {},
     }
