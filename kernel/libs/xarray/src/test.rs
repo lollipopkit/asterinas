@@ -3,10 +3,7 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use ostd::{
-    prelude::ktest,
-    task::{Task, disable_preempt},
-};
+use ostd::{prelude::ktest, sync::synchronize_rcu, task::disable_preempt};
 
 use super::*;
 
@@ -392,12 +389,6 @@ fn load_after_clear() {
 static TEST_LEAKAGE: AtomicBool = AtomicBool::new(false);
 static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-fn finish_grace_period() {
-    let task = || {};
-    let _ = ostd::task::TaskOptions::new(task).data(()).spawn();
-    Task::yield_now();
-}
-
 impl<P: NonNullPtr + Send + Sync> Drop for node::XNode<P> {
     fn drop(&mut self) {
         if TEST_LEAKAGE.load(Ordering::Relaxed) {
@@ -409,7 +400,7 @@ impl<P: NonNullPtr + Send + Sync> Drop for node::XNode<P> {
 #[ktest]
 fn no_leakage() {
     // Drop the nodes created by the previous tests.
-    finish_grace_period();
+    synchronize_rcu();
     DROP_COUNT.store(0, Ordering::Relaxed);
     TEST_LEAKAGE.store(true, Ordering::Relaxed);
 
@@ -418,7 +409,7 @@ fn no_leakage() {
     drop(xarray_arc);
 
     // Drop the nodes created in the test.
-    finish_grace_period();
+    synchronize_rcu();
     TEST_LEAKAGE.store(false, Ordering::Relaxed);
 
     let count = DROP_COUNT.load(Ordering::Relaxed);
@@ -432,7 +423,7 @@ fn no_leakage() {
 #[ktest]
 fn remove_shrinks_empty_nodes() {
     // Drop the nodes created by the previous tests.
-    finish_grace_period();
+    synchronize_rcu();
     DROP_COUNT.store(0, Ordering::Relaxed);
     TEST_LEAKAGE.store(true, Ordering::Relaxed);
 
@@ -445,7 +436,7 @@ fn remove_shrinks_empty_nodes() {
     assert!(xarray_arc.lock().remove(index).is_some());
 
     // Drop the nodes detached by the `remove` above.
-    finish_grace_period();
+    synchronize_rcu();
     TEST_LEAKAGE.store(false, Ordering::Relaxed);
 
     // All 3 nodes on the chain (root, interior, leaf) should have been

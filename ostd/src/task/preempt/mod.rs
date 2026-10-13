@@ -23,6 +23,16 @@ pub use self::guard::{DisabledPreemptGuard, disable_preempt};
 pub fn halt_cpu() {
     crate::task::atomic_mode::might_sleep();
 
+    // An idle CPU may halt repeatedly without switching tasks, so it must
+    // report its quiescent state here. Otherwise, grace periods would never
+    // end while the CPU stays idle.
+    //
+    // SAFETY: RCU read-side critical sections disable preemption. We have
+    // checked that preemption is enabled.
+    unsafe {
+        crate::sync::finish_grace_period();
+    }
+
     let irq_guard = crate::irq::disable_local();
 
     if cpu_local::need_preempt() {

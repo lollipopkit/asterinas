@@ -583,6 +583,14 @@ where
                 return;
             }
             ReschedAction::Retry => {
+                // The CPU may spin here for a long time if there are no other
+                // runnable tasks, so it must report its quiescent state here.
+                super::atomic_mode::might_sleep();
+                // SAFETY: RCU read-side critical sections disable preemption.
+                // We have checked that preemption is enabled.
+                unsafe {
+                    crate::sync::finish_grace_period();
+                }
                 continue;
             }
             ReschedAction::SwitchTo(next_task) => {
