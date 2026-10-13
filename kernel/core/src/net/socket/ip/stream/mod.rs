@@ -656,9 +656,12 @@ impl Socket for StreamSocket {
             warn!("sending control message is not supported");
         }
 
-        self.block_on(IoEvents::OUT, self.timeouts.send_timeout(), || {
-            self.try_send(reader, flags)
-        })
+        self.block_on_unless(
+            flags.contains(SendFlags::MSG_DONTWAIT),
+            IoEvents::OUT,
+            self.timeouts.send_timeout(),
+            || self.try_send(reader, flags),
+        )
 
         // TODO: Trigger `SIGPIPE` if the error code is `EPIPE` and `MSG_NOSIGNAL` is not specified
     }
@@ -673,10 +676,12 @@ impl Socket for StreamSocket {
             warn!("unsupported flags: {:?}", flags);
         }
 
-        let (received_bytes, _) =
-            self.block_on(IoEvents::IN, self.timeouts.recv_timeout(), || {
-                self.try_recv(writer, flags)
-            })?;
+        let (received_bytes, _) = self.block_on_unless(
+            flags.contains(RecvFlags::MSG_DONTWAIT),
+            IoEvents::IN,
+            self.timeouts.recv_timeout(),
+            || self.try_recv(writer, flags),
+        )?;
 
         // TODO: Receive control message
 
