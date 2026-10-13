@@ -446,6 +446,67 @@ FN_TEST(get_link_error)
 }
 END_TEST()
 
+FN_TEST(new_link_without_changes)
+{
+	int sock_fd;
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+	struct sockaddr_nl local;
+	socklen_t local_len = sizeof(local);
+	struct {
+		struct nlmsghdr hdr;
+		struct ifinfomsg ifi;
+	} req;
+
+	// Responses are sent before `send` returns, so the socket can be
+	// non-blocking.
+	sock_fd = TEST_SUCC(
+		socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE));
+	TEST_SUCC(bind(sock_fd, (struct sockaddr *)&sa, sizeof(sa)));
+	TEST_SUCC(getsockname(sock_fd, (struct sockaddr *)&local, &local_len));
+
+	// This is what `ip link set lo up` sends. The PID in the request header
+	// is not the port of the socket, but the response should be addressed
+	// to the port.
+	memset(&req, 0, sizeof(req));
+	req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	req.hdr.nlmsg_type = RTM_NEWLINK;
+	req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	req.hdr.nlmsg_seq = 1;
+	req.hdr.nlmsg_pid = local.nl_pid + 1;
+	req.ifi.ifi_family = AF_UNSPEC;
+	req.ifi.ifi_index = if_nametoindex(LOOPBACK_NAME);
+	req.ifi.ifi_flags = IFF_UP;
+	req.ifi.ifi_change = IFF_UP;
+
+#define TEST_ACK_SEGMENT(errno)                                            \
+	TEST_SUCC(send(sock_fd, &req, req.hdr.nlmsg_len, 0));              \
+	TEST_RES(recv(sock_fd, buffer, BUFFER_SIZE, 0),                    \
+		 ((struct nlmsghdr *)buffer)->nlmsg_type == NLMSG_ERROR && \
+			 ((struct nlmsghdr *)buffer)->nlmsg_pid ==         \
+				 local.nl_pid &&                           \
+			 ((struct nlmsgerr *)NLMSG_DATA(buffer))->error == \
+				 -errno);
+
+	TEST_ACK_SEGMENT(0);
+
+	// Without `NLM_F_ACK`, nothing is replied.
+	req.hdr.nlmsg_flags = NLM_F_REQUEST;
+	TEST_SUCC(send(sock_fd, &req, req.hdr.nlmsg_len, 0));
+	TEST_ERRNO(recv(sock_fd, buffer, BUFFER_SIZE, 0), EAGAIN);
+
+	// The link exists.
+	req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL;
+	TEST_ACK_SEGMENT(EEXIST);
+
+	// The link does not exist.
+	req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	req.ifi.ifi_index = 1234;
+	TEST_ACK_SEGMENT(ENODEV);
+
+	TEST_SUCC(close(sock_fd));
+}
+END_TEST()
+
 struct nl_req {
 	struct nlmsghdr hdr;
 	struct ifaddrmsg ifa;

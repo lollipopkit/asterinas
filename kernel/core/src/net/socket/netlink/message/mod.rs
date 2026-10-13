@@ -15,7 +15,7 @@ pub(super) use segment::{
     CSegmentType, SegmentBody,
     ack::{DoneSegment, ErrorSegment},
     common::SegmentCommon,
-    header::{CMsgSegHdr, GetRequestFlags, SegHdrCommonFlags},
+    header::{CMsgSegHdr, GetRequestFlags, NewRequestFlags, SegHdrCommonFlags},
 };
 
 use super::receiver::QueueableMessage;

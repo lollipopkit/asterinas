@@ -4,14 +4,20 @@
 
 use core::num::NonZero;
 
-use aster_bigtcp::{iface::InterfaceType, wire::EthernetAddress};
+use aster_bigtcp::{
+    iface::{InterfaceFlags, InterfaceType},
+    wire::EthernetAddress,
+};
 
 use super::util::finish_response;
 use crate::{
     net::{
         iface::{DEFAULT_TX_QUEUE_LEN, Iface, iter_all_ifaces},
         socket::netlink::{
-            message::{CMsgSegHdr, CSegmentType, GetRequestFlags, SegHdrCommonFlags},
+            message::{
+                CMsgSegHdr, CSegmentType, ErrorSegment, GetRequestFlags, NewRequestFlags,
+                SegHdrCommonFlags,
+            },
             route::message::{LinkAttr, LinkSegment, LinkSegmentBody, RtnlSegment},
         },
     },
@@ -46,6 +52,92 @@ pub(super) fn do_get_link(request_segment: &LinkSegment) -> Result<Vec<RtnlSegme
 
     Ok(response_segments)
 }
+
+/// Handles `RTM_NEWLINK`, which creates a link or modifies an existing link.
+///
+/// Neither creating links nor modifying link attributes is supported yet. However, a request that
+/// does not change anything (e.g., `ip link set lo up` when `lo` is already up) succeeds.
+pub(super) fn do_new_link(request_segment: &LinkSegment) -> Result<Vec<RtnlSegment>> {
+    let header = request_segment.header();
+    let body = request_segment.body();
+    let flags = NewRequestFlags::from_bits_truncate(header.flags);
+
+    let required_name = request_segment.attrs().iter().find_map(|attr| {
+        if let LinkAttr::Name(name) = attr {
+            Some(name.as_cstr())
+        } else {
+            None
+        }
+    });
+    // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/core/rtnetlink.c#L3909-L3926>.
+    let iface = if let Some(index) = body.index {
+        iter_all_ifaces().find(|iface| iface.index() == index.get())
+    } else if let Some(name) = required_name {
+        iter_all_ifaces().find(|iface| iface.name().as_cstr() == name)
+    } else {
+        None
+    };
+
+    let Some(iface) = iface else {
+        if flags.contains(NewRequestFlags::CREATE) {
+            return_errno_with_message!(Errno::EOPNOTSUPP, "creating links is not supported");
+        }
+        return_errno_with_message!(Errno::ENODEV, "no link found");
+    };
+
+    // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/core/rtnetlink.c#L3709>.
+    if flags.contains(NewRequestFlags::EXCL) {
+        return_errno_with_message!(Errno::EEXIST, "the link already exists");
+    }
+
+    if request_segment
+        .attrs()
+        .iter()
+        .any(|attr| !matches!(attr, LinkAttr::Name(_)))
+    {
+        return_errno_with_message!(
+            Errno::EOPNOTSUPP,
+            "modifying link attributes is not supported"
+        );
+    }
+
+    // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/core/rtnetlink.c#L3140-L3142>.
+    // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/core/rtnetlink.c#L1092-L1103>.
+    let old_flags = iface.flags();
+    let new_flags = if body.change.is_empty() {
+        if body.flags.is_empty() {
+            old_flags
+        } else {
+            body.flags
+        }
+    } else {
+        (body.flags & body.change) | (old_flags - body.change)
+    };
+    if (new_flags ^ old_flags).intersects(USER_CHANGEABLE_FLAGS) {
+        return_errno_with_message!(Errno::EOPNOTSUPP, "changing link flags is not supported");
+    }
+
+    let mut response_segments = Vec::new();
+    if SegHdrCommonFlags::from_bits_truncate(header.flags).contains(SegHdrCommonFlags::ACK) {
+        let ack_segment = ErrorSegment::new_from_request(header, None);
+        response_segments.push(RtnlSegment::Error(ack_segment));
+    }
+    Ok(response_segments)
+}
+
+/// The link flags that can be changed by user space.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/core/dev.c#L9444-L9447>.
+const USER_CHANGEABLE_FLAGS: InterfaceFlags = InterfaceFlags::UP
+    .union(InterfaceFlags::DEBUG)
+    .union(InterfaceFlags::NOTRAILERS)
+    .union(InterfaceFlags::NOARP)
+    .union(InterfaceFlags::DYNAMIC)
+    .union(InterfaceFlags::MULTICAST)
+    .union(InterfaceFlags::PORTSEL)
+    .union(InterfaceFlags::AUTOMEDIA)
+    .union(InterfaceFlags::PROMISC)
+    .union(InterfaceFlags::ALLMULTI);
 
 enum FilterBy<'a> {
     Index(u32),
@@ -137,6 +229,7 @@ fn iface_to_new_link(request_header: &CMsgSegHdr, iface: &Arc<Iface>) -> LinkSeg
         type_: iface.type_(),
         index: NonZero::new(iface.index()),
         flags: iface.flags(),
+        change: InterfaceFlags::empty(),
     };
 
     // Linux may report dozens of attributes in a fixed order.
