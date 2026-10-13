@@ -9,6 +9,7 @@ pub(super) use init::{init, iter_all_ifaces};
 pub(super) use poll::init_in_first_kthread;
 
 pub(super) type Iface = dyn aster_bigtcp::iface::Iface<ext::BigtcpExt>;
+pub(super) type BoundPort = aster_bigtcp::iface::BoundPort<ext::BigtcpExt>;
 pub(super) type BoundTcpPort = aster_bigtcp::iface::BoundTcpPort<ext::BigtcpExt>;
 pub(super) type BoundUdpPort = aster_bigtcp::iface::BoundUdpPort<ext::BigtcpExt>;
 

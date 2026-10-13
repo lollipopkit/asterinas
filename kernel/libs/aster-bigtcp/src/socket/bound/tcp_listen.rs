@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc, vec, vec::Vec};
 
 use aster_softirq::BottomHalfDisabled;
 use ostd::sync::SpinLock;
 use smoltcp::{
     socket::PollAt,
     time::Duration,
-    wire::{IpEndpoint, IpRepr, TcpRepr},
+    wire::{IpEndpoint, IpListenEndpoint, IpRepr, TcpRepr},
 };
 
 use super::{
@@ -17,7 +17,7 @@ use super::{
 use crate::{
     errors::tcp::ListenError,
     ext::Ext,
-    iface::{BindPortConfig, BoundTcpPort, PacketSlice, PollableIfaceMut},
+    iface::{BindPortConfig, BoundTcpPort, Iface, PacketSlice, PollableIfaceMut},
     socket::{
         option::{RawTcpOption, RawTcpSetOption},
         unbound::{RawTcpSocket, new_tcp_socket},
@@ -74,46 +74,89 @@ impl<E: Ext> TcpListener<E> {
         option: &RawTcpOption,
         observer: E::TcpEventObserver,
     ) -> Result<Self, (BoundTcpPort<E>, ListenError)> {
-        let local_endpoint = bound.endpoint();
-
-        let iface = bound.iface().clone();
-        let mut sockets = iface.common().sockets();
-
-        let listener_key = ListenerKey::new(local_endpoint.addr, local_endpoint.port);
-
-        if sockets.lookup_listener(&listener_key).is_some() {
-            return Err((bound, ListenError::AddressInUse));
+        match Self::new_listen_all(vec![bound], max_conn, option, observer) {
+            Ok(mut listeners) => Ok(listeners.pop().unwrap()),
+            Err((mut bound_ports, err)) => Err((bound_ports.pop().unwrap(), err)),
         }
+    }
 
-        let socket = {
-            let mut socket = new_tcp_socket();
+    /// Listens at the endpoints of multiple bound ports.
+    ///
+    /// Either a listener is created for every bound port, or no listener is created and the bound
+    /// ports are returned with the error. An unspecified address in a bound port means listening
+    /// at all the addresses of the iface in the same address family.
+    ///
+    /// Polling the ifaces is _not_ required after this method succeeds.
+    pub fn new_listen_all(
+        bound_ports: Vec<BoundTcpPort<E>>,
+        max_conn: usize,
+        option: &RawTcpOption,
+        observer: E::TcpEventObserver,
+    ) -> Result<Vec<Self>, (Vec<BoundTcpPort<E>>, ListenError)> {
+        // Lock the socket tables of the ifaces in the order of their indexes to avoid deadlocks.
+        let mut ifaces: Vec<Arc<dyn Iface<E>>> = bound_ports
+            .iter()
+            .map(|bound| bound.iface().clone())
+            .collect();
+        ifaces.sort_by_key(|iface| iface.index());
+        ifaces.dedup_by_key(|iface| iface.index());
+        let mut socket_tables: Vec<_> = ifaces
+            .iter()
+            .map(|iface| iface.common().sockets())
+            .collect();
+        let table_index = |bound: &BoundTcpPort<E>| {
+            ifaces
+                .iter()
+                .position(|iface| iface.index() == bound.iface().index())
+                .unwrap()
+        };
 
-            option.apply(&mut socket);
-
-            if let Err(err) = socket.listen(local_endpoint) {
-                return Err((bound, err.into()));
+        let mut sockets = Vec::with_capacity(bound_ports.len());
+        for bound in bound_ports.iter() {
+            let local_endpoint = bound.endpoint();
+            let listener_key = ListenerKey::new(local_endpoint.addr, local_endpoint.port);
+            if socket_tables[table_index(bound)]
+                .lookup_listener(&listener_key)
+                .is_some()
+            {
+                return Err((bound_ports, ListenError::AddressInUse));
             }
 
-            socket
-        };
+            let mut socket = new_tcp_socket();
+            option.apply(&mut socket);
+            if let Err(err) = socket.listen(listen_endpoint(local_endpoint)) {
+                return Err((bound_ports, err.into()));
+            }
+            sockets.push(socket);
+        }
 
-        let inner = {
-            let backlog = TcpBacklog {
-                socket,
-                max_conn,
-                connecting: BTreeMap::new(),
-                connected: Vec::new(),
-            };
+        let listeners = bound_ports
+            .into_iter()
+            .zip(sockets)
+            .map(|(bound, socket)| {
+                let local_endpoint = bound.endpoint();
+                let listener_key = ListenerKey::new(local_endpoint.addr, local_endpoint.port);
+                let socket_table = &mut socket_tables[table_index(&bound)];
 
-            TcpListenerInner::new(backlog, listener_key)
-        };
+                let backlog = TcpBacklog {
+                    socket,
+                    max_conn,
+                    connecting: BTreeMap::new(),
+                    connected: Vec::new(),
+                };
+                let listener = Self::new(bound, TcpListenerInner::new(backlog, listener_key));
+                listener.init_observer(observer.clone());
 
-        let listener = Self::new(bound, inner);
-        listener.init_observer(observer);
-        let res = sockets.insert_listener(listener.inner().clone());
-        debug_assert!(res.is_ok());
+                // This cannot fail. The bound ports are on different ifaces or have different
+                // endpoints, and the listener keys are checked above with the tables locked.
+                let res = socket_table.insert_listener(listener.inner().clone());
+                debug_assert!(res.is_ok());
 
-        Ok(listener)
+                listener
+            })
+            .collect();
+
+        Ok(listeners)
     }
 
     /// Accepts a TCP connection.
@@ -236,10 +279,14 @@ impl<E: Ext> TcpListenerBg<E> {
             socket
         };
 
+        // Bind the connection to the actual local endpoint, which differs from the listener's
+        // endpoint if the listener is listening at an unspecified address.
+        let local_endpoint = backlog.socket.local_endpoint().unwrap();
+
         let conn = TcpConnection::new_cyclic(
             self.bound
                 .iface()
-                .bind_tcp(BindPortConfig::new_backlog(self.bound.endpoint()))
+                .bind_tcp(BindPortConfig::new_backlog(local_endpoint))
                 .unwrap(),
             |weak| {
                 TcpConnectionInner::new(
@@ -257,5 +304,16 @@ impl<E: Ext> TcpListenerBg<E> {
         iface.update_next_poll_at_ms(&conn_bg, PollAt::Now);
 
         (result, Some(conn_bg))
+    }
+}
+
+/// Converts the endpoint of a bound port to the endpoint for listening.
+///
+/// An unspecified address is converted to `None`, which means listening at all addresses.
+fn listen_endpoint(endpoint: IpEndpoint) -> IpListenEndpoint {
+    let addr = (!endpoint.addr.is_unspecified()).then_some(endpoint.addr);
+    IpListenEndpoint {
+        addr,
+        port: endpoint.port,
     }
 }

@@ -10,7 +10,10 @@ use aster_bigtcp::{
     wire::{IpAddress, IpEndpoint, Ipv6Address},
 };
 
-use super::{connecting::ConnectingStream, listen::ListenStream, observer::StreamObserver};
+use super::{
+    bound::BoundTcpPorts, connecting::ConnectingStream, listen::ListenStream,
+    observer::StreamObserver,
+};
 use crate::{
     events::IoEvents,
     net::{
@@ -19,10 +22,7 @@ use crate::{
         socket::{
             ip::{
                 addr::IpAddressFamily,
-                common::{
-                    get_ephemeral_endpoint, map_unspecified_to_localhost,
-                    resolve_bind_iface_and_config,
-                },
+                common::{get_ephemeral_endpoint, map_unspecified_to_localhost},
             },
             util::SocketAddr,
         },
@@ -31,7 +31,7 @@ use crate::{
 };
 
 pub(super) struct InitStream {
-    bound_port: Option<BoundTcpPort>,
+    bound_ports: Option<BoundTcpPorts>,
     /// Indicates if the last `connect()` is considered to be done.
     ///
     /// If `connect()` is called but we're still in the `InitStream`, this means that the
@@ -57,15 +57,15 @@ pub(super) struct InitStream {
 impl InitStream {
     pub(super) fn new() -> Self {
         Self {
-            bound_port: None,
+            bound_ports: None,
             is_connect_done: true,
             is_conn_refused: AtomicBool::new(false),
         }
     }
 
-    pub(super) fn new_bound(bound_port: BoundTcpPort) -> Self {
+    pub(super) fn new_bound(bound_ports: BoundTcpPorts) -> Self {
         Self {
-            bound_port: Some(bound_port),
+            bound_ports: Some(bound_ports),
             is_connect_done: true,
             is_conn_refused: AtomicBool::new(false),
         }
@@ -73,7 +73,7 @@ impl InitStream {
 
     pub(super) fn new_refused(bound_port: BoundTcpPort) -> Self {
         Self {
-            bound_port: Some(bound_port),
+            bound_ports: Some(bound_port.into()),
             is_connect_done: false,
             is_conn_refused: AtomicBool::new(true),
         }
@@ -84,8 +84,9 @@ impl InitStream {
         endpoint: &IpEndpoint,
         family: IpAddressFamily,
         can_reuse: bool,
+        is_dual_stack: bool,
     ) -> Result<()> {
-        if self.bound_port.is_some() {
+        if self.bound_ports.is_some() {
             return_errno_with_message!(Errno::EINVAL, "the socket is already bound to an address");
         }
 
@@ -98,13 +99,13 @@ impl InitStream {
             );
         }
 
-        self.bound_port = Some(bind_port(endpoint, can_reuse)?);
+        self.bound_ports = Some(BoundTcpPorts::bind(endpoint, can_reuse, is_dual_stack)?);
 
         Ok(())
     }
 
-    pub(super) fn bound_port(&self) -> Option<&BoundTcpPort> {
-        self.bound_port.as_ref()
+    pub(super) fn bound_ports(&self) -> Option<&BoundTcpPorts> {
+        self.bound_ports.as_ref()
     }
 
     pub(super) fn connect(
@@ -162,15 +163,18 @@ impl InitStream {
             remote_endpoint
         };
 
-        let bound_port = if let Some(bound_port) = self.bound_port {
-            bound_port
+        let bound_port = if let Some(bound_ports) = self.bound_ports {
+            match bound_ports.into_connecting_port(&route_endpoint, can_reuse) {
+                Ok(bound_port) => bound_port,
+                Err((err, bound_ports)) => return Err((err, Self::new_bound(bound_ports))),
+            }
         } else {
             let endpoint = match get_ephemeral_endpoint(&route_endpoint) {
                 Ok(endpoint) => endpoint,
                 Err(err) => return Err((err, self)),
             };
-            match bind_port(&endpoint, can_reuse) {
-                Ok(bound_port) => bound_port,
+            match BoundTcpPorts::bind(&endpoint, can_reuse, false) {
+                Ok(bound_ports) => bound_ports.into_ports().pop().unwrap(),
                 Err(err) => return Err((err, self)),
             }
         };
@@ -190,7 +194,7 @@ impl InitStream {
                 if err.error() == Errno::ECONNREFUSED {
                     (err, InitStream::new_refused(bound_port))
                 } else {
-                    (err, InitStream::new_bound(bound_port))
+                    (err, InitStream::new_bound(bound_port.into()))
                 }
             },
         )
@@ -218,7 +222,10 @@ impl InitStream {
     pub(super) fn listen(
         self,
         backlog: usize,
+        family: IpAddressFamily,
         option: &RawTcpOption,
+        can_reuse: bool,
+        is_dual_stack: bool,
         observer: StreamObserver,
     ) -> Result<ListenStream, (Error, Self)> {
         if !self.is_connect_done {
@@ -233,19 +240,21 @@ impl InitStream {
             ));
         }
 
-        let Some(bound_port) = self.bound_port else {
-            // FIXME: The socket should be bound to INADDR_ANY (i.e., 0.0.0.0) with an ephemeral
-            // port. However, INADDR_ANY is not yet supported, so we need to return an error first.
-            warn!("listen() without bind() is not implemented");
-            return Err((
-                Error::with_message(Errno::EINVAL, "listen() without bind() is not implemented"),
-                self,
-            ));
+        let bound_ports = if let Some(bound_ports) = self.bound_ports {
+            bound_ports
+        } else {
+            // An unbound socket is bound to the unspecified address with an ephemeral port.
+            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/ipv4/af_inet.c#L190>.
+            let endpoint = family.unspecified_endpoint();
+            match BoundTcpPorts::bind(&endpoint, can_reuse, is_dual_stack) {
+                Ok(bound_ports) => bound_ports,
+                Err(err) => return Err((err, self)),
+            }
         };
 
-        match ListenStream::new(bound_port, backlog, option, observer) {
+        match ListenStream::new(bound_ports, backlog, option, observer) {
             Ok(listen_stream) => Ok(listen_stream),
-            Err((bound_port, error)) => Err((error, Self::new_bound(bound_port))),
+            Err((bound_ports, error)) => Err((error, Self::new_bound(bound_ports))),
         }
     }
 
@@ -277,9 +286,9 @@ impl InitStream {
     }
 
     pub(super) fn local_endpoint(&self) -> Option<IpEndpoint> {
-        self.bound_port
+        self.bound_ports
             .as_ref()
-            .map(|bound_port| bound_port.endpoint())
+            .map(|bound_ports| bound_ports.local_endpoint())
     }
 
     pub(super) fn check_io_events(&self) -> IoEvents {
@@ -303,9 +312,4 @@ impl InitStream {
             None
         }
     }
-}
-
-fn bind_port(endpoint: &IpEndpoint, can_reuse: bool) -> Result<BoundTcpPort> {
-    let (iface, config) = resolve_bind_iface_and_config(endpoint, can_reuse)?;
-    Ok(iface.bind_tcp(config)?)
 }

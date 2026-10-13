@@ -102,6 +102,33 @@ impl From<IpAddress> for NormalizedAddress {
     }
 }
 
+impl NormalizedAddress {
+    const MIN: Self = Self(Ipv6Address::from_bits(u128::MIN));
+    const MAX: Self = Self(Ipv6Address::from_bits(u128::MAX));
+
+    fn is_ipv4(&self) -> bool {
+        self.0.to_ipv4_mapped().is_some()
+    }
+
+    fn is_unspecified(&self) -> bool {
+        match self.0.to_ipv4_mapped() {
+            Some(ipv4) => ipv4.is_unspecified(),
+            None => self.0.is_unspecified(),
+        }
+    }
+
+    /// Returns whether binding both addresses to the same port conflicts.
+    ///
+    /// An unspecified address conflicts with every address of the same family. Note that an IPv6
+    /// unspecified address does not conflict with IPv4 addresses here; a dual-stack socket should
+    /// bind the IPv4 unspecified address as well.
+    fn overlaps(&self, other: &Self) -> bool {
+        self == other
+            || ((self.is_unspecified() || other.is_unspecified())
+                && self.is_ipv4() == other.is_ipv4())
+    }
+}
+
 impl<E: Ext> IfaceCommon<E> {
     pub(super) fn new(
         name: InterfaceName,
@@ -325,9 +352,9 @@ impl<E: Ext> BoundPort<E> {
         }
 
         let key = PortKey {
-            addr: NormalizedAddress::from(self.addr),
-            port: self.port,
             protocol: self.protocol,
+            port: self.port,
+            addr: NormalizedAddress::from(self.addr),
         };
         used_ports.set_can_reuse(key, can_reuse);
 
@@ -387,11 +414,13 @@ impl<E: Ext> Deref for BoundUdpPort<E> {
     }
 }
 
+// The field order matters: keys with the same protocol and port are adjacent, so that
+// `PortTable::overlapping` can find them with a range query.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PortKey {
-    addr: NormalizedAddress,
-    port: u16,
     protocol: PortProtocol,
+    port: u16,
+    addr: NormalizedAddress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -448,10 +477,20 @@ impl PortTable {
         };
 
         let key = PortKey {
-            addr,
-            port,
             protocol,
+            port,
+            addr,
         };
+
+        // A backlog socket reuses the port of its listener, so it never conflicts.
+        if !config.is_backlog()
+            && self.overlapping(key).any(|(other, port_state)| {
+                other.addr != addr && !(port_state.can_reuse() && config_can_reuse)
+            })
+        {
+            return Err(BindError::InUse);
+        }
+
         let entry = self.used_ports.entry(key);
         match entry {
             Entry::Occupied(mut occupied) => {
@@ -503,15 +542,15 @@ impl PortTable {
         }
 
         let mut key = PortKey {
-            addr,
-            port: 0,
             protocol,
+            port: 0,
+            addr,
         };
         let start_port = self.next_ephemeral_port;
         let mut port = start_port;
         loop {
             key.port = port;
-            if !self.used_ports.contains_key(&key) {
+            if self.overlapping(key).next().is_none() {
                 self.next_ephemeral_port = next_ephemeral_port_after(port);
                 return Some(port);
             }
@@ -528,11 +567,27 @@ impl PortTable {
         None
     }
 
+    /// Returns the used ports whose addresses overlap with the address of `key`.
+    ///
+    /// The used port of `key` itself is also returned if it exists.
+    fn overlapping(&self, key: PortKey) -> impl Iterator<Item = (&PortKey, &PortState)> {
+        let range = PortKey {
+            addr: NormalizedAddress::MIN,
+            ..key
+        }..=PortKey {
+            addr: NormalizedAddress::MAX,
+            ..key
+        };
+        self.used_ports
+            .range(range)
+            .filter(move |(other, _)| other.addr.overlaps(&key.addr))
+    }
+
     fn acquire(&mut self, addr: IpAddress, port: u16, can_reuse: bool, protocol: PortProtocol) {
         let key = PortKey {
-            addr: NormalizedAddress::from(addr),
-            port,
             protocol,
+            port,
+            addr: NormalizedAddress::from(addr),
         };
         match self.used_ports.entry(key) {
             Entry::Occupied(mut occupied) => {
@@ -550,9 +605,9 @@ impl PortTable {
 
     fn release(&mut self, addr: IpAddress, port: u16, can_reuse: bool, protocol: PortProtocol) {
         let key = PortKey {
-            addr: NormalizedAddress::from(addr),
-            port,
             protocol,
+            port,
+            addr: NormalizedAddress::from(addr),
         };
         let Entry::Occupied(mut occupied) = self.used_ports.entry(key) else {
             return;

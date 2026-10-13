@@ -21,7 +21,7 @@ use util::{Retrans, TcpOptionSet};
 use super::{
     addr::IpAddressFamily,
     ioctl::ipv4_ioctl,
-    options::{IpOptionSet, SetIpLevelOption},
+    options::{IpOptionSet, Ipv6OptionSet, SetIpLevelOption, SetIpv6LevelOption},
 };
 use crate::{
     events::IoEvents,
@@ -48,6 +48,7 @@ use crate::{
     util::{MultiRead, MultiWrite, ioctl::RawIoctl, net::SockType},
 };
 
+mod bound;
 mod connected;
 mod connecting;
 mod init;
@@ -84,6 +85,7 @@ enum State {
 struct OptionSet {
     socket: SocketOptionSet,
     ip: IpOptionSet,
+    ipv6: Ipv6OptionSet,
     tcp: TcpOptionSet,
 }
 
@@ -91,8 +93,14 @@ impl OptionSet {
     fn new() -> Self {
         let socket = SocketOptionSet::new_tcp();
         let ip = IpOptionSet::new_tcp();
+        let ipv6 = Ipv6OptionSet::new();
         let tcp = TcpOptionSet::new();
-        OptionSet { socket, ip, tcp }
+        OptionSet {
+            socket,
+            ip,
+            ipv6,
+            tcp,
+        }
     }
 
     fn raw(&self) -> RawTcpOption {
@@ -150,6 +158,8 @@ impl StreamSocket {
             if !raw_tcp_socket.nagle_enabled() {
                 options.tcp.set_no_delay(true);
             }
+
+            options.ipv6 = listener_options.ipv6;
 
             // TODO: Update other options for a newly-accepted socket
 
@@ -308,6 +318,11 @@ impl StreamSocket {
         result_or_block
     }
 
+    /// Returns whether the socket also handles IPv4 traffic as an IPv6 socket.
+    fn is_dual_stack(&self, options: &OptionSet) -> bool {
+        self.family == IpAddressFamily::IPv6 && !options.ipv6.v6only()
+    }
+
     fn check_connect(&self) -> Result<()> {
         let mut state = self.write_updated_state();
 
@@ -340,13 +355,18 @@ impl StreamSocket {
                 &self.timeouts,
                 is_nonblocking,
             );
-            (accepted_socket as _, remote_endpoint.into())
+            (
+                accepted_socket as _,
+                self.family.to_socket_addr(remote_endpoint),
+            )
         });
-        let iface_to_poll = listen_stream.iface().clone();
+        let ifaces_to_poll = listen_stream.ifaces();
 
         drop(state);
         self.pollee.invalidate();
-        iface_to_poll.poll();
+        for iface in ifaces_to_poll {
+            iface.poll();
+        }
 
         accepted
     }
@@ -385,7 +405,7 @@ impl StreamSocket {
             iface.poll();
         }
 
-        Ok((recv_bytes, remote_endpoint.into()))
+        Ok((recv_bytes, self.family.to_socket_addr(remote_endpoint)))
     }
 
     fn try_send(&self, reader: &mut dyn MultiRead, flags: SendFlags) -> Result<usize> {
@@ -481,8 +501,13 @@ impl Socket for StreamSocket {
             return_errno_with_message!(Errno::EINVAL, "the socket is already bound to an address");
         };
 
-        let can_reuse = self.options.read().socket.reuse_addr();
-        init_stream.bind(&endpoint, self.family, can_reuse)
+        let options = self.options.read();
+        init_stream.bind(
+            &endpoint,
+            self.family,
+            options.socket.reuse_addr(),
+            self.is_dual_stack(&options),
+        )
     }
 
     fn connect(&self, socket_addr: SocketAddr) -> Result<()> {
@@ -527,7 +552,10 @@ impl Socket for StreamSocket {
 
             let listen_stream = match init_stream.listen(
                 backlog,
+                self.family,
                 &raw_option,
+                options.socket.reuse_addr(),
+                self.is_dual_stack(&options),
                 StreamObserver::new(self.pollee.clone()),
             ) {
                 Ok(listen_stream) => listen_stream,
@@ -577,7 +605,7 @@ impl Socket for StreamSocket {
             State::Listen(listen_stream) => listen_stream.local_endpoint(),
             State::Connected(connected_stream) => connected_stream.local_endpoint(),
         };
-        Ok(local_endpoint.into())
+        Ok(self.family.to_socket_addr(local_endpoint))
     }
 
     fn peer_addr(&self) -> Result<SocketAddr> {
@@ -601,7 +629,7 @@ impl Socket for StreamSocket {
                 connected_stream.remote_endpoint()
             }
         };
-        Ok(remote_endpoint.into())
+        Ok(self.family.to_socket_addr(remote_endpoint))
     }
 
     fn sendmsg(
@@ -684,6 +712,14 @@ impl Socket for StreamSocket {
         match options.ip.get_option(option) {
             Err(err) if err.error() == Errno::ENOPROTOOPT => (),
             res => return res,
+        }
+
+        // Deal with IPv6-level options
+        if self.family == IpAddressFamily::IPv6 {
+            match options.ipv6.get_option(option) {
+                Err(err) if err.error() == Errno::ENOPROTOOPT => (),
+                res => return res,
+            }
         }
 
         // Deal with TCP-level options
@@ -770,8 +806,20 @@ impl Socket for StreamSocket {
                 // Deal with IP-level options
                 match options.ip.set_option(option, state.as_ref()) {
                     Err(err) if err.error() == Errno::ENOPROTOOPT => {
-                        // Deal with TCP-level options
-                        do_tcp_setsockopt(option, &mut options, state.as_mut())?
+                        // Deal with IPv6-level options
+                        let ipv6_option_result = if self.family == IpAddressFamily::IPv6 {
+                            options.ipv6.set_option(option, state.as_ref())
+                        } else {
+                            Err(Error::new(Errno::ENOPROTOOPT))
+                        };
+                        match ipv6_option_result {
+                            Err(err) if err.error() == Errno::ENOPROTOOPT => {
+                                // Deal with TCP-level options
+                                do_tcp_setsockopt(option, &mut options, state.as_mut())?
+                            }
+                            Err(err) => return Err(err),
+                            Ok(()) => NeedIfacePoll::FALSE,
+                        }
                     }
                     Err(err) => return Err(err),
                     Ok(need_iface_poll) => need_iface_poll,
@@ -781,12 +829,12 @@ impl Socket for StreamSocket {
             Ok(need_iface_poll) => need_iface_poll,
         };
 
-        let iface_to_poll = need_iface_poll.then(|| state.iface().cloned()).flatten();
+        let ifaces_to_poll = need_iface_poll.then(|| state.ifaces()).unwrap_or_default();
 
         drop(state);
         drop(options);
 
-        if let Some(iface) = iface_to_poll {
+        for iface in ifaces_to_poll {
             iface.poll();
         }
 
@@ -918,7 +966,7 @@ impl State {
     ///
     /// For listening sockets, socket options are inherited by new connections. However, they are
     /// not updated for connections in the backlog queue.
-    fn set_raw_option<R>(&self, set_option: impl FnOnce(&dyn RawTcpSetOption) -> R) -> Option<R> {
+    fn set_raw_option<R>(&self, set_option: impl Fn(&dyn RawTcpSetOption) -> R) -> Option<R> {
         match self {
             State::Init(_) => None,
             State::Connecting(connecting_stream) => {
@@ -929,23 +977,22 @@ impl State {
         }
     }
 
-    fn iface(&self) -> Option<&Arc<Iface>> {
+    fn ifaces(&self) -> Vec<Arc<Iface>> {
         match self {
-            State::Init(_) => None,
-            State::Connecting(connecting_stream) => Some(connecting_stream.iface()),
-            State::Connected(connected_stream) => Some(connected_stream.iface()),
-            State::Listen(listen_stream) => Some(listen_stream.iface()),
+            State::Init(_) => Vec::new(),
+            State::Connecting(connecting_stream) => vec![connecting_stream.iface().clone()],
+            State::Connected(connected_stream) => vec![connected_stream.iface().clone()],
+            State::Listen(listen_stream) => listen_stream.ifaces(),
         }
     }
 
     fn set_reuse_addr(&self, reuse_addr: bool) {
         let bound_port = match self {
             State::Init(init_stream) => {
-                if let Some(bound_port) = init_stream.bound_port() {
-                    bound_port
-                } else {
-                    return;
+                if let Some(bound_ports) = init_stream.bound_ports() {
+                    bound_ports.set_can_reuse(reuse_addr);
                 }
+                return;
             }
             State::Connecting(connecting_stream) => connecting_stream.bound_port(),
             State::Connected(connected_stream) => connected_stream.bound_port(),
@@ -995,6 +1042,15 @@ impl SetSocketLevelOption for (&State, &TcpOptionSet, &SocketTimeouts) {
     }
 }
 
+impl SetIpv6LevelOption for State {
+    fn is_bound(&self) -> bool {
+        match self {
+            State::Init(init_stream) => init_stream.bound_ports().is_some(),
+            State::Connecting(_) | State::Connected(_) | State::Listen(_) => true,
+        }
+    }
+}
+
 impl SetIpLevelOption for State {
     fn set_hdrincl(&self, _hdrincl: bool) -> Result<()> {
         return_errno_with_message!(
@@ -1013,9 +1069,17 @@ impl Drop for StreamSocket {
             State::Connecting(connecting_stream) => connecting_stream.into_connection(),
             State::Connected(connected_stream) => connected_stream.into_connection(),
             State::Listen(listen_stream) => {
-                let listener = listen_stream.into_listener();
-                listener.close();
-                listener.iface().poll();
+                let ifaces_to_poll = listen_stream.ifaces();
+                let listeners = listen_stream.into_listeners();
+                for listener in listeners.iter() {
+                    listener.close();
+                }
+                // Polling the ifaces drops the connections reset by `close`, which hold
+                // references to the listeners. So the listeners must be dropped afterward.
+                for iface in ifaces_to_poll {
+                    iface.poll();
+                }
+                drop(listeners);
                 return;
             }
         };
