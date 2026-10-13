@@ -91,6 +91,9 @@ impl ProtocolSegment for RtnlSegment {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "the reader length is too small"))?;
 
         let segment = match CSegmentType::try_from(header.type_) {
+            Ok(CSegmentType::NEWLINK) => {
+                LinkSegment::read_from(&header, reader)?.map(RtnlSegment::NewLink)
+            }
             Ok(CSegmentType::GETLINK) => {
                 LinkSegment::read_from(&header, reader)?.map(RtnlSegment::GetLink)
             }
