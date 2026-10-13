@@ -81,7 +81,12 @@ impl NetlinkRouteKernelSocket {
         }
     }
 
-    pub(super) fn report_error(&self, err_segment: ErrorSegment, dst_port: PortNum) {
+    pub(super) fn report_error(&self, mut err_segment: ErrorSegment, dst_port: PortNum) {
+        // Like Linux, address the error to the requesting socket's port, regardless of the PID
+        // in the request header. Otherwise, user space (e.g., iproute2) may discard the error
+        // segment and wait forever.
+        err_segment.header_mut().pid = dst_port;
+
         let response = RtnlMessage::new(vec![RtnlSegment::Error(err_segment)]);
 
         debug!("netlink route error: {:?}", response);
