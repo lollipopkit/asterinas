@@ -2,16 +2,19 @@
 
 //! A fixed-size local cache for frame allocation.
 
-use core::{alloc::Layout, cell::RefCell};
+use core::alloc::Layout;
 
 use ostd::{
+    cpu::CpuId,
     cpu_local,
     irq::DisabledLocalIrqGuard,
     mm::{PAGE_SIZE, Paddr},
+    sync::{LocalIrqDisabled, SpinLock},
 };
 
+// The lock of a cache must be acquired before that of any pool.
 cpu_local! {
-    static CACHE: RefCell<CacheOfSizes> = RefCell::new(CacheOfSizes::new());
+    static CACHE: SpinLock<CacheOfSizes, LocalIrqDisabled> = SpinLock::new(CacheOfSizes::new());
 }
 
 struct CacheOfSizes {
@@ -53,16 +56,23 @@ impl<const NR_CONT_FRAMES: usize, const COUNT: usize> CacheArray<NR_CONT_FRAMES,
         }
 
         let nr_to_alloc = COUNT * 2 / 3;
-        let allocated = super::pools::alloc(
+        if let Some(allocated) = super::pools::alloc(
             guard,
             Layout::from_size_align(nr_to_alloc * Self::segment_size(), PAGE_SIZE).unwrap(),
-        )?;
+        ) {
+            for i in 1..nr_to_alloc {
+                self.push_front(allocated + i * Self::segment_size());
+            }
 
-        for i in 1..nr_to_alloc {
-            self.push_front(allocated + i * Self::segment_size());
+            return Some(allocated);
         }
 
-        Some(allocated)
+        // The pools may still have chunks that are large enough for one
+        // segment but not for a batch of segments.
+        super::pools::alloc(
+            guard,
+            Layout::from_size_align(Self::segment_size(), PAGE_SIZE).unwrap(),
+        )
     }
 
     /// Deallocates a segment of frames.
@@ -115,6 +125,29 @@ impl CacheOfSizes {
             cache4: CacheArray::new(),
         }
     }
+
+    /// Removes all cached segments.
+    ///
+    /// Returns the address and the size of each removed segment.
+    fn take_all(&mut self) -> impl Iterator<Item = (Paddr, usize)> + use<> {
+        fn take<const N: usize, const C: usize>(
+            cache: &mut CacheArray<N, C>,
+        ) -> impl Iterator<Item = (Paddr, usize)> + use<N, C> {
+            let mut segments = [None; C];
+            for segment in segments.iter_mut() {
+                *segment = cache.pop_front();
+            }
+            segments
+                .into_iter()
+                .flatten()
+                .map(|addr| (addr, CacheArray::<N, C>::segment_size()))
+        }
+
+        take(&mut self.cache1)
+            .chain(take(&mut self.cache2))
+            .chain(take(&mut self.cache3))
+            .chain(take(&mut self.cache4))
+    }
 }
 
 pub(super) fn alloc(guard: &DisabledLocalIrqGuard, layout: Layout) -> Option<Paddr> {
@@ -123,8 +156,7 @@ pub(super) fn alloc(guard: &DisabledLocalIrqGuard, layout: Layout) -> Option<Pad
         return super::pools::alloc(guard, layout);
     }
 
-    let cache_cell = CACHE.get_with(guard);
-    let mut cache = cache_cell.borrow_mut();
+    let mut cache = CACHE.get_with(guard).deref_target().lock();
 
     match nr_frames {
         1 => cache.cache1.alloc(guard),
@@ -142,8 +174,7 @@ pub(super) fn dealloc(guard: &DisabledLocalIrqGuard, addr: Paddr, size: usize) {
         return;
     }
 
-    let cache_cell = CACHE.get_with(guard);
-    let mut cache = cache_cell.borrow_mut();
+    let mut cache = CACHE.get_with(guard).deref_target().lock();
 
     match nr_frames {
         1 => cache.cache1.dealloc(guard, addr),
@@ -151,5 +182,44 @@ pub(super) fn dealloc(guard: &DisabledLocalIrqGuard, addr: Paddr, size: usize) {
         3 => cache.cache3.dealloc(guard, addr),
         4 => cache.cache4.dealloc(guard, addr),
         _ => super::pools::dealloc(guard, [(addr, size)].into_iter()),
+    }
+}
+
+/// Moves all segments in the cache of the given CPU to the global pool.
+///
+/// The caller must not hold the lock of any cache or pool.
+pub(super) fn reclaim_from(cpu: CpuId) {
+    let segments = CACHE.get_on_cpu(cpu).lock().take_all();
+    super::pools::dealloc_to_global(segments);
+}
+
+#[cfg(ktest)]
+mod test {
+    use ostd::{
+        cpu::PinCurrentCpu,
+        irq,
+        mm::{FrameAllocOptions, HasPaddr, UniqueFrame},
+        prelude::ktest,
+    };
+
+    use super::*;
+
+    #[ktest]
+    fn reclaim_from_empties_cache() {
+        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        let addr = frame.paddr();
+        UniqueFrame::try_from(frame).unwrap().reset_as_unused();
+
+        let guard = irq::disable_local();
+        // Give the frame back as free memory, bypassing the deallocation path.
+        crate::TOTAL_FREE_SIZE.add(guard.current_cpu(), PAGE_SIZE);
+        let pushed = CACHE.get_with(&guard).lock().cache1.push_front(addr);
+        if pushed.is_none() {
+            // The cache is full, which is also fine for this test.
+            crate::pools::dealloc_to_global([(addr, PAGE_SIZE)].into_iter());
+        }
+
+        reclaim_from(guard.current_cpu());
+        assert_eq!(CACHE.get_with(&guard).lock().take_all().count(), 0);
     }
 }

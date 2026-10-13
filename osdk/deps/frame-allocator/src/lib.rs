@@ -31,7 +31,7 @@ extern crate alloc;
 use core::alloc::Layout;
 
 use ostd::{
-    cpu::PinCurrentCpu,
+    cpu::{PinCurrentCpu, all_cpus},
     irq,
     mm::{Paddr, frame::GlobalFrameAllocator},
 };
@@ -65,7 +65,10 @@ pub struct FrameAllocator;
 impl GlobalFrameAllocator for FrameAllocator {
     fn alloc(&self, layout: Layout) -> Option<Paddr> {
         let guard = irq::disable_local();
-        let res = cache::alloc(&guard, layout);
+        let res = cache::alloc(&guard, layout).or_else(|| {
+            reclaim_all();
+            cache::alloc(&guard, layout)
+        });
         if res.is_some() {
             TOTAL_FREE_SIZE.sub(guard.current_cpu(), layout.size());
         }
@@ -82,5 +85,18 @@ impl GlobalFrameAllocator for FrameAllocator {
         let guard = irq::disable_local();
         TOTAL_FREE_SIZE.add(guard.current_cpu(), size);
         pools::add_free_memory(&guard, addr, size);
+    }
+}
+
+/// Moves the free frames held by the caches and the local pools of all CPUs
+/// to the global pool.
+///
+/// Free frames that are held by different CPUs cannot coalesce. So an
+/// allocation can fail even if plenty of memory is free. Reclaiming them lets
+/// them coalesce in the global pool, so the failed allocation can be retried.
+fn reclaim_all() {
+    for cpu in all_cpus() {
+        cache::reclaim_from(cpu);
+        pools::reclaim_from(cpu);
     }
 }
