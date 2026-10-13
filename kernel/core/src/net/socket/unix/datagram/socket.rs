@@ -94,7 +94,7 @@ impl UnixDatagramSocket {
         reader: &mut dyn MultiRead,
         mut aux_data: AuxiliaryData,
         remote: Option<UnixSocketAddr>,
-        _flags: SendFlags,
+        flags: SendFlags,
         timeout: Option<Duration>,
     ) -> Result<usize> {
         if self.is_write_shutdown.load(Ordering::Relaxed) {
@@ -111,7 +111,7 @@ impl UnixDatagramSocket {
             })?
         };
 
-        let res = if self.is_nonblocking() {
+        let res = if self.is_nonblocking() || flags.contains(SendFlags::MSG_DONTWAIT) {
             queue.try_send(reader, &mut aux_data, &self.local_receiver)
         } else {
             queue.block_send(timeout, || {

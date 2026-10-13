@@ -92,6 +92,7 @@ FN_TEST(unix_datagram)
 
 	TEST_SUCC(socketpair(AF_UNIX, SOCK_DGRAM, 0, fds));
 	TEST_ERRNO(recv(fds[0], buf, sizeof(buf), MSG_DONTWAIT), EAGAIN);
+	TEST_SEND_UNTIL_FULL(fds[1]);
 
 	TEST_SUCC(close(fds[0]));
 	TEST_SUCC(close(fds[1]));
