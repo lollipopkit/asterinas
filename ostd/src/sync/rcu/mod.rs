@@ -19,6 +19,7 @@ use spin::once::Once;
 use self::monitor::RcuMonitor;
 use crate::{
     panic::PanicGuard,
+    sync::Waiter,
     task::{
         DisabledPreemptGuard,
         atomic_mode::{AsAtomicModeGuard, InAtomicMode},
@@ -519,6 +520,27 @@ impl<T: Send + 'static> Drop for RcuDrop<T> {
             drop(taken);
         });
     }
+}
+
+/// Blocks the current task until a full grace period has elapsed.
+///
+/// The RCU callbacks registered before the call (e.g., the delayed drops of
+/// [`Rcu`] and [`RcuDrop`]) are invoked before this function returns. They
+/// have also finished unless one of them sleeps.
+///
+/// # Panics
+///
+/// This function will panic if it is called in the atomic mode
+/// ([`crate::task::atomic_mode`]).
+#[track_caller]
+pub fn synchronize_rcu() {
+    crate::task::atomic_mode::might_sleep();
+
+    let (waiter, waker) = Waiter::new_pair();
+    RCU_MONITOR.get().unwrap().after_grace_period(move || {
+        waker.wake_up();
+    });
+    waiter.wait();
 }
 
 /// Finishes the current grace period.

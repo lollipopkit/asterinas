@@ -49,7 +49,19 @@ fn main() {
         };
     };
 
+    ostd::boot::smp::register_ap_entry(ap_main);
+
     TaskOptions::new(test_task).data(()).spawn().unwrap();
+}
+
+/// The entry point of the application processors.
+///
+/// All tests run on the BSP. The APs only halt, which lets them pass
+/// quiescent states so that RCU grace periods can end.
+fn ap_main() {
+    loop {
+        ostd::task::halt_cpu();
+    }
 }
 
 #[ostd::ktest::panic_handler]
