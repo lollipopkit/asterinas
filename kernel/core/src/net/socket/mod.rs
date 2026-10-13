@@ -28,7 +28,13 @@ pub(crate) mod vsock;
 mod private {
     use core::time::Duration;
 
-    use crate::{events::IoEvents, prelude::*, process::signal::Pollable, util::ioctl::RawIoctl};
+    use super::util::RecvFlags;
+    use crate::{
+        events::IoEvents,
+        prelude::*,
+        process::signal::Pollable,
+        util::{MultiWrite, ioctl::RawIoctl},
+    };
 
     /// Common methods for sockets, but private to the network module.
     ///
@@ -88,6 +94,76 @@ mod private {
                         }
                         _ => err,
                     })
+            }
+        }
+
+        /// Receives data from a stream socket, honoring `MSG_DONTWAIT` and `MSG_WAITALL`.
+        ///
+        /// `try_recv` receives some data without blocking. It returns the number of bytes
+        /// received (zero means the end of the stream) and an extra output. If `should_stop`
+        /// returns true for the extra output, no more data will be received.
+        ///
+        /// With `MSG_WAITALL`, this method keeps receiving until `writer` is full. Like Linux, it
+        /// returns the data received so far instead of waiting for more if the socket is
+        /// non-blocking, the end of the stream is reached, an error occurs, or a signal or the
+        /// receive timeout interrupts the waiting. The extra output of the last receive is
+        /// returned.
+        ///
+        /// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/ipv4/tcp.c#L2711-L2749>
+        #[track_caller]
+        fn recv_stream<T>(
+            &self,
+            writer: &mut dyn MultiWrite,
+            flags: RecvFlags,
+            timeout: Option<Duration>,
+            mut try_recv: impl FnMut(&mut dyn MultiWrite) -> Result<(usize, T)>,
+            should_stop: impl Fn(&T) -> bool,
+        ) -> Result<(usize, T)>
+        where
+            Self: Sized,
+        {
+            // TODO: Support `MSG_WAITALL` with `MSG_PEEK` and `MSG_TRUNC` as Linux does.
+            let is_wait_all = flags.contains(RecvFlags::MSG_WAITALL)
+                && !flags.intersects(RecvFlags::MSG_PEEK | RecvFlags::MSG_TRUNC);
+
+            let mut received_len = 0;
+            let mut last_output = None;
+            let result = self.block_on_unless(
+                flags.contains(RecvFlags::MSG_DONTWAIT),
+                IoEvents::IN,
+                timeout,
+                || {
+                    let (len, output) = match try_recv(writer) {
+                        Ok(res) => res,
+                        // Return the data received before the error.
+                        //
+                        // TODO: Linux keeps the error (e.g., `ECONNRESET`) for the next call,
+                        // but some errors here have already been consumed by `try_recv`.
+                        Err(err) if received_len > 0 && err.error() != Errno::EAGAIN => {
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    };
+
+                    received_len += len;
+                    let is_done =
+                        !is_wait_all || len == 0 || should_stop(&output) || writer.is_empty();
+                    last_output = Some(output);
+
+                    if is_done {
+                        Ok(())
+                    } else {
+                        Err(Error::with_message(Errno::EAGAIN, "waiting for more data"))
+                    }
+                },
+            );
+
+            match (result, last_output) {
+                (Ok(()), Some(output)) => Ok((received_len, output)),
+                // Return the data received before the waiting is interrupted.
+                (Err(_), Some(output)) if received_len > 0 => Ok((received_len, output)),
+                (Err(err), _) => Err(err),
+                (Ok(()), None) => unreachable!("`try_recv` has succeeded at least once"),
             }
         }
 

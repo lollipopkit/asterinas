@@ -20,6 +20,7 @@ sleep 0.2
 ./listen_backlog
 ./msg_dontwait
 ./msg_peek
+./msg_waitall
 ./msg_trunc
 ./privileged_ports
 ./send_buf_full

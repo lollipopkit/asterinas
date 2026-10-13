@@ -52,7 +52,8 @@ bitflags! {
 
         const SUPPORTED        = RecvFlags::MSG_PEEK.bits
             | RecvFlags::MSG_TRUNC.bits
-            | RecvFlags::MSG_DONTWAIT.bits;
+            | RecvFlags::MSG_DONTWAIT.bits
+            | RecvFlags::MSG_WAITALL.bits;
     }
 }
 
