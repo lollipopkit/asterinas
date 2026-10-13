@@ -49,13 +49,36 @@ mod private {
             &self,
             events: IoEvents,
             timeout: Option<Duration>,
+            try_op: F,
+        ) -> Result<R>
+        where
+            Self: Sized,
+            F: FnMut() -> Result<R>,
+        {
+            self.block_on_unless(false, events, timeout, try_op)
+        }
+
+        /// Blocks until some events occur to complete I/O operations, unless `is_dont_wait` is
+        /// true.
+        ///
+        /// This method behaves like [`Self::block_on`], except that it also fails with
+        /// [`EAGAIN`] instead of blocking if `is_dont_wait` is true. This is used to support
+        /// `MSG_DONTWAIT` in send and receive operations.
+        ///
+        /// [`EAGAIN`]: crate::error::Errno::EAGAIN
+        #[track_caller]
+        fn block_on_unless<F, R>(
+            &self,
+            is_dont_wait: bool,
+            events: IoEvents,
+            timeout: Option<Duration>,
             mut try_op: F,
         ) -> Result<R>
         where
             Self: Sized,
             F: FnMut() -> Result<R>,
         {
-            if self.is_nonblocking() {
+            if is_dont_wait || self.is_nonblocking() {
                 try_op()
             } else {
                 self.wait_events(events, timeout.as_ref(), try_op)

@@ -182,9 +182,12 @@ where
         writer: &mut dyn MultiWrite,
         flags: RecvFlags,
     ) -> Result<(RecvOutput, MessageHeader)> {
-        let (output, addr) = self.block_on(IoEvents::IN, self.timeouts.recv_timeout(), || {
-            self.try_recv(writer, flags)
-        })?;
+        let (output, addr) = self.block_on_unless(
+            flags.contains(RecvFlags::MSG_DONTWAIT),
+            IoEvents::IN,
+            self.timeouts.recv_timeout(),
+            || self.try_recv(writer, flags),
+        )?;
 
         // TODO: Receive control message
 
