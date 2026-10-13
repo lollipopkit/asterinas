@@ -25,8 +25,9 @@ pub(crate) fn greater_order_of(size: usize) -> BuddyOrder {
 
 /// Returns a order that covers at most the given size.
 ///
-/// The size must be larger than 0.
+/// The size must be at least [`PAGE_SIZE`].
 pub(crate) fn lesser_order_of(size: usize) -> BuddyOrder {
+    debug_assert!(size >= PAGE_SIZE);
     let size = size / PAGE_SIZE;
     (usize::BITS - size.leading_zeros() - 1) as BuddyOrder
 }

@@ -98,6 +98,31 @@ impl<const MAX_ORDER: BuddyOrder> BuddySet<MAX_ORDER> {
         head_frame.reset_as_unused(); // It will "drop" the frame without up-calling us.
         Some(paddr)
     }
+
+    /// Allocates a chunk of at most the given order.
+    ///
+    /// If there is a chunk of the given order or larger, a chunk of exactly
+    /// the given order is allocated, like [`Self::alloc_chunk`]. Otherwise,
+    /// the largest available chunk is allocated as a whole.
+    ///
+    /// Returns the address and the order of the allocated chunk.
+    pub(crate) fn alloc_chunk_at_most(&mut self, order: BuddyOrder) -> Option<(Paddr, BuddyOrder)> {
+        let order = order.min(MAX_ORDER - 1);
+        if let Some(addr) = self.alloc_chunk(order) {
+            return Some((addr, order));
+        }
+
+        let smaller_order = (0..order).rev().find(|&i| !self.lists[i].is_empty())?;
+        let addr = self.alloc_chunk(smaller_order).unwrap();
+        Some((addr, smaller_order))
+    }
+
+    /// Allocates the largest available chunk as a whole.
+    ///
+    /// Returns the address and the order of the allocated chunk.
+    pub(crate) fn alloc_largest_chunk(&mut self) -> Option<(Paddr, BuddyOrder)> {
+        self.alloc_chunk_at_most(MAX_ORDER - 1)
+    }
 }
 
 #[cfg(ktest)]
@@ -144,5 +169,34 @@ mod test {
         let chunk = set.alloc_chunk(region_order).unwrap();
         assert!(chunk == region_start);
         assert!(set.total_size() == 0);
+    }
+
+    #[ktest]
+    fn buddy_set_alloc_chunk_at_most() {
+        let region = MockMemoryRegion::alloc(size_of_order(2));
+        let region_start = region.paddr();
+
+        let mut set = BuddySet::<5>::new_empty();
+
+        // A large enough chunk is split into a chunk of the requested order.
+        set.insert_chunk(region_start, 2);
+        assert_eq!(set.alloc_chunk_at_most(1), Some((region_start, 1)));
+        assert_eq!(set.total_size(), size_of_order(1));
+        set.insert_chunk(region_start, 1);
+        assert_eq!(set.alloc_chunk(2), Some(region_start));
+
+        // Without a large enough chunk, smaller chunks are allocated as a whole.
+        let frame0 = region_start;
+        let frame2 = region_start + size_of_order(1);
+        set.insert_chunk(frame0, 0);
+        set.insert_chunk(frame2, 0);
+        let first = set.alloc_chunk_at_most(3).unwrap();
+        let second = set.alloc_largest_chunk().unwrap();
+        assert_eq!(first.1, 0);
+        assert_eq!(second.1, 0);
+        assert!([first.0, second.0].contains(&frame0));
+        assert!([first.0, second.0].contains(&frame2));
+        assert_eq!(set.total_size(), 0);
+        assert_eq!(set.alloc_chunk_at_most(3), None);
     }
 }
