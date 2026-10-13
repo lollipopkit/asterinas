@@ -4,11 +4,11 @@
 //! for efficiently inserting, looking up, and removing sockets.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 
 use jhash::{jhash_1vals, jhash_3vals, jhash_u32_array};
 use ostd::const_assert;
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
+use smoltcp::wire::{IpAddress, IpEndpoint};
 
 use crate::{
     ext::Ext,
@@ -38,18 +38,17 @@ impl ListenerKey {
         Self { addr, port, hash }
     }
 
+    /// Creates a key for listening at the unspecified address in the family of `addr`.
+    pub(crate) const fn new_unspecified(addr: IpAddress, port: PortNum) -> Self {
+        let addr = match addr {
+            IpAddress::Ipv4(_) => IpAddress::Ipv4(Ipv4Addr::UNSPECIFIED),
+            IpAddress::Ipv6(_) => IpAddress::Ipv6(Ipv6Addr::UNSPECIFIED),
+        };
+        Self::new(addr, port)
+    }
+
     pub(crate) const fn hash(&self) -> SocketHash {
         self.hash
-    }
-}
-
-impl From<IpListenEndpoint> for ListenerKey {
-    fn from(listen_endpoint: IpListenEndpoint) -> Self {
-        let addr = listen_endpoint
-            .addr
-            .unwrap_or(IpAddress::Ipv4(Ipv4Addr::UNSPECIFIED));
-        let port = listen_endpoint.port;
-        Self::new(addr, port)
     }
 }
 

@@ -56,6 +56,19 @@ impl IpAddressFamily {
             IpAddressFamily::IPv6 => UNSPECIFIED_LOCAL_ENDPOINT_V6,
         }
     }
+
+    /// Converts an endpoint to a socket address of this address family.
+    ///
+    /// For an IPv6 socket, an IPv4 endpoint is converted to an IPv4-mapped IPv6 address. Such an
+    /// endpoint comes from IPv4 traffic handled by a dual-stack socket.
+    pub(super) fn to_socket_addr(self, endpoint: IpEndpoint) -> SocketAddr {
+        match (self, endpoint.addr) {
+            (IpAddressFamily::IPv6, IpAddress::Ipv4(addr)) => {
+                SocketAddr::IPv6(addr.to_ipv6_mapped(), endpoint.port)
+            }
+            _ => endpoint.into(),
+        }
+    }
 }
 
 // Note: This does not handle IPv4-mapped IPv6 addresses. When `IPV6_V6ONLY` is set,

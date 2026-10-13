@@ -110,6 +110,7 @@ impl_socket_options!(
     pub(crate) struct Ttl(IpTtl);
     pub(crate) struct Hdrincl(bool);
     pub(crate) struct Recverr(bool);
+    pub(crate) struct V6Only(bool);
 );
 
 #[derive(Clone, Copy, Debug)]
@@ -131,4 +132,60 @@ impl IpTtl {
 
 pub(super) trait SetIpLevelOption {
     fn set_hdrincl(&self, _hdrincl: bool) -> Result<()>;
+}
+
+/// IPv6-level socket options.
+#[derive(Clone, Copy, CopyGetters, Debug, Setters)]
+#[get_copy = "pub"]
+#[set = "pub"]
+pub(super) struct Ipv6OptionSet {
+    v6only: bool,
+}
+
+impl Ipv6OptionSet {
+    pub(super) const fn new() -> Self {
+        // Linux uses `net.ipv6.bindv6only` as the default value, which defaults to 0.
+        Self { v6only: false }
+    }
+
+    pub(super) fn get_option(&self, option: &mut dyn SocketOption) -> Result<()> {
+        sock_option_mut!(match option {
+            ipv6_v6only @ V6Only => {
+                ipv6_v6only.set(self.v6only());
+            }
+            _ => return_errno_with_message!(Errno::ENOPROTOOPT, "the socket option is unknown"),
+        });
+
+        Ok(())
+    }
+
+    pub(super) fn set_option(
+        &mut self,
+        option: &dyn SocketOption,
+        socket: &dyn SetIpv6LevelOption,
+    ) -> Result<()> {
+        sock_option_ref!(match option {
+            ipv6_v6only @ V6Only => {
+                // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/ipv6/ipv6_sockglue.c#L536>.
+                if socket.is_bound() {
+                    return_errno_with_message!(
+                        Errno::EINVAL,
+                        "IPV6_V6ONLY cannot be changed after the socket is bound"
+                    );
+                }
+                self.set_v6only(*ipv6_v6only.get().unwrap());
+            }
+            _ => return_errno_with_message!(
+                Errno::ENOPROTOOPT,
+                "the socket option to be set is unknown"
+            ),
+        });
+
+        Ok(())
+    }
+}
+
+pub(super) trait SetIpv6LevelOption {
+    /// Returns whether the socket is bound to a local port.
+    fn is_bound(&self) -> bool;
 }
