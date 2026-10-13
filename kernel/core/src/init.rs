@@ -153,11 +153,37 @@ fn first_kthread() {
     INIT_PROCESS.call_once(|| {
         let karg = INIT_PROC_ARGS.get().unwrap();
         let argv = karg.argv().to_vec();
-        let envp = karg.envp().to_vec();
+        let envp = init_envp(karg.envp());
         boot_init
             .spawn(argv, envp)
             .expect("failed to run the init process")
     });
+}
+
+/// Returns the environment variables of the init process.
+///
+/// Like Linux, the init process starts with `HOME=/` and `TERM=linux`. A variable from the kernel
+/// command line replaces the default one with the same name, or is appended otherwise.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/init/main.c#L194>
+/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/init/main.c#L565-L576>
+fn init_envp(cmdline_envp: &[CString]) -> Vec<CString> {
+    fn name(entry: &CString) -> &[u8] {
+        let bytes = entry.as_bytes();
+        bytes.split(|byte| *byte == b'=').next().unwrap_or(bytes)
+    }
+
+    let mut envp = vec![CString::from(c"HOME=/"), CString::from(c"TERM=linux")];
+    for entry in cmdline_envp {
+        match envp
+            .iter_mut()
+            .find(|existing| name(existing) == name(entry))
+        {
+            Some(existing) => *existing = entry.clone(),
+            None => envp.push(entry.clone()),
+        }
+    }
+    envp
 }
 
 struct BootInit {
