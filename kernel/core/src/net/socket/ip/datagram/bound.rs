@@ -15,6 +15,9 @@ use crate::{
     util::{MultiRead, MultiWrite},
 };
 
+/// The maximum length of a UDP payload, which is limited by the 16-bit length field.
+const MAX_UDP_PAYLOAD_LEN: usize = u16::MAX as usize;
+
 pub(super) struct BoundDatagram {
     bound_socket: UdpSocket,
     remote_endpoint: Option<IpEndpoint>,
@@ -57,23 +60,26 @@ impl datagram_common::Bound for BoundDatagram {
         writer: &mut dyn MultiWrite,
         flags: RecvFlags,
     ) -> Result<(RecvOutput, Self::Endpoint)> {
+        // User space cannot be accessed while holding spin locks, so the packet is first copied to
+        // a kernel buffer. If copying to user space fails later, the packet is dropped like Linux.
+        let user_len = writer.sum_lens();
         let result = self
             .bound_socket
             .recv(flags.receive_behavior(), |packet, udp_metadata| {
-                let message_len = packet.len();
-                let copied_res = writer
-                    .write(&mut VmReader::from(packet))
-                    .map_err(Into::into);
-                let endpoint = udp_metadata.endpoint;
-                (copied_res, endpoint, message_len)
+                let copy_len = packet.len().min(user_len);
+                (
+                    packet[..copy_len].to_vec(),
+                    udp_metadata.endpoint,
+                    packet.len(),
+                )
             });
 
         match result {
-            Ok((Ok(copied_len), endpoint, message_len)) => {
+            Ok((data, endpoint, message_len)) => {
+                let copied_len = writer.write(&mut VmReader::from(data.as_slice()))?;
                 let output = RecvOutput::new_for_packet(flags, copied_len, message_len);
                 Ok((output, endpoint))
             }
-            Ok((Err(e), _, _)) => Err(e),
             Err(RecvError::Exhausted) => {
                 return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty")
             }
@@ -89,21 +95,22 @@ impl datagram_common::Bound for BoundDatagram {
         remote: &Self::Endpoint,
         _flags: SendFlags,
     ) -> Result<usize> {
-        let result = self
-            .bound_socket
-            .send(reader.sum_lens(), *remote, |socket_buffer| {
-                // FIXME: If copy failed, we should not send any packet.
-                // But current smoltcp API seems not to support this behavior.
-                reader
-                    .read(&mut VmWriter::from(socket_buffer))
-                    .inspect_err(|e| {
-                        warn!("unexpected UDP packet {e:#?} will be sent");
-                    })
-                    .map_err(Into::into)
-            });
+        let len = reader.sum_lens();
+        if len > MAX_UDP_PAYLOAD_LEN {
+            return_errno_with_message!(Errno::EMSGSIZE, "the message is too large");
+        }
+
+        // User space cannot be accessed while holding spin locks, so the data are first copied to
+        // a kernel buffer. This also ensures that no packet is sent if the copy fails.
+        let mut data = vec![0u8; len];
+        reader.read(&mut VmWriter::from(data.as_mut_slice()))?;
+
+        let result = self.bound_socket.send(len, *remote, |socket_buffer| {
+            socket_buffer.copy_from_slice(&data)
+        });
 
         match result {
-            Ok(inner) => inner,
+            Ok(()) => Ok(len),
             Err(SendError::TooLarge) => {
                 return_errno_with_message!(Errno::EMSGSIZE, "the message is too large");
             }

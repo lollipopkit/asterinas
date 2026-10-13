@@ -69,10 +69,15 @@ impl ConnectedStream {
         Ok(())
     }
 
+    /// Receives data.
+    ///
+    /// If copying to the user buffer fails, no data are received and the address that caused the
+    /// failure is stored in `fault_addr`.
     pub(super) fn try_recv(
         &self,
         writer: &mut dyn MultiWrite,
         flags: RecvFlags,
+        fault_addr: &mut Option<Vaddr>,
     ) -> Result<(usize, NeedIfacePoll)> {
         let mut trunc_len = if flags.contains(RecvFlags::MSG_TRUNC) {
             Some(writer.sum_lens())
@@ -87,7 +92,10 @@ impl ConnectedStream {
                     *remaining -= recv_len;
                     Ok(recv_len)
                 } else {
-                    writer.write(&mut VmReader::from(socket_buffer))
+                    // On errors, nothing is copied.
+                    writer
+                        .write_or_rollback(&mut VmReader::from(socket_buffer))
+                        .map_err(|fault| (fault, 0))
                 }
             });
 
@@ -96,7 +104,10 @@ impl ConnectedStream {
             Err(IoError::NoProgress) => {
                 return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty")
             }
-            Err(IoError::Copy(e)) => Err(e.into()),
+            Err(IoError::Copy((err, addr))) => {
+                *fault_addr = Some(addr);
+                Err(err.into())
+            }
             Err(IoError::Socket(RecvError::Finished | RecvError::InvalidState)) => {
                 // `InvalidState` occurs when the connection is reset but `ECONNRESET` was reported
                 // earlier. Linux returns EOF in this case, so we follow it.
@@ -108,21 +119,32 @@ impl ConnectedStream {
         }
     }
 
+    /// Sends data.
+    ///
+    /// If copying from the user buffer fails, no data are sent and the address that caused the
+    /// failure is stored in `fault_addr`.
     pub(super) fn try_send(
         &self,
         reader: &mut dyn MultiRead,
         _flags: SendFlags,
+        fault_addr: &mut Option<Vaddr>,
     ) -> Result<(usize, NeedIfacePoll)> {
-        let result = self
-            .tcp_conn
-            .send(|socket_buffer| reader.read(&mut VmWriter::from(socket_buffer)));
+        let result = self.tcp_conn.send(|socket_buffer| {
+            // On errors, nothing is copied.
+            reader
+                .read_or_rollback(&mut VmWriter::from(socket_buffer))
+                .map_err(|fault| (fault, 0))
+        });
 
         match result {
             Ok((sent_bytes, need_poll)) => Ok((sent_bytes.get(), need_poll)),
             Err(IoError::NoProgress) => {
                 return_errno_with_message!(Errno::EAGAIN, "the send buffer is full")
             }
-            Err(IoError::Copy(e)) => Err(e.into()),
+            Err(IoError::Copy((err, addr))) => {
+                *fault_addr = Some(addr);
+                Err(err.into())
+            }
             Err(IoError::Socket(SendError::InvalidState)) => {
                 return_errno_with_message!(Errno::EPIPE, "the connection is closed");
             }

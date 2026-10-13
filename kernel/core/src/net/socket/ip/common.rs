@@ -7,6 +7,7 @@ use aster_bigtcp::{
     iface::BindPortConfig,
     wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address},
 };
+use ostd::task::Task;
 
 use crate::{
     net::{
@@ -15,6 +16,7 @@ use crate::{
         socket::util::check_port_privilege,
     },
     prelude::*,
+    vm::{perms::VmPerms, vmar::PageFaultInfo},
 };
 
 pub(super) fn resolve_bind_iface_and_config(
@@ -104,6 +106,37 @@ where
     }
 
     Err(BindError::Exhausted.into())
+}
+
+/// Runs `copy`, which copies data from or to user space while holding spin locks.
+///
+/// The page fault handler is disabled when running `copy`, because handling page faults may sleep.
+/// Returns `None` if `copy` fails due to a page fault. In that case, the caller should release the
+/// spin locks, call [`fault_in_user_page`], and retry.
+pub(super) fn try_copy_in_atomic_mode<T>(copy: impl FnOnce() -> Result<T>) -> Option<Result<T>> {
+    let task = Task::current().unwrap();
+    match task.as_thread_local() {
+        Some(thread_local) => thread_local.with_page_fault_disabled(copy),
+        // Kernel threads do not access user space, so page faults cannot occur.
+        None => Some(copy()),
+    }
+}
+
+/// Handles the page fault at `addr` of the current user space.
+///
+/// This method must not be called in the atomic mode. It fails with `EFAULT` if the page fault
+/// cannot be resolved, e.g., when the address is not mapped.
+pub(super) fn fault_in_user_page(addr: Option<Vaddr>, perms: VmPerms) -> Result<()> {
+    let Some(addr) = addr else {
+        return_errno_with_message!(Errno::EFAULT, "no user buffer can cause the page fault");
+    };
+
+    let task = Task::current().unwrap();
+    let thread_local = task.as_thread_local().unwrap();
+    CurrentUserSpace::new(thread_local)
+        .vmar()
+        .handle_page_fault(&PageFaultInfo::new(addr, perms))
+        .map_err(|_| Error::with_message(Errno::EFAULT, "the user buffer is not accessible"))
 }
 
 impl From<BindError> for Error {
