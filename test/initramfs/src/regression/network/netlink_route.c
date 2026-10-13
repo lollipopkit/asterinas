@@ -342,6 +342,10 @@ FN_TEST(get_link_error)
 
 	TEST_SUCC(bind(sock_fd, (struct sockaddr *)&sa, sizeof(sa)));
 
+	struct sockaddr_nl local;
+	socklen_t local_len = sizeof(local);
+	TEST_SUCC(getsockname(sock_fd, (struct sockaddr *)&local, &local_len));
+
 	struct nl_req {
 		struct nlmsghdr hdr;
 		struct ifinfomsg ifi;
@@ -365,6 +369,8 @@ FN_TEST(get_link_error)
 	TEST_SUCC(sendmsg(sock_fd, &msg, 0));                              \
 	TEST_RES(recv(sock_fd, buffer, BUFFER_SIZE, 0),                    \
 		 ((struct nlmsghdr *)buffer)->nlmsg_type == NLMSG_ERROR && \
+			 ((struct nlmsghdr *)buffer)->nlmsg_pid ==         \
+				 local.nl_pid &&                           \
 			 ((struct nlmsgerr *)NLMSG_DATA(buffer))->error == \
 				 -errno);
 
