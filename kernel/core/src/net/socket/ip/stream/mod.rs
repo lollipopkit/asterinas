@@ -20,6 +20,7 @@ use util::{Retrans, TcpOptionSet};
 
 use super::{
     addr::IpAddressFamily,
+    common::{fault_in_user_page, try_copy_in_atomic_mode},
     ioctl::ipv4_ioctl,
     options::{IpOptionSet, Ipv6OptionSet, SetIpLevelOption, SetIpv6LevelOption},
 };
@@ -46,6 +47,7 @@ use crate::{
     prelude::*,
     process::signal::{PollHandle, Pollable, Pollee},
     util::{MultiRead, MultiWrite, ioctl::RawIoctl, net::SockType},
+    vm::perms::VmPerms,
 };
 
 mod bound;
@@ -376,70 +378,90 @@ impl StreamSocket {
         writer: &mut dyn MultiWrite,
         flags: RecvFlags,
     ) -> Result<(usize, SocketAddr)> {
-        let state = self.read_updated_state();
+        loop {
+            let state = self.read_updated_state();
 
-        let connected_stream = match state.as_ref() {
-            State::Connected(connected_stream) => connected_stream,
-            State::Init(init_stream) => {
-                let result = init_stream.try_recv();
-                self.pollee.invalidate();
-                return result;
+            let connected_stream = match state.as_ref() {
+                State::Connected(connected_stream) => connected_stream,
+                State::Init(init_stream) => {
+                    let result = init_stream.try_recv();
+                    self.pollee.invalidate();
+                    return result;
+                }
+                State::Listen(_) => {
+                    return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected")
+                }
+                State::Connecting(_) => {
+                    return_errno_with_message!(Errno::EAGAIN, "the socket is connecting")
+                }
+            };
+
+            // The data are copied to user space while holding spin locks.
+            let mut fault_addr = None;
+            let Some(result) = try_copy_in_atomic_mode(|| {
+                connected_stream.try_recv(writer, flags, &mut fault_addr)
+            }) else {
+                drop(state);
+                fault_in_user_page(fault_addr, VmPerms::WRITE)?;
+                continue;
+            };
+            self.pollee.invalidate();
+
+            let (recv_bytes, need_poll) = result?;
+            let iface_to_poll = need_poll.then(|| connected_stream.iface().clone());
+            let remote_endpoint = connected_stream.remote_endpoint();
+
+            drop(state);
+            if let Some(iface) = iface_to_poll {
+                iface.poll();
             }
-            State::Listen(_) => {
-                return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected")
-            }
-            State::Connecting(_) => {
-                return_errno_with_message!(Errno::EAGAIN, "the socket is connecting")
-            }
-        };
 
-        let result = connected_stream.try_recv(writer, flags);
-        self.pollee.invalidate();
-
-        let (recv_bytes, need_poll) = result?;
-        let iface_to_poll = need_poll.then(|| connected_stream.iface().clone());
-        let remote_endpoint = connected_stream.remote_endpoint();
-
-        drop(state);
-        if let Some(iface) = iface_to_poll {
-            iface.poll();
+            return Ok((recv_bytes, self.family.to_socket_addr(remote_endpoint)));
         }
-
-        Ok((recv_bytes, self.family.to_socket_addr(remote_endpoint)))
     }
 
     fn try_send(&self, reader: &mut dyn MultiRead, flags: SendFlags) -> Result<usize> {
-        let state = self.read_updated_state();
+        loop {
+            let state = self.read_updated_state();
 
-        let connected_stream = match state.as_ref() {
-            State::Connected(connected_stream) => connected_stream,
-            State::Init(init_stream) => {
-                let result = init_stream.try_send();
-                self.pollee.invalidate();
-                return result;
+            let connected_stream = match state.as_ref() {
+                State::Connected(connected_stream) => connected_stream,
+                State::Init(init_stream) => {
+                    let result = init_stream.try_send();
+                    self.pollee.invalidate();
+                    return result;
+                }
+                State::Listen(_) => {
+                    return_errno_with_message!(Errno::EPIPE, "the socket is not connected");
+                }
+                State::Connecting(_) => {
+                    // FIXME: Linux indeed allows data to be buffered at this point. Can we do
+                    // something similar?
+                    return_errno_with_message!(Errno::EAGAIN, "the socket is connecting")
+                }
+            };
+
+            // The data are copied from user space while holding spin locks.
+            let mut fault_addr = None;
+            let Some(result) = try_copy_in_atomic_mode(|| {
+                connected_stream.try_send(reader, flags, &mut fault_addr)
+            }) else {
+                drop(state);
+                fault_in_user_page(fault_addr, VmPerms::READ)?;
+                continue;
+            };
+            self.pollee.invalidate();
+
+            let (sent_bytes, need_poll) = result?;
+            let iface_to_poll = need_poll.then(|| connected_stream.iface().clone());
+
+            drop(state);
+            if let Some(iface) = iface_to_poll {
+                iface.poll();
             }
-            State::Listen(_) => {
-                return_errno_with_message!(Errno::EPIPE, "the socket is not connected");
-            }
-            State::Connecting(_) => {
-                // FIXME: Linux indeed allows data to be buffered at this point. Can we do
-                // something similar?
-                return_errno_with_message!(Errno::EAGAIN, "the socket is connecting")
-            }
-        };
 
-        let result = connected_stream.try_send(reader, flags);
-        self.pollee.invalidate();
-
-        let (sent_bytes, need_poll) = result?;
-        let iface_to_poll = need_poll.then(|| connected_stream.iface().clone());
-
-        drop(state);
-        if let Some(iface) = iface_to_poll {
-            iface.poll();
+            return Ok(sent_bytes);
         }
-
-        Ok(sent_bytes)
     }
 
     fn check_io_events(&self) -> IoEvents {

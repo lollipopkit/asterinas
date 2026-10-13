@@ -209,6 +209,14 @@ pub(crate) trait MultiRead: ReadCString {
     /// Skips the first `nbytes` bytes of data, or skips to the end if the readers have
     /// insufficient bytes.
     fn skip_some(&mut self, nbytes: usize);
+
+    /// Reads like [`Self::read`], but leaves `self` unchanged if an error occurs.
+    ///
+    /// On errors, this method returns the error and the address that caused the error.
+    fn read_or_rollback(
+        &mut self,
+        writer: &mut VmWriter<'_, Infallible>,
+    ) -> Result<usize, (OstdError, Vaddr)>;
 }
 
 /// Trait defining the write behavior for a collection of [`VmWriter`]s.
@@ -238,6 +246,14 @@ pub(crate) trait MultiWrite {
     /// Skips the first `nbytes` bytes of data, or skips to the end if the writers have
     /// insufficient bytes.
     fn skip_some(&mut self, nbytes: usize);
+
+    /// Writes like [`Self::write`], but leaves `self` unchanged if an error occurs.
+    ///
+    /// On errors, this method returns the error and the address that caused the error.
+    fn write_or_rollback(
+        &mut self,
+        reader: &mut VmReader<'_, Infallible>,
+    ) -> Result<usize, (OstdError, Vaddr)>;
 }
 
 impl MultiRead for VmReaderArray<'_> {
@@ -271,6 +287,27 @@ impl MultiRead for VmReaderArray<'_> {
             }
         }
     }
+
+    fn read_or_rollback(
+        &mut self,
+        writer: &mut VmWriter<'_, Infallible>,
+    ) -> Result<usize, (OstdError, Vaddr)> {
+        let mut total_len = 0;
+
+        for reader in self.0.iter() {
+            let mut reader = reader.clone();
+            match reader.read_fallible(writer) {
+                Ok(copied_len) => total_len += copied_len,
+                Err((err, _)) => return Err((err, reader.cursor() as Vaddr)),
+            }
+            if !writer.has_avail() {
+                break;
+            }
+        }
+
+        self.skip_some(total_len);
+        Ok(total_len)
+    }
 }
 
 impl MultiRead for VmReader<'_> {
@@ -284,6 +321,20 @@ impl MultiRead for VmReader<'_> {
 
     fn skip_some(&mut self, nbytes: usize) {
         self.skip(self.remain().min(nbytes));
+    }
+
+    fn read_or_rollback(
+        &mut self,
+        writer: &mut VmWriter<'_, Infallible>,
+    ) -> Result<usize, (OstdError, Vaddr)> {
+        let mut reader = self.clone();
+        match reader.read_fallible(writer) {
+            Ok(copied_len) => {
+                self.skip(copied_len);
+                Ok(copied_len)
+            }
+            Err((err, _)) => Err((err, reader.cursor() as Vaddr)),
+        }
     }
 }
 
@@ -335,6 +386,27 @@ impl MultiWrite for VmWriterArray<'_> {
             }
         }
     }
+
+    fn write_or_rollback(
+        &mut self,
+        reader: &mut VmReader<'_, Infallible>,
+    ) -> Result<usize, (OstdError, Vaddr)> {
+        let mut total_len = 0;
+
+        for writer in self.0.iter_mut() {
+            let mut writer = writer.clone_exclusive();
+            match writer.write_fallible(reader) {
+                Ok(copied_len) => total_len += copied_len,
+                Err((err, _)) => return Err((err, writer.cursor() as Vaddr)),
+            }
+            if !reader.has_remain() {
+                break;
+            }
+        }
+
+        self.skip_some(total_len);
+        Ok(total_len)
+    }
 }
 
 impl MultiWrite for VmWriter<'_> {
@@ -351,6 +423,20 @@ impl MultiWrite for VmWriter<'_> {
 
     fn skip_some(&mut self, nbytes: usize) {
         self.skip(self.avail().min(nbytes));
+    }
+
+    fn write_or_rollback(
+        &mut self,
+        reader: &mut VmReader<'_, Infallible>,
+    ) -> Result<usize, (OstdError, Vaddr)> {
+        let mut writer = self.clone_exclusive();
+        match writer.write_fallible(reader) {
+            Ok(copied_len) => {
+                self.skip(copied_len);
+                Ok(copied_len)
+            }
+            Err((err, _)) => Err((err, writer.cursor() as Vaddr)),
+        }
     }
 }
 
