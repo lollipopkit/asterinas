@@ -166,7 +166,7 @@ impl Ipv6OptionSet {
     ) -> Result<()> {
         sock_option_ref!(match option {
             ipv6_v6only @ V6Only => {
-                // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/ipv6/ipv6_sockglue.c#L536>.
+                // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/ipv6/ipv6_sockglue.c#L656-L659>.
                 if socket.is_bound() {
                     return_errno_with_message!(
                         Errno::EINVAL,

@@ -187,7 +187,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
             // which init has explicitly installed signal handlers."
             //
             // Forced signals are exceptions. Otherwise, init would fault again forever.
-            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/signal.c#L1323>
+            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/signal.c#L1314-L1319>
         }
         SigAction::Dfl => {
             let sig_default_action = SigDefaultAction::from_signum(sig_num);
@@ -481,7 +481,7 @@ pub(crate) fn handle_user_signal(
             // Clear the DF flag to conform to x86-64 calling conventions. Also clear the TF and
             // RF flags so that the handler does not start with single-stepping enabled.
             //
-            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/arch/x86/kernel/signal.c#L284>
+            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/arch/x86/kernel/signal.c#L306>
             const X86_RFLAGS_TF: usize = 1 << 8;
             const X86_RFLAGS_DF: usize = 1 << 10;
             const X86_RFLAGS_RF: usize = 1 << 16;
