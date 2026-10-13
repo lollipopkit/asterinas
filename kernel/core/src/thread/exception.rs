@@ -72,7 +72,7 @@ pub(crate) trait ToFaultSignal {
 /// reset to the default. Otherwise, the thread would return to the faulting instruction and fault
 /// again forever.
 ///
-/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/signal.c#L1302>
+/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/signal.c#L1294-L1312>
 fn generate_fault_signal(exception: CpuException, ctx: &Context, user_ctx: &UserContext) {
     let Some(signal) = exception.to_fault_signal(user_ctx) else {
         panic!("`{:?}` cannot be handled via signals", exception);

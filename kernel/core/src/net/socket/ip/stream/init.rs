@@ -244,7 +244,7 @@ impl InitStream {
             bound_ports
         } else {
             // An unbound socket is bound to the unspecified address with an ephemeral port.
-            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/ipv4/af_inet.c#L190>.
+            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/ipv4/inet_connection_sock.c#L1363>.
             let endpoint = family.unspecified_endpoint();
             match BoundTcpPorts::bind(&endpoint, can_reuse, is_dual_stack) {
                 Ok(bound_ports) => bound_ports,
