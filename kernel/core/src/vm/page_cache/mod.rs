@@ -343,6 +343,20 @@ impl PageCache {
     pub(crate) fn fill_zeros(&self, range: Range<usize>) -> Result<()> {
         self.0.fill_zeros(range)
     }
+
+    /// Caches a zeroed page at `page_idx` unless a page is already cached there.
+    ///
+    /// The page is up to date, so the caller must ensure that the backend
+    /// content of the page is zeros, e.g., because it is a hole or a newly
+    /// allocated block that has been zeroed. This saves reading the backend
+    /// when the page is about to be partially written.
+    pub(crate) fn insert_zero_page_if_absent(&self, page_idx: usize) -> Result<()> {
+        match self.0.as_backed_vmo() {
+            Some(backed_vmo) => backed_vmo.insert_zero_page_if_absent(page_idx),
+            // Pages of anonymous VMOs are zero-filled on first access.
+            None => Ok(()),
+        }
+    }
 }
 
 impl VmIo for PageCache {

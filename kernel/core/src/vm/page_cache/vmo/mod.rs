@@ -865,6 +865,20 @@ impl PageSelection {
 }
 
 impl<'a> BackedVmo<'a> {
+    /// Caches a zeroed up-to-date page at `page_idx` if no page is cached there.
+    pub(super) fn insert_zero_page_if_absent(&self, page_idx: usize) -> Result<()> {
+        let mut locked_pages = self.pages.lock();
+        if page_idx >= self.size().div_ceil(PAGE_SIZE) {
+            return_errno_with_message!(Errno::EINVAL, "the offset is outside the VMO");
+        }
+
+        let mut cursor = locked_pages.cursor_mut(page_idx as u64);
+        if cursor.load().is_none() {
+            cursor.store(CachePage::alloc_zero()?);
+        }
+        Ok(())
+    }
+
     /// Writes back dirty pages in the specified byte range to the backend storage.
     pub(super) fn flush_dirty_pages(&self, range: &Range<usize>) -> Result<()> {
         if range.start >= self.size() {

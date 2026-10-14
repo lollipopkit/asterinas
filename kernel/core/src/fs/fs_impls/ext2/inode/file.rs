@@ -197,7 +197,39 @@ impl InodeInner {
             self.resize_page_cache(end, old_size)?;
         }
 
+        self.zero_partial_new_blocks(offset, end, old_size)?;
         self.allocate_range_blocks(offset, end)?;
+        Ok(())
+    }
+
+    /// Caches zeroed pages for the blocks that the write covers partially and
+    /// that hold no file data yet.
+    ///
+    /// Such blocks are holes or lie beyond the old end of the file, so their
+    /// content is zeros: blocks are zeroed on the device when allocated (see
+    /// `BlockPtrTree::allocate_blocks`). Caching the zeros saves reading the
+    /// blocks back to fill the bytes that the write does not cover. Linux also
+    /// zeroes these ranges of new buffers instead of reading them, in
+    /// `__block_write_begin_int` (fs/buffer.c in v7.2.10).
+    fn zero_partial_new_blocks(&self, offset: usize, end: usize, old_size: usize) -> Result<()> {
+        let first_block = offset / BLOCK_SIZE;
+        let last_block = (end - 1) / BLOCK_SIZE;
+
+        let boundary_blocks =
+            core::iter::once(first_block).chain((last_block != first_block).then_some(last_block));
+        for idx in boundary_blocks {
+            let block_start = idx * BLOCK_SIZE;
+            let is_partial = offset > block_start || end < block_start + BLOCK_SIZE;
+            if !is_partial {
+                continue;
+            }
+
+            let has_data = block_start < old_size
+                && self.block_manager()?.lookup_block(idx as Iblock)?.is_some();
+            if !has_data {
+                self.page_cache().insert_zero_page_if_absent(idx)?;
+            }
+        }
         Ok(())
     }
 
@@ -547,6 +579,38 @@ mod test {
         let mut read_back = [0xffu8; 32];
         file.read_bytes_at(mmap_offset, &mut read_back).unwrap();
         assert_eq!(read_back, mmap_payload);
+    }
+
+    #[ktest]
+    fn partial_write_to_new_block_skips_reading_it() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(4, 4)
+            .with_free_inodes(1000, 1000)
+            .build()
+            .unwrap();
+        let root = f.root();
+        let file = create_file(&root, "new_block");
+        file.resize(BLOCK_SIZE).unwrap();
+
+        // Write partially to a hole within the file and beyond the end of the file.
+        let payload = [0xa5u8; 100];
+        let read_count = f.disk.read_count();
+        for offset in [100, BLOCK_SIZE * 2 + 100] {
+            let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+            file.write_at(offset, &mut reader).unwrap();
+        }
+        assert_eq!(f.disk.read_count(), read_count);
+
+        let mut expected = vec![0u8; BLOCK_SIZE];
+        expected[100..200].copy_from_slice(&payload);
+        for block_start in [0, BLOCK_SIZE * 2] {
+            let mut read_back = vec![0xffu8; BLOCK_SIZE];
+            let mut writer = VmWriter::from(read_back.as_mut_slice()).to_fallible();
+            file.read_at(block_start, &mut writer).unwrap();
+            assert_eq!(read_back[..200], expected[..200]);
+        }
     }
 
     #[ktest]
