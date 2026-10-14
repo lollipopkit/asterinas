@@ -570,7 +570,9 @@ fn read_ahead_on_cold_read() {
     }
 
     // The pages read ahead are cached.
-    page_cache.read_bytes(3 * PAGE_SIZE, &mut read_buffer).unwrap();
+    page_cache
+        .read_bytes(3 * PAGE_SIZE, &mut read_buffer)
+        .unwrap();
     assert_eq!(backend.read_count(3), 1);
 }
 
@@ -598,7 +600,9 @@ fn read_ahead_skips_cached_pages() {
     let page_cache = new_backend_page_cache(&backend, 8);
 
     let mut read_buffer = vec![0; PAGE_SIZE];
-    page_cache.read_bytes(2 * PAGE_SIZE, &mut read_buffer).unwrap();
+    page_cache
+        .read_bytes(2 * PAGE_SIZE, &mut read_buffer)
+        .unwrap();
     page_cache.read_bytes(0, &mut read_buffer).unwrap();
 
     for idx in 0..6 {
