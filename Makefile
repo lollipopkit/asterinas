@@ -137,7 +137,8 @@ CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
 ifneq ($(strip $(CMDLINE)),)
 CARGO_OSDK_BUILD_ARGS += $(foreach arg,$(CMDLINE),--kcmd-args="$(arg)")
 endif
-CARGO_OSDK_TEST_ARGS :=
+# Test kernels print results with the early console.
+CARGO_OSDK_TEST_ARGS := --kcmd-args="earlycon"
 
 ifeq ($(AUTO_TEST), conformance)
 ENABLE_CONFORMANCE_TEST := true
