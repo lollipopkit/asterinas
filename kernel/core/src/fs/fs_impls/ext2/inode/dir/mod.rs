@@ -470,7 +470,9 @@ impl InodeInner {
 
         for block_idx in 0..data_blocks {
             let block = DirBlockView::from_index(page_cache, block_idx, file_size);
-            let mut entry_iter = block.iter_entries();
+            let Ok(mut entry_iter) = block.iter_entries() else {
+                return false;
+            };
 
             loop {
                 let entry = match entry_iter.next_entry() {
@@ -525,7 +527,7 @@ impl InodeInner {
             }
 
             let block = DirBlockView::from_index(page_cache, block_idx, size);
-            let mut entry_iter = block.iter_entries();
+            let mut entry_iter = block.iter_entries()?;
             while let Some((entry_offset_in_block, entry)) = entry_iter.next_entry()? {
                 let entry_offset = block_offset + entry_offset_in_block;
                 let rec_len = entry.header.rec_len as usize;
@@ -583,7 +585,7 @@ impl InodeInner {
         for block_idx in 0..data_blocks {
             let block_offset = block_idx * BLOCK_SIZE;
             let block = DirBlockView::from_index(page_cache, block_idx, file_size);
-            let mut entry_iter = block.iter_entries();
+            let mut entry_iter = block.iter_entries()?;
 
             while let Some((entry_offset, header)) = entry_iter.next_entry_header()? {
                 let ino = header.ino;
@@ -677,7 +679,7 @@ impl InodeInner {
         for block_idx in 0..file_size.div_ceil(BLOCK_SIZE) {
             let block_offset = block_idx * BLOCK_SIZE;
             let block = DirBlockView::from_index(page_cache, block_idx, file_size);
-            let mut entry_iter = block.iter_entries();
+            let mut entry_iter = block.iter_entries()?;
             while let Some((entry_offset, entry)) = entry_iter.next_entry()? {
                 let ino = entry.header.ino;
                 if ino == 0 || entry.name != name_bytes {
