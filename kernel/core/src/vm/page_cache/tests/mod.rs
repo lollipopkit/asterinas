@@ -274,7 +274,8 @@ fn concurrent_commit_and_truncate() {
         .spawn()
     };
 
-    backend.wait_for_deferred_bios(IoKind::Read, 1);
+    // The page fault also reads page 0 around page 1.
+    backend.wait_for_deferred_bios(IoKind::Read, 2);
 
     let resize_thread = {
         let page_cache = page_cache.clone();
@@ -294,7 +295,7 @@ fn concurrent_commit_and_truncate() {
 
     // Let the blocked commit finish, then verify the truncated page is no
     // longer accessible through subsequent VMO operations.
-    assert!(backend.complete_next_deferred_bio(IoKind::Read, true));
+    while backend.complete_next_deferred_bio(IoKind::Read, true) {}
     commit_thread.join();
     resize_thread.join();
 
@@ -549,4 +550,58 @@ fn delayed_io_completion() {
     assert!(first_flush_result.lock().take().unwrap().is_ok());
     assert!(second_flush_result.lock().take().unwrap().is_ok());
     assert_eq!(backend.persisted_page_bytes(0), latest_dirty_pattern);
+}
+
+/// Reads one cold page and checks that the initial readahead window follows Linux.
+#[ktest]
+fn read_ahead_on_cold_read() {
+    let backend = MockPageCacheBackend::new(8);
+    let page_cache = new_backend_page_cache(&backend, 8);
+
+    let mut read_buffer = vec![0; PAGE_SIZE];
+    page_cache.read_bytes(0, &mut read_buffer).unwrap();
+
+    // A one-page read reads four pages ahead.
+    for idx in 0..4 {
+        assert_eq!(backend.read_count(idx), 1);
+    }
+    for idx in 4..8 {
+        assert_eq!(backend.read_count(idx), 0);
+    }
+
+    // The pages read ahead are cached.
+    page_cache.read_bytes(3 * PAGE_SIZE, &mut read_buffer).unwrap();
+    assert_eq!(backend.read_count(3), 1);
+}
+
+/// Reads around a cold page on a page fault.
+#[ktest]
+fn read_around_on_page_fault() {
+    let backend = MockPageCacheBackend::new(64);
+    let page_cache = new_backend_page_cache(&backend, 64);
+
+    page_cache
+        .as_vmo()
+        .commit_on(20, VmoMapMode::SharedRead)
+        .unwrap();
+
+    for idx in 0..64 {
+        let expected = if (4..36).contains(&idx) { 1 } else { 0 };
+        assert_eq!(backend.read_count(idx), expected);
+    }
+}
+
+/// Skips cached pages when reading ahead.
+#[ktest]
+fn read_ahead_skips_cached_pages() {
+    let backend = MockPageCacheBackend::new(8);
+    let page_cache = new_backend_page_cache(&backend, 8);
+
+    let mut read_buffer = vec![0; PAGE_SIZE];
+    page_cache.read_bytes(2 * PAGE_SIZE, &mut read_buffer).unwrap();
+    page_cache.read_bytes(0, &mut read_buffer).unwrap();
+
+    for idx in 0..6 {
+        assert_eq!(backend.read_count(idx), 1);
+    }
 }
