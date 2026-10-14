@@ -11,7 +11,9 @@
 
 use ostd::mm::io::util::HasVmReaderWriter;
 
-use super::{super::Ext2, FileFlags, Inode, InodeInner, io_range::IoRange};
+use super::{
+    super::Ext2, FileFlags, Inode, InodeInner, block_manager::NewBlockInit, io_range::IoRange,
+};
 use crate::fs::{
     ext2::{prelude::*, utils},
     vfs::inode::FallocMode,
@@ -148,7 +150,9 @@ impl Inode {
 
         match mode {
             FallocMode::Allocate => {
-                if let Err(err) = inner.allocate_range_blocks(offset, end) {
+                if let Err(err) =
+                    inner.allocate_range_blocks(offset, end, NewBlockInit::ZeroOnDevice)
+                {
                     inner.rollback_fallocate(old_size);
                     return Err(err);
                 }
@@ -160,7 +164,9 @@ impl Inode {
                 }
             }
             FallocMode::AllocateKeepSize => {
-                if let Err(err) = inner.allocate_range_blocks(offset, end) {
+                if let Err(err) =
+                    inner.allocate_range_blocks(offset, end, NewBlockInit::ZeroOnDevice)
+                {
                     inner.rollback_fallocate(old_size);
                     return Err(err);
                 }
@@ -179,10 +185,10 @@ impl Inode {
 }
 
 impl InodeInner {
-    /// Prepares the inode for a write spanning `[offset, end)`.
+    /// Prepares the inode for a buffered write spanning `[offset, end)`.
     ///
-    /// Expands the page cache if `end > file_size`, zeroes partial block
-    /// boundaries, and allocates missing data blocks.
+    /// Expands the page cache if `end > file_size`, allocates missing data
+    /// blocks, and initializes their pages in the page cache with zeros.
     ///
     /// # Rollback
     ///
@@ -191,14 +197,67 @@ impl InodeInner {
     /// free partially allocated blocks. The caller must hold `InodeInner`
     /// write lock for the entire prepare-write-commit sequence.
     pub(super) fn prepare_write(&mut self, fs: &Ext2, offset: usize, end: usize) -> Result<()> {
+        let old_size = self.expand_page_cache_for_write(fs, end)?;
+
+        // The pages of the blocks to allocate are locked and initialized in the
+        // page cache, so the blocks need not be zeroed on the device. Linux
+        // likewise allocates blocks under the folio lock and zeroes the new
+        // buffers in the folio (`__block_write_begin_int` in fs/buffer.c of
+        // v7.2.10).
+        let new_block_pages = self
+            .page_cache()
+            .lock_new_block_pages(self.pages_without_data(offset, end, old_size)?.into_iter())?;
+        let result = self.allocate_range_blocks(offset, end, NewBlockInit::LockedPages);
+        let block_manager = self.block_manager()?;
+        new_block_pages.finish(|idx| {
+            block_manager
+                .lookup_block(idx as Iblock)
+                .is_ok_and(|bid| bid.is_some())
+        });
+        result
+    }
+
+    /// Prepares the inode for a direct write spanning `[offset, end)`.
+    ///
+    /// Unlike [`Self::prepare_write`], newly allocated blocks are zeroed on
+    /// the device, because the written data does not go through the page
+    /// cache. The same rollback rules apply.
+    fn prepare_direct_write(&mut self, fs: &Ext2, offset: usize, end: usize) -> Result<()> {
+        self.expand_page_cache_for_write(fs, end)?;
+        self.allocate_range_blocks(offset, end, NewBlockInit::ZeroOnDevice)
+    }
+
+    /// Expands the page cache to cover a write ending at `end`.
+    ///
+    /// Returns the file size before the write.
+    fn expand_page_cache_for_write(&mut self, fs: &Ext2, end: usize) -> Result<usize> {
         let old_size = self.file_size();
         if end > old_size {
             self.ensure_size_within_limit(fs, end)?;
             self.resize_page_cache(end, old_size)?;
         }
+        Ok(old_size)
+    }
 
-        self.allocate_range_blocks(offset, end)?;
-        Ok(())
+    /// Returns the indices of the pages in `[offset, end)` that hold no file
+    /// data, i.e., the pages of holes and the pages beyond `old_size`.
+    fn pages_without_data(&self, offset: usize, end: usize, old_size: usize) -> Result<Vec<usize>> {
+        let first_idx = offset / BLOCK_SIZE;
+        let end_idx = end.div_ceil(BLOCK_SIZE);
+        let data_end_idx = old_size.div_ceil(BLOCK_SIZE).clamp(first_idx, end_idx);
+
+        let mut indices = Vec::new();
+        if first_idx < data_end_idx {
+            let iblock_range = first_idx as Iblock..data_end_idx as Iblock;
+            let mut io_ranges = self.block_manager()?.iter_io_ranges(iblock_range);
+            while let Some(io_range) = io_ranges.next()? {
+                if let IoRange::Hole(hole) = io_range {
+                    indices.extend(hole.start as usize..hole.end as usize);
+                }
+            }
+        }
+        indices.extend(data_end_idx..end_idx);
+        Ok(indices)
     }
 
     /// Truncates page cache and blocks after a failed write.
@@ -304,16 +363,20 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         let old_size = self.file_size();
 
-        if let Err(err) = self.prepare_write(fs, offset, end) {
+        if let Err(err) = self.prepare_direct_write(fs, offset, end) {
             self.rollback_write(old_size, end);
             return Err(err);
         }
 
         let discard_start_bytes = offset.min(old_size);
         let discard_end_bytes = end.min(old_size);
-        if discard_start_bytes < discard_end_bytes {
-            self.page_cache()
-                .invalidate_range(discard_start_bytes..discard_end_bytes)?;
+        if discard_start_bytes < discard_end_bytes
+            && let Err(err) = self
+                .page_cache()
+                .invalidate_range(discard_start_bytes..discard_end_bytes)
+        {
+            self.rollback_write(old_size, end);
+            return Err(err);
         }
 
         if let Err(err) = self.write_direct_blocks(fs, offset, reader) {
@@ -394,7 +457,7 @@ impl InodeInner {
                     // The upper layer should have performed allocation for the write
                     // range. Linux does not allocate blocks in the direct write path;
                     // when it encounters a hole it falls back to buffered write to
-                    // prevent stale data exposure. We pre-allocate in `prepare_write`
+                    // prevent stale data exposure. We pre-allocate in `prepare_direct_write`
                     // so holes here indicate a bug. Stale-read is not a concern
                     // because our inode-level lock serializes reads after this write.
                     return_errno_with_message!(Errno::EIO, "unexpected hole in direct write path");
@@ -430,11 +493,16 @@ impl InodeInner {
     }
 
     /// Allocates any missing data blocks covering the requested file byte range.
-    fn allocate_range_blocks(&mut self, offset: usize, end: usize) -> Result<()> {
+    fn allocate_range_blocks(
+        &mut self,
+        offset: usize,
+        end: usize,
+        init: NewBlockInit,
+    ) -> Result<()> {
         let start_block = offset / BLOCK_SIZE;
         let end_block = end.div_ceil(BLOCK_SIZE);
         self.block_manager()?
-            .allocate_range_blocks(start_block, end_block)
+            .allocate_range_blocks(start_block, end_block, init)
     }
 
     /// Rejects growth beyond the ext2-representable size limit before mutating state.
@@ -547,6 +615,53 @@ mod test {
         let mut read_back = [0xffu8; 32];
         file.read_bytes_at(mmap_offset, &mut read_back).unwrap();
         assert_eq!(read_back, mmap_payload);
+    }
+
+    #[ktest]
+    fn buffered_write_to_new_blocks_defers_device_io() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(4, 4)
+            .with_free_inodes(1000, 1000)
+            .build()
+            .unwrap();
+        let root = f.root();
+        let file = create_file(&root, "new_blocks");
+        file.resize(BLOCK_SIZE).unwrap();
+
+        // Write partially to a hole within the file and beyond the end of the file.
+        let payload = [0xa5u8; 100];
+        let offsets = [100, BLOCK_SIZE * 2 + 100];
+        let (read_count, write_count) = (f.disk.read_count(), f.disk.write_count());
+        for offset in offsets {
+            let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+            file.write_at(offset, &mut reader).unwrap();
+        }
+        // The new blocks are neither read nor zeroed on the device.
+        assert_eq!(f.disk.read_count(), read_count);
+        assert_eq!(f.disk.write_count(), write_count);
+
+        // The device blocks hold zeros around the payload after writeback.
+        file.sync_data().unwrap();
+        let mut expected = vec![0u8; BLOCK_SIZE];
+        expected[100..200].copy_from_slice(&payload);
+        for offset in offsets {
+            let bid = file
+                .inner
+                .read()
+                .block_manager()
+                .unwrap()
+                .lookup_block((offset / BLOCK_SIZE) as Iblock)
+                .unwrap()
+                .unwrap();
+            let mut block = vec![0xffu8; BLOCK_SIZE];
+            f.disk
+                .segment()
+                .read_bytes(Bid::new(bid as u64).to_offset(), &mut block)
+                .unwrap();
+            assert_eq!(block, expected);
+        }
     }
 
     #[ktest]

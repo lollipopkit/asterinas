@@ -343,6 +343,56 @@ impl PageCache {
     pub(crate) fn fill_zeros(&self, range: Range<usize>) -> Result<()> {
         self.0.fill_zeros(range)
     }
+
+    /// Locks the pages at `page_indices` that will back newly allocated
+    /// blocks, inserting the pages that are not cached.
+    ///
+    /// This lets a filesystem allocate blocks without initializing them on the
+    /// backend: until [`NewBlockPages::finish`] initializes and unlocks the
+    /// pages, the page cache does not read the blocks, because readers wait for
+    /// the page locks. Callers must lock the pages in ascending order and must
+    /// not hold locks that the backend read path takes, e.g., the locks of the
+    /// block mappings.
+    pub(crate) fn lock_new_block_pages(
+        &self,
+        page_indices: impl Iterator<Item = usize>,
+    ) -> Result<NewBlockPages> {
+        let backed_vmo = self
+            .0
+            .as_backed_vmo()
+            .expect("only page caches with a backend allocate blocks");
+        let pages = page_indices
+            .map(|idx| Ok((idx, backed_vmo.lock_or_insert_page(idx)?)))
+            .collect::<Result<_>>()?;
+        Ok(NewBlockPages { pages })
+    }
+}
+
+/// Locked pages that will back newly allocated blocks.
+///
+/// See [`PageCache::lock_new_block_pages`].
+pub(crate) struct NewBlockPages {
+    pages: Vec<(usize, LockedCachePage)>,
+}
+
+impl NewBlockPages {
+    /// Initializes and unlocks the pages.
+    ///
+    /// Uninitialized pages are filled with zeros, which is the content of a
+    /// hole. If `is_allocated` reports that the block of a page has been
+    /// allocated, the page is marked dirty, because the backend content of the
+    /// block is undefined until the page is written back.
+    pub(crate) fn finish(self, is_allocated: impl Fn(usize) -> bool) {
+        for (idx, locked_page) in self.pages {
+            if locked_page.state().is_uninit() {
+                locked_page.fill_zeros(0, PAGE_SIZE).unwrap();
+                locked_page.set_up_to_date();
+            }
+            if is_allocated(idx) {
+                locked_page.set_dirty();
+            }
+        }
+    }
 }
 
 impl VmIo for PageCache {

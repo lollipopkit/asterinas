@@ -17,6 +17,17 @@ use crate::{
     vm::page_cache::PageRun,
 };
 
+/// How newly allocated data blocks are initialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in super::super) enum NewBlockInit {
+    /// The blocks are zeroed on the device before they are linked.
+    ZeroOnDevice,
+    /// The caller holds the locks of the cache pages of the blocks and
+    /// initializes the pages, so the device content of the blocks is never
+    /// read before the pages are written back.
+    LockedPages,
+}
+
 /// Bridges the inode's logical file view and the physical block device.
 ///
 /// `InodeBlockManager` maintains the relationship between logical file
@@ -102,7 +113,12 @@ impl InodeBlockManager {
     }
 
     /// Allocates missing data blocks that cover the requested logical block range.
-    pub(super) fn allocate_range_blocks(&self, start_block: usize, end_block: usize) -> Result<()> {
+    pub(super) fn allocate_range_blocks(
+        &self,
+        start_block: usize,
+        end_block: usize,
+        init: NewBlockInit,
+    ) -> Result<()> {
         let fs = self.fs()?;
         let mut tree = self.block_ptr_tree.write();
         let mut current_block = start_block;
@@ -112,7 +128,7 @@ impl InodeBlockManager {
             let remaining = u32::try_from(end_block - current_block)
                 .map_err(|_| Error::with_message(Errno::EINVAL, "block range length overflow"))?;
 
-            let block_range = tree.resolve_block_range(&fs, iblock, remaining)?;
+            let block_range = tree.resolve_block_range(&fs, iblock, remaining, init)?;
             match block_range {
                 ResolvedBlockRange::Existing(range) => {
                     debug_assert!(!range.is_empty());
@@ -218,7 +234,12 @@ impl BlockAsPageCacheBackend for InodeBlockManager {
         // above, another thread may have filled the hole; the `Existing` arm
         // below handles that race.
         let mut tree = self.block_ptr_tree.write();
-        let step = tree.resolve_block_range(&fs, iblock, bio_segment.nblocks() as u32)?;
+        let step = tree.resolve_block_range(
+            &fs,
+            iblock,
+            bio_segment.nblocks() as u32,
+            NewBlockInit::ZeroOnDevice,
+        )?;
         let bid = match step {
             ResolvedBlockRange::NewlyAllocated(r) => r.start,
             ResolvedBlockRange::Existing(r) => r.start,
@@ -233,7 +254,7 @@ impl BlockAsPageCacheBackend for InodeBlockManager {
         if end_idx > self.npages.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EINVAL, "invalid write size");
         }
-        self.allocate_range_blocks(start_idx, end_idx)?;
+        self.allocate_range_blocks(start_idx, end_idx, NewBlockInit::ZeroOnDevice)?;
         let iblock_range = start_idx as Iblock..end_idx as Iblock;
         let fs = self.fs()?;
         let mut io_ranges = self.iter_io_ranges(iblock_range);
