@@ -29,6 +29,7 @@ fi
 
 [ "$(uname -m)" = "x86_64" ] && ./fork/fork
 ./fork_c/fork
+./fork_c/fork_snapshot
 
 ./getcpu/getcpu
 
