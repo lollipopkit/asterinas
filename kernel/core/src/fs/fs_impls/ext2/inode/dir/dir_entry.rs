@@ -167,18 +167,28 @@ impl<'a> DirBlockView<'a> {
         }
     }
 
-    /// Reads and validates a directory entry header at an absolute offset.
+    /// Reads the bytes of this view from the page cache.
     ///
-    /// `offset` is an absolute byte offset in the page cache, matching the
-    /// iterator cursor. The header is checked before being returned, so callers
-    /// can use its `rec_len` and `name_len` to advance within this view.
-    fn read_header(&self, offset: usize) -> Result<DirEntryHeader> {
-        let header: DirEntryHeader = self
-            .page_cache
-            .read_val(offset)
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to read dir entry header"))?;
+    /// Callers parse entries from the returned bytes instead of reading each
+    /// entry from the page cache, which is much slower for large directories.
+    fn read_bytes(&self) -> Result<Box<[u8]>> {
+        let mut bytes = vec![0u8; self.limit].into_boxed_slice();
+        self.page_cache
+            .read_bytes(self.offset, &mut bytes)
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to read dir block"))?;
+        Ok(bytes)
+    }
 
-        let end = self.offset + self.limit;
+    /// Parses and validates a directory entry header at `offset` in `bytes`.
+    ///
+    /// The header is checked before being returned, so callers can use its
+    /// `rec_len` and `name_len` to advance within `bytes`.
+    fn parse_header(bytes: &[u8], offset: usize) -> Result<DirEntryHeader> {
+        let Some(header_bytes) = bytes.get(offset..offset + Self::HEADER_LEN) else {
+            return_errno_with_message!(Errno::EIO, "failed to read dir entry header");
+        };
+        let header = DirEntryHeader::from_bytes(header_bytes);
+
         let rec_len = header.rec_len as usize;
         if (rec_len & DirEntryHeader::ALIGN_MASK) != 0 {
             return_errno_with_message!(
@@ -199,7 +209,7 @@ impl<'a> DirBlockView<'a> {
                 "invalid dir entry: rec_len is smaller than required by name_len"
             );
         }
-        if offset + rec_len > end {
+        if offset + rec_len > bytes.len() {
             return_errno_with_message!(
                 Errno::EIO,
                 "invalid dir entry: entry extends beyond block limit"
@@ -209,12 +219,11 @@ impl<'a> DirBlockView<'a> {
     }
 
     /// Returns an iterator over entries in this view.
-    pub(super) fn iter_entries(&self) -> DirBlockViewIter<'_> {
-        DirBlockViewIter {
-            block: self,
-            cursor: self.offset,
-            name_buf: [0u8; NAME_MAX],
-        }
+    pub(super) fn iter_entries(&self) -> Result<DirBlockViewIter> {
+        Ok(DirBlockViewIter {
+            bytes: self.read_bytes()?,
+            cursor: 0,
+        })
     }
 
     /// Writes a complete directory entry (header + name) at `entry_offset`.
@@ -249,11 +258,14 @@ impl<'a> DirBlockView<'a> {
         let mut current_entry_offset = chunk_start_offset;
         let mut prev_offset = None;
 
+        let bytes = self.read_bytes()?;
         while current_entry_offset < entry_offset {
-            let header: DirEntryHeader = self
-                .page_cache
-                .read_val(self.offset + current_entry_offset)
-                .map_err(|_| Error::with_message(Errno::EIO, "dir entry header out of bounds"))?;
+            let Some(header_bytes) =
+                bytes.get(current_entry_offset..current_entry_offset + Self::HEADER_LEN)
+            else {
+                return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
+            };
+            let header = DirEntryHeader::from_bytes(header_bytes);
             let rec_len = header.rec_len as usize;
             if rec_len == 0 {
                 return_errno_with_message!(Errno::EIO, "zero rec_len in dir entry chain");
@@ -308,30 +320,27 @@ impl<'a> DirBlockView<'a> {
 }
 
 /// Iterator over directory entries in a [`DirBlockView`].
-pub(super) struct DirBlockViewIter<'a> {
-    block: &'a DirBlockView<'a>,
-    /// Absolute offset of the next entry in the page cache.
+pub(super) struct DirBlockViewIter {
+    /// The bytes of the view.
+    bytes: Box<[u8]>,
+    /// Offset of the next entry in the view.
     cursor: usize,
-    /// Reusable buffer for the current entry's name bytes.
-    name_buf: [u8; NAME_MAX],
 }
 
-impl DirBlockViewIter<'_> {
+impl DirBlockViewIter {
     /// Reads the next entry header and advances the iterator.
     ///
     /// Returns `(offset_within_block, DirEntryHeader)` when an entry is found.
     /// The `offset_within_block` is relative to the start of the
     /// `DirBlockView`.
     pub(super) fn next_entry_header(&mut self) -> Result<Option<(usize, DirEntryHeader)>> {
-        let end = self.block.offset + self.block.limit;
-        if self.cursor >= end {
+        if self.cursor >= self.bytes.len() {
             return Ok(None);
         }
 
-        let header = self.block.read_header(self.cursor)?;
-        let rec_len = header.rec_len as usize;
-        let entry_offset = self.cursor - self.block.offset;
-        self.cursor += rec_len;
+        let header = DirBlockView::parse_header(&self.bytes, self.cursor)?;
+        let entry_offset = self.cursor;
+        self.cursor += header.rec_len as usize;
 
         Ok(Some((entry_offset, header)))
     }
@@ -342,27 +351,22 @@ impl DirBlockViewIter<'_> {
     /// `offset_within_block` is relative to the start of the `DirBlockView`.
     /// Deleted entries are returned with an empty `name`.
     ///
-    /// The returned `name` borrows from the iterator's reusable buffer.
+    /// The returned `name` borrows from the iterator.
     pub(super) fn next_entry(&mut self) -> Result<Option<(usize, DirEntry<'_>)>> {
         let Some((entry_offset, header)) = self.next_entry_header()? else {
             return Ok(None);
         };
 
         let name = if header.ino != 0 {
-            let name_len = header.name_len as usize;
-            let name_abs_offset = self.block.offset + entry_offset + Self::HEADER_LEN;
-            self.block
-                .page_cache
-                .read_bytes(name_abs_offset, &mut self.name_buf[..name_len])?;
-            &self.name_buf[..name_len]
+            let name_offset = entry_offset + DirBlockView::HEADER_LEN;
+            // `parse_header` has checked that the name lies within the entry.
+            &self.bytes[name_offset..name_offset + header.name_len as usize]
         } else {
             &[]
         };
 
         Ok(Some((entry_offset, DirEntry { header, name })))
     }
-
-    const HEADER_LEN: usize = size_of::<DirEntryHeader>();
 }
 
 #[cfg(ktest)]
@@ -400,7 +404,7 @@ mod test {
     fn iter_all_zero_block_returns_eio() {
         let page_cache = PageCache::new_anon(BLOCK_SIZE).unwrap();
         let view = DirBlockView::from_index(&page_cache, 0, BLOCK_SIZE);
-        let mut iter = view.iter_entries();
+        let mut iter = view.iter_entries().unwrap();
         assert_errno!(iter.next_entry(), Errno::EIO);
     }
 
@@ -420,7 +424,7 @@ mod test {
         page_cache.write_bytes(0, &block).unwrap();
 
         let view = DirBlockView::from_index(&page_cache, 0, BLOCK_SIZE);
-        let mut iter = view.iter_entries();
+        let mut iter = view.iter_entries().unwrap();
         assert_errno!(iter.next_entry(), Errno::EIO);
     }
 
@@ -448,7 +452,7 @@ mod test {
         page_cache.write_bytes(0, &block).unwrap();
 
         let view = DirBlockView::from_index(&page_cache, 0, BLOCK_SIZE);
-        let mut iter = view.iter_entries();
+        let mut iter = view.iter_entries().unwrap();
 
         let (offset, entry) = iter.next_entry().unwrap().unwrap();
         assert_eq!(offset, 0);
@@ -478,7 +482,7 @@ mod test {
         page_cache.write_bytes(0, &block).unwrap();
 
         let view = DirBlockView::from_index(&page_cache, 0, BLOCK_SIZE);
-        let mut iter = view.iter_entries();
+        let mut iter = view.iter_entries().unwrap();
 
         let (offset, entry) = iter.next_entry().unwrap().unwrap();
         assert_eq!(offset, 0);
