@@ -8,7 +8,10 @@ use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::mm::io::util::HasVmReaderWriter;
 use smallvec::SmallVec;
 
-use super::indirect_block_manager::{IndirectBlock, IndirectBlockManager};
+use super::{
+    NewBlockInit,
+    indirect_block_manager::{IndirectBlock, IndirectBlockManager},
+};
 use crate::fs::ext2::{fs::Ext2, inode::RAW_BLOCK_PTRS_LEN, prelude::*};
 
 const PTRS_PER_BLOCK: usize = BLOCK_SIZE / size_of::<u32>();
@@ -112,6 +115,7 @@ impl BlockPtrTree {
         fs: &Ext2,
         iblock: Iblock,
         max_blocks: u32,
+        init: NewBlockInit,
     ) -> Result<ResolvedBlockRange> {
         if max_blocks == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
@@ -127,7 +131,7 @@ impl BlockPtrTree {
         // Allocate the missing indirect metadata blocks, plus as many contiguous
         // data blocks as we can place before the current leaf boundary.
         let (indirect_blks, data_blks) = self.planned_allocation(&walk, max_blocks)?;
-        let mut guard = self.allocate_blocks(fs, indirect_blks, data_blks, &walk)?;
+        let mut guard = self.allocate_blocks(fs, indirect_blks, data_blks, &walk, init)?;
         self.link_allocated_blocks(&guard, &walk)?;
         guard.commit();
         Ok(ResolvedBlockRange::NewlyAllocated(
@@ -642,6 +646,7 @@ impl BlockPtrTree {
         indirect_blks: u32,
         data_blks: u32,
         walk: &BlockPointerWalk,
+        init: NewBlockInit,
     ) -> Result<BlockAllocGuard<'a>> {
         let mut alloc_goal = walk
             .visited_entries
@@ -673,10 +678,9 @@ impl BlockPtrTree {
 
         // We must wait until the blocks are initialized before we can proceed.
         // Otherwise, concurrent page faults may see uninitialized blocks.
-        //
-        // TODO: In the write path, if the entire block is going to be
-        // overwritten, we should write the real payload instead of zeroing it.
-        Self::zero_new_blocks(fs, &data_blocks_range)?;
+        if init == NewBlockInit::ZeroOnDevice {
+            Self::zero_new_blocks(fs, &data_blocks_range)?;
+        }
 
         Ok(guard)
     }
@@ -1192,7 +1196,7 @@ mod test {
     };
 
     fn alloc_single_block(tree: &mut BlockPtrTree, fs: &Ext2, iblock: Iblock) -> Result<Ext2Bid> {
-        let step = tree.resolve_block_range(fs, iblock, 1)?;
+        let step = tree.resolve_block_range(fs, iblock, 1, NewBlockInit::ZeroOnDevice)?;
         let range = match step {
             ResolvedBlockRange::Existing(r) | ResolvedBlockRange::NewlyAllocated(r) => r,
         };
@@ -1553,8 +1557,11 @@ mod test {
 
         let mut block_ptr_tree = make_block_ptr_tree([0u32; RAW_BLOCK_PTRS_LEN], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated_range =
-            expect_allocated(block_ptr_tree.resolve_block_range(ext2, 0, 3).unwrap());
+        let allocated_range = expect_allocated(
+            block_ptr_tree
+                .resolve_block_range(ext2, 0, 3, NewBlockInit::ZeroOnDevice)
+                .unwrap(),
+        );
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(allocated_range.end - allocated_range.start, 3);
@@ -1575,7 +1582,12 @@ mod test {
             allocated_range.clone()
         );
         assert_eq!(
-            expect_existing(block_ptr_tree.resolve_block_range(ext2, 0, 1).unwrap()).start,
+            expect_existing(
+                block_ptr_tree
+                    .resolve_block_range(ext2, 0, 1, NewBlockInit::ZeroOnDevice)
+                    .unwrap()
+            )
+            .start,
             allocated_range.start
         );
         assert_eq!(
@@ -1595,8 +1607,11 @@ mod test {
 
         let mut block_ptr_tree = make_block_ptr_tree([0u32; RAW_BLOCK_PTRS_LEN], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated_range =
-            expect_allocated(block_ptr_tree.resolve_block_range(ext2, 12, 4).unwrap());
+        let allocated_range = expect_allocated(
+            block_ptr_tree
+                .resolve_block_range(ext2, 12, 4, NewBlockInit::ZeroOnDevice)
+                .unwrap(),
+        );
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[12], 0);

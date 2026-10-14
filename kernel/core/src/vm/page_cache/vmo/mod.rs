@@ -32,7 +32,10 @@ use xarray::{Cursor, LockedXArray, XArray};
 use crate::{
     prelude::*,
     vm::{
-        page_cache::{CachePage, CachePageExt, PageCacheBackend, PageRun, cache_page::PageState},
+        page_cache::{
+            CachePage, CachePageExt, LockedCachePage, PageCacheBackend, PageRun,
+            cache_page::PageState,
+        },
         vmar::Rmap,
     },
 };
@@ -865,18 +868,33 @@ impl PageSelection {
 }
 
 impl<'a> BackedVmo<'a> {
-    /// Caches a zeroed up-to-date page at `page_idx` if no page is cached there.
-    pub(super) fn insert_zero_page_if_absent(&self, page_idx: usize) -> Result<()> {
-        let mut locked_pages = self.pages.lock();
-        if page_idx >= self.size().div_ceil(PAGE_SIZE) {
-            return_errno_with_message!(Errno::EINVAL, "the offset is outside the VMO");
-        }
+    /// Locks the page at `page_idx`, inserting an uninitialized page if no
+    /// page is cached there.
+    pub(super) fn lock_or_insert_page(&self, page_idx: usize) -> Result<LockedCachePage> {
+        loop {
+            let page = {
+                let mut locked_pages = self.pages.lock();
+                if page_idx >= self.size().div_ceil(PAGE_SIZE) {
+                    return_errno_with_message!(Errno::EINVAL, "the offset is outside the VMO");
+                }
 
-        let mut cursor = locked_pages.cursor_mut(page_idx as u64);
-        if cursor.load().is_none() {
-            cursor.store(CachePage::alloc_zero()?);
+                let mut cursor = locked_pages.cursor_mut(page_idx as u64);
+                match cursor.load() {
+                    Some(page) => page.clone(),
+                    None => {
+                        let page = CachePage::alloc_uninit()?;
+                        cursor.store(page.clone());
+                        page
+                    }
+                }
+            };
+
+            let locked_page = page.lock();
+            // Retry if the page has been evicted before we lock it.
+            if !locked_page.state().is_evicted() {
+                return Ok(locked_page);
+            }
         }
-        Ok(())
     }
 
     /// Writes back dirty pages in the specified byte range to the backend storage.

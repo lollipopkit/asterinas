@@ -65,6 +65,7 @@ pub(super) struct Ext2MemoryDisk {
     segment: Segment<()>,
     flush_count: AtomicUsize,
     read_count: AtomicUsize,
+    write_count: AtomicUsize,
     fail_flush: AtomicBool,
 }
 
@@ -79,6 +80,7 @@ impl Ext2MemoryDisk {
             segment,
             flush_count: AtomicUsize::new(0),
             read_count: AtomicUsize::new(0),
+            write_count: AtomicUsize::new(0),
             fail_flush: AtomicBool::new(false),
         }
     }
@@ -90,6 +92,11 @@ impl Ext2MemoryDisk {
     /// Returns the number of read requests that the disk has served.
     pub(super) fn read_count(&self) -> usize {
         self.read_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of write requests that the disk has served.
+    pub(super) fn write_count(&self) -> usize {
+        self.write_count.load(Ordering::Relaxed)
     }
 
     pub(super) fn write_super_block(&self, raw: &RawSuperBlock) {
@@ -126,9 +133,11 @@ impl BlockDevice for Ext2MemoryDisk {
             return Ok(());
         }
 
-        if bio.type_() == BioType::Read {
-            self.read_count.fetch_add(1, Ordering::Relaxed);
-        }
+        match bio.type_() {
+            BioType::Read => self.read_count.fetch_add(1, Ordering::Relaxed),
+            BioType::Write => self.write_count.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
 
         let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
 
