@@ -370,9 +370,13 @@ impl InodeInner {
 
         let discard_start_bytes = offset.min(old_size);
         let discard_end_bytes = end.min(old_size);
-        if discard_start_bytes < discard_end_bytes {
-            self.page_cache()
-                .invalidate_range(discard_start_bytes..discard_end_bytes)?;
+        if discard_start_bytes < discard_end_bytes
+            && let Err(err) = self
+                .page_cache()
+                .invalidate_range(discard_start_bytes..discard_end_bytes)
+        {
+            self.rollback_write(old_size, end);
+            return Err(err);
         }
 
         if let Err(err) = self.write_direct_blocks(fs, offset, reader) {
