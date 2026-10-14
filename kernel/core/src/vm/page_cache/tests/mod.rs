@@ -259,7 +259,6 @@ fn concurrent_commit_and_truncate() {
     let vmo = page_cache.read().as_vmo().clone();
     let commit_second_page_result = Arc::new(Mutex::new(None::<Result<()>>));
     let resize_result = Arc::new(Mutex::new(None::<Result<()>>));
-    let resize_started = Arc::new(Mutex::new(false));
     let resize_finished = Arc::new(Mutex::new(false));
 
     // Commit page 1 and pause its backend read so truncate can shrink the VMO
@@ -280,17 +279,17 @@ fn concurrent_commit_and_truncate() {
     let resize_thread = {
         let page_cache = page_cache.clone();
         let resize_result = resize_result.clone();
-        let resize_started = resize_started.clone();
         let resize_finished = resize_finished.clone();
         ThreadOptions::new(move || {
-            *resize_started.lock() = true;
             *resize_result.lock() = Some(page_cache.write().resize(PAGE_SIZE, 2 * PAGE_SIZE));
             *resize_finished.lock() = true;
         })
         .spawn()
     };
 
-    wait_until(|| *resize_started.lock());
+    // Truncate shrinks the VMO before it removes page 1, which waits for the
+    // pending read of page 1.
+    wait_until(|| vmo.size() == PAGE_SIZE);
     assert!(!*resize_finished.lock());
 
     // Let the blocked commit finish, then verify the truncated page is no
