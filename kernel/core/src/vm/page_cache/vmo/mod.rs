@@ -210,7 +210,12 @@ impl From<ostd::Error> for VmoCommitError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitMode {
+    /// Reads the page from the backend if it is not initialized.
     Read,
+    /// Like `Read`, for a read that requests pages up to `end_idx`. A missing
+    /// page triggers readahead.
+    ReadAhead { end_idx: usize },
+    /// Skips reading the page because it will be entirely overwritten.
     Overwrite,
 }
 
@@ -296,7 +301,14 @@ impl Vmo {
     /// For anonymous VMOs the page is zero-filled on first access.
     /// For VMOs with a backend this may perform synchronous I/O.
     pub(crate) fn commit_on(&self, page_idx: usize, map_mode: VmoMapMode) -> Result<()> {
-        let page = self.commit_on_internal(page_idx, CommitMode::Read)?;
+        let read_page = match self.as_backed_vmo() {
+            Some(backed_vmo) => backed_vmo.read_around(page_idx)?,
+            None => None,
+        };
+        let page = match read_page {
+            Some(page) => page,
+            None => self.commit_on_internal(page_idx, CommitMode::Read)?,
+        };
         map_mode.ensure(page);
         Ok(())
     }
@@ -528,6 +540,12 @@ impl Vmo {
     }
 }
 
+/// The maximum number of pages to read ahead.
+///
+/// This is 128 KiB, the default of Linux (`VM_READAHEAD_PAGES` in
+/// include/linux/pagemap.h of v7.2.10).
+const READAHEAD_MAX_PAGES: usize = 128 * 1024 / PAGE_SIZE;
+
 // Implement the read/write methods for `Vmo`.
 impl Vmo {
     /// Maximum number of pages collected per batch from the `XArray`.
@@ -552,7 +570,9 @@ impl Vmo {
             self.collect_pages(
                 current_idx,
                 page_idx_range.end,
-                CommitMode::Read,
+                CommitMode::ReadAhead {
+                    end_idx: page_idx_range.end,
+                },
                 &mut page_batch,
             )?;
 
@@ -819,6 +839,12 @@ impl Vmo {
         match err {
             VmoCommitError::Err(e) => Err(e),
             VmoCommitError::NeedIo { index } => {
+                if let CommitMode::ReadAhead { end_idx } = commit_mode
+                    && let Some(backed_vmo) = self.as_backed_vmo()
+                    && let Some(page) = backed_vmo.read_ahead(index, end_idx)?
+                {
+                    return Ok((index, page));
+                }
                 Ok((index, self.commit_on_internal(index, commit_mode)?))
             }
             VmoCommitError::WaitUntilInit { index, page } => {
@@ -895,6 +921,106 @@ impl<'a> BackedVmo<'a> {
                 return Ok(locked_page);
             }
         }
+    }
+
+    /// Reads ahead from the missing page at `page_idx` for a read that
+    /// requests pages up to `end_idx`.
+    ///
+    /// The window follows the initial readahead window of Linux
+    /// (`get_init_ra_size` in mm/readahead.c of v7.2.10).
+    //
+    // TODO: Track sequential streams per file to ramp up the window and read
+    // ahead asynchronously, as Linux does.
+    fn read_ahead(&self, page_idx: usize, end_idx: usize) -> Result<Option<CachePage>> {
+        let nr_requested = end_idx.saturating_sub(page_idx).max(1);
+        let size = nr_requested.next_power_of_two();
+        let nr_pages = if size <= READAHEAD_MAX_PAGES / 32 {
+            size * 4
+        } else if size <= READAHEAD_MAX_PAGES / 4 {
+            size * 2
+        } else {
+            READAHEAD_MAX_PAGES
+        };
+        self.read_absent_pages(page_idx, page_idx..page_idx + nr_pages)
+    }
+
+    /// Reads the pages around `page_idx` if it is missing, for a page fault.
+    ///
+    /// The window follows the mmap read-around of Linux
+    /// (`do_sync_mmap_readahead` in mm/filemap.c of v7.2.10).
+    fn read_around(&self, page_idx: usize) -> Result<Option<CachePage>> {
+        let start_idx = page_idx.saturating_sub(READAHEAD_MAX_PAGES / 2);
+        self.read_absent_pages(page_idx, start_idx..start_idx + READAHEAD_MAX_PAGES)
+    }
+
+    /// Reads the pages in `idx_range` that are not cached if the page at
+    /// `trigger_idx` is not cached.
+    ///
+    /// Returns the page at `trigger_idx` after its read completes, or `None`
+    /// if this method does not read it. Fails if the page cannot be read, as
+    /// a read of that page alone would. Other pages are read asynchronously on
+    /// a best-effort basis: a page whose read fails stays uninitialized, so the
+    /// next access reads it again and reports the error.
+    fn read_absent_pages(
+        &self,
+        trigger_idx: usize,
+        idx_range: Range<usize>,
+    ) -> Result<Option<CachePage>> {
+        let mut new_pages = Vec::new();
+        let mut trigger_page = None;
+        {
+            let mut locked_pages = self.pages.lock();
+            let end_idx = idx_range.end.min(self.size().div_ceil(PAGE_SIZE));
+            if trigger_idx >= end_idx || locked_pages.load(trigger_idx as u64).is_some() {
+                return Ok(None);
+            }
+
+            for idx in idx_range.start..end_idx {
+                let mut cursor = locked_pages.cursor_mut(idx as u64);
+                if cursor.load().is_some() {
+                    continue;
+                }
+                let Ok(page) = CachePage::alloc_uninit() else {
+                    break;
+                };
+                // The page is not shared yet, so locking it never fails. Others
+                // that find the page wait for the lock until the read completes.
+                let locked_page = page.clone().try_lock().unwrap();
+                if idx == trigger_idx {
+                    trigger_page = Some(page.clone());
+                }
+                cursor.store(page);
+                new_pages.push((idx, locked_page));
+            }
+        }
+
+        let mut io_batch = IoBatch::with_capacity(new_pages.len());
+        let mut new_pages = new_pages.into_iter().peekable();
+        while let Some((start_idx, first_page)) = new_pages.next() {
+            let mut run = vec![first_page];
+            while let Some((idx, _)) = new_pages.peek()
+                && *idx == start_idx + run.len()
+            {
+                run.push(new_pages.next().unwrap().1);
+            }
+
+            let mut run = run.into_iter();
+            self.backend
+                .read_pages_async(PageRun::new(start_idx, &mut run), &mut io_batch)?;
+        }
+        // The reads unlock the pages when they complete. Only the page at
+        // `trigger_idx` is waited for below.
+        drop(io_batch);
+
+        let Some(trigger_page) = trigger_page else {
+            return Ok(None);
+        };
+        // A page stays uninitialized if and only if its read fails. Truncation
+        // removes pages from the page cache without changing their states.
+        if trigger_page.lock_guard().state().is_uninit() {
+            return_errno_with_message!(Errno::EIO, "failed to read the page from the backend");
+        }
+        Ok(Some(trigger_page))
     }
 
     /// Writes back dirty pages in the specified byte range to the backend storage.

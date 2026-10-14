@@ -438,7 +438,6 @@ pub(crate) trait PageCacheBackend: Sync + Send {
     ///
     /// Backends that can process several pages in one request should override
     /// this method. The default implementation submits each page separately.
-    #[expect(dead_code)]
     fn read_pages_async(&self, pages: PageRun<'_>, io_batch: &mut IoBatch) -> Result<()> {
         for (idx, locked_page) in pages.into_indexed() {
             self.read_page_async(idx, locked_page, io_batch)?;
