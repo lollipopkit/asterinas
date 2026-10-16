@@ -101,6 +101,11 @@ impl Ext2MemoryDisk {
         self.write_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the number of flush requests that the disk has served.
+    pub(super) fn flush_count(&self) -> usize {
+        self.flush_count.load(Ordering::Relaxed)
+    }
+
     /// Makes every subsequent write request fail with `IoError`.
     pub(super) fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::Relaxed);

@@ -640,6 +640,24 @@ impl ExfatInodeInner {
 }
 
 impl ExfatInode {
+    /// Writes back the dirty state of the inode, without writing back the cached metadata of
+    /// the file system or flushing the device.
+    ///
+    /// For [`SyncMode::Data`], the directory entry is still written, since it holds the size
+    /// and the allocation needed to read the data back.
+    pub(super) fn write_back(&self, mode: SyncMode) -> Result<()> {
+        let inner = self.inner.read();
+        let fs = inner.fs();
+        let fs_guard = fs.lock();
+        match mode {
+            SyncMode::Data => {
+                inner.sync_data(&fs_guard)?;
+                inner.write_inode(true, &fs_guard)
+            }
+            SyncMode::Full => inner.sync_all(&fs_guard),
+        }
+    }
+
     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
         let inner = self.inner.upread();
         if inner.inode_type.is_directory() {
@@ -1774,17 +1792,8 @@ impl Inode for ExfatInode {
     }
 
     fn sync(&self, mode: SyncMode) -> Result<()> {
-        let inner = self.inner.read();
-        let fs = inner.fs();
-        let fs_guard = fs.lock();
-        match mode {
-            SyncMode::Data => inner.sync_data(&fs_guard)?,
-            SyncMode::Full => inner.sync_all(&fs_guard)?,
-        }
-
-        fs.block_device().sync()?;
-
-        Ok(())
+        self.write_back(mode)?;
+        self.inner.read().fs().flush_meta_and_device()
     }
 
     fn extension(&self) -> &Extension {
