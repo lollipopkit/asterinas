@@ -685,20 +685,18 @@ impl ExfatInode {
             return_errno_with_message!(Errno::EINVAL, "not block-aligned");
         }
 
-        let sector_size = inner.fs().sector_size();
+        // The offset and the length are block-aligned, but the end of the file may not be.
+        // Like Linux, the block holding the end of the file is read whole, and only the bytes
+        // before the end of the file are returned.
+        let file_size = inner.size;
+        if offset >= file_size {
+            return Ok(0);
+        }
+        let read_off = offset;
+        let read_end = file_size.min(offset + writer.avail());
+        let read_len = read_end - read_off;
 
-        let (read_off, read_len) = {
-            let file_size = inner.size;
-            let start = file_size.min(offset).align_down(sector_size);
-            let end = file_size
-                .min(offset + writer.avail())
-                .align_down(sector_size);
-            (start, end - start)
-        };
-
-        inner
-            .page_cache
-            .flush_range(read_off..read_off + read_len)?;
+        inner.page_cache.flush_range(read_off..read_end)?;
 
         let bio_segment = BioSegment::alloc(1, BioDirection::FromDevice);
 
@@ -706,19 +704,26 @@ impl ExfatInode {
         let cluster_size = inner.fs().cluster_size();
         let mut cur_cluster = start_pos.0.clone();
         let mut cur_offset = start_pos.1;
-        for _ in Bid::from_offset(read_off)..Bid::from_offset(read_off + read_len) {
+        let mut pos = read_off;
+        while pos < read_end {
             let physical_bid =
                 Bid::from_offset(cur_cluster.physical_cluster_start_offset() + cur_offset);
             inner
                 .fs()
                 .block_device()
                 .read_blocks(physical_bid, vec![bio_segment.clone()])?;
-            bio_segment.reader().unwrap().read_fallible(writer)?;
+            let len = (read_end - pos).min(BLOCK_SIZE);
+            bio_segment
+                .reader()
+                .unwrap()
+                .limit(len)
+                .read_fallible(writer)?;
 
+            pos += BLOCK_SIZE;
             cur_offset += BLOCK_SIZE;
-            if cur_offset >= cluster_size {
+            if pos < read_end && cur_offset >= cluster_size {
                 cur_cluster = cur_cluster.walk(1)?;
-                cur_offset %= BLOCK_SIZE;
+                cur_offset = 0;
             }
         }
 

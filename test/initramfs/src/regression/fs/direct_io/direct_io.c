@@ -77,3 +77,23 @@ FN_TEST(direct_write_then_read)
 	TEST_SUCC(unlink(path));
 }
 END_TEST()
+
+FN_TEST(direct_read_stops_at_unaligned_eof)
+{
+	// The file ends in the middle of a block, and is shorter than the request.
+	const size_t file_size = 5000;
+	int fd = TEST_SUCC(open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644));
+
+	fill(expected, 5);
+	TEST_RES(write(fd, expected, file_size), _ret == file_size);
+	TEST_SUCC(fsync(fd));
+	TEST_SUCC(close(fd));
+
+	fd = TEST_SUCC(open(path, O_RDONLY | O_DIRECT));
+	memset(buf, 0, FILE_SIZE);
+	TEST_RES(read(fd, buf, 2 * ALIGNMENT),
+		 _ret == file_size && memcmp(buf, expected, file_size) == 0);
+	TEST_SUCC(close(fd));
+	TEST_SUCC(unlink(path));
+}
+END_TEST()
