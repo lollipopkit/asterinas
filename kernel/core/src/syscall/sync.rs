@@ -2,14 +2,21 @@
 
 use super::SyscallReturn;
 use crate::{
-    fs::file::{
-        StatusFlags,
-        file_table::{RawFileDesc, get_file_fast},
+    fs::{
+        file::{
+            StatusFlags,
+            file_table::{RawFileDesc, get_file_fast},
+        },
+        vfs::sync_policy,
     },
     prelude::*,
 };
 
 pub(super) fn sys_sync(ctx: &Context) -> Result<SyscallReturn> {
+    if sync_policy::defers_current_sync() {
+        return Ok(SyscallReturn::Return(0));
+    }
+
     let current_ns_proxy = ctx.thread_local.borrow_ns_proxy();
     let current_mnt_ns = current_ns_proxy.unwrap().mnt_ns();
     current_mnt_ns.sync()?;
@@ -24,6 +31,8 @@ pub(super) fn sys_syncfs(raw_fd: RawFileDesc, ctx: &Context) -> Result<SyscallRe
     if file.status_flags().contains(StatusFlags::O_PATH) {
         return_errno_with_message!(Errno::EBADF, "the file is opened as a path");
     }
-    file.path().fs().sync()?;
+    if !sync_policy::defers_current_sync() {
+        file.path().fs().sync()?;
+    }
     Ok(SyscallReturn::Return(0))
 }

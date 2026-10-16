@@ -9,6 +9,7 @@ mod fs_apis;
 pub(crate) mod notify;
 pub mod path;
 pub(crate) mod range_lock;
+pub mod sync_policy;
 
 // Re-export commonly used abstractions from `fs_apis`
 pub use fs_apis::inode;

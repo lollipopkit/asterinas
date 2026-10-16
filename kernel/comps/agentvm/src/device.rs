@@ -40,7 +40,7 @@ use ostd::{
     task::Task,
 };
 
-use crate::tct::Tct;
+use crate::tct::{Tct, TctFlags};
 
 /// The major number of misc devices.
 const MISC_MAJOR: u16 = 10;
@@ -129,11 +129,15 @@ impl PerOpenFileOps for AgentCtlFile {
 
         dispatch_ioctl!(match raw_ioctl {
             cmd @ TctBegin => {
+                let mut args: TctBeginArgs = cmd.read()?;
+                let flags = TctFlags::from_bits(args.flags)
+                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid TCT flags"))?;
                 check_controller()?;
                 // Write the ID first, so a failed write does not leave the caller in a TCT
                 // that it cannot identify.
-                let tct = Tct::new();
-                cmd.write(&tct.id())?;
+                let tct = Tct::new(flags);
+                args.id = tct.id();
+                cmd.write(&args)?;
                 tct.begin(&process)?;
                 Ok(0)
             }
@@ -176,6 +180,17 @@ impl PerOpenFileOps for AgentCtlFile {
     }
 }
 
+/// The argument of `AGENT_CTL_TCT_BEGIN`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod)]
+struct TctBeginArgs {
+    /// The flags of the TCT (input), see [`TctFlags`].
+    flags: u32,
+    reserved: u32,
+    /// The ID of the TCT (output).
+    id: u64,
+}
+
 /// The argument of `AGENT_CTL_TCT_END`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
@@ -206,7 +221,7 @@ mod ioctl_defs {
     use super::*;
 
     // TCT IDs start from 1; `AGENT_CTL_TCT_GET` returns 0 outside a TCT.
-    pub(super) type TctBegin   = ioc!(AGENT_CTL_TCT_BEGIN,   0xA7, 1, OutData<u64>);
+    pub(super) type TctBegin   = ioc!(AGENT_CTL_TCT_BEGIN,   0xA7, 1, InOutData<TctBeginArgs>);
     pub(super) type TctEnd     = ioc!(AGENT_CTL_TCT_END,     0xA7, 2, InOutData<TctEndArgs>);
     pub(super) type TctGet     = ioc!(AGENT_CTL_TCT_GET,     0xA7, 3, OutData<u64>);
     pub(super) type TctEffects = ioc!(AGENT_CTL_TCT_EFFECTS, 0xA7, 4, InOutData<TctEffectsArgs>);

@@ -20,6 +20,7 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use aster_core::{
+    fs::vfs::sync_policy::{self, SyncPolicy},
     prelude::*,
     process::Process,
     security::audit::{AuditEvent, AuditHooks},
@@ -30,9 +31,22 @@ use ostd::sync::Mutex;
 #[derive(Debug)]
 pub(crate) struct Tct {
     id: u64,
+    flags: TctFlags,
     nr_live_processes: AtomicUsize,
     has_ended: AtomicBool,
     effects: Mutex<Effects>,
+}
+
+bitflags::bitflags! {
+    /// The flags that a TCT is created with.
+    pub(crate) struct TctFlags: u32 {
+        /// Defers the sync requests of the processes in the TCT until it ends, when all the
+        /// file systems are written back and flushed at once.
+        ///
+        /// This is only safe if the storage is rolled back to the state of the previous TCT
+        /// after a crash, because data synced inside the TCT is not durable until it ends.
+        const DEFER_SYNC = 1 << 0;
+    }
 }
 
 /// The TCTs that have begun but not been released, indexed by ID.
@@ -87,11 +101,12 @@ struct Effects {
 
 impl Tct {
     /// Creates a new TCT, which begins when a process is put into it with [`Self::begin`].
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(flags: TctFlags) -> Arc<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
         Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            flags,
             nr_live_processes: AtomicUsize::new(1),
             has_ended: AtomicBool::new(false),
             effects: Mutex::new(Effects::default()),
@@ -123,9 +138,15 @@ impl Tct {
     /// Ends the TCT.
     ///
     /// Returns `EINVAL` if the TCT has already ended.
+    /// With [`TctFlags::DEFER_SYNC`], all the file systems in the mount namespace of the
+    /// caller are written back and flushed, so the data of the TCT is durable on return.
+    /// Processes that outlive the TCT have their sync requests served directly from then on.
     pub(crate) fn end(&self) -> Result<()> {
         if self.has_ended.swap(true, Ordering::Relaxed) {
             return_errno_with_message!(Errno::EINVAL, "the TCT has already ended");
+        }
+        if self.flags.contains(TctFlags::DEFER_SYNC) {
+            sync_policy::sync_mnt_ns()?;
         }
         Ok(())
     }
@@ -182,6 +203,17 @@ impl Tct {
             return;
         }
         effects.set.insert(entry);
+    }
+}
+
+/// The sync policy that defers the sync requests in TCTs with [`TctFlags::DEFER_SYNC`].
+pub(crate) struct TctSyncPolicy;
+
+impl SyncPolicy for TctSyncPolicy {
+    fn defers_sync(&self, process: &Process) -> bool {
+        Tct::of(process).is_some_and(|tct| {
+            tct.flags.contains(TctFlags::DEFER_SYNC) && !tct.has_ended.load(Ordering::Relaxed)
+        })
     }
 }
 

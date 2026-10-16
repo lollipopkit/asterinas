@@ -22,5 +22,7 @@ mod tct;
 fn init() -> Result<(), ComponentInitError> {
     aster_core::security::audit::register_hooks(&tct::TctAuditHooks)
         .map_err(|_| ComponentInitError::Unknown)?;
+    aster_core::fs::vfs::sync_policy::register_policy(&tct::TctSyncPolicy)
+        .map_err(|_| ComponentInitError::Unknown)?;
     device::init().map_err(|_| ComponentInitError::Unknown)
 }

@@ -4,7 +4,10 @@ use align_ext::AlignExt;
 
 use super::SyscallReturn;
 use crate::{
-    fs::file::SyncMode, prelude::*, thread::kernel_thread::ThreadOptions, vm::vmar::VMAR_CAP_ADDR,
+    fs::{file::SyncMode, vfs::sync_policy},
+    prelude::*,
+    thread::kernel_thread::ThreadOptions,
+    vm::vmar::VMAR_CAP_ADDR,
 };
 
 pub(super) fn sys_msync(
@@ -54,18 +57,24 @@ pub(super) fn sys_msync(
         .iter()
         .filter_map(|m| m.inode().cloned())
         .collect::<Vec<_>>();
-    let task_fn = move || {
-        for inode in inodes {
-            // TODO: Sync a necessary range instead of syncing the whole inode.
-            let _ = inode.sync(SyncMode::Full);
-        }
-    };
+    if sync_policy::defers_current_sync() {
+        return Ok(SyscallReturn::Return(0));
+    }
 
     // If neither MS_SYNC nor MS_ASYNC is specified, Linux defaults to MS_ASYNC behavior.
     if flags.contains(MsyncFlags::MS_SYNC) {
-        task_fn();
+        // Like Linux, a failure to write back the data is reported.
+        for inode in inodes {
+            // TODO: Sync a necessary range instead of syncing the whole inode.
+            inode.sync(SyncMode::Full)?;
+        }
     } else {
-        ThreadOptions::new(task_fn).spawn();
+        ThreadOptions::new(move || {
+            for inode in inodes {
+                let _ = inode.sync(SyncMode::Full);
+            }
+        })
+        .spawn();
     }
 
     Ok(SyscallReturn::Return(0))
