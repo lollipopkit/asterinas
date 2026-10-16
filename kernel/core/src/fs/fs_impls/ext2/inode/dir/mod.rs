@@ -80,22 +80,20 @@ impl Inode {
             return_errno!(Errno::ENOTEMPTY);
         }
 
-        child_inner.set_ctime(utils::now());
-        child_inner.dec_link_count(2);
-
-        if child_inner.link_count() == 0 {
-            child_inner.write_back_inode_desc(&fs, child.ino())?;
-            fs.forget_unlinked_inode(child);
-        }
-
+        // Remove the entry first: it may fail, and nothing has changed yet if it does.
         let parent_inner = guards.inner_mut(self.ino());
-
         let entry_info = parent_inner.find_entry_info(name)?;
         debug_assert_eq!(entry_info.ino, child.ino);
-
         parent_inner.delete_entry(&entry_info)?;
         parent_inner.dec_link_count(1);
         parent_inner.set_mtime_ctime(utils::now());
+
+        let child_inner = guards.inner_mut(child.ino());
+        child_inner.set_ctime(utils::now());
+        child_inner.dec_link_count(2);
+        if child_inner.link_count() == 0 {
+            release_unlinked_inode(&fs, child_inner, child);
+        }
 
         Ok(())
     }
@@ -224,8 +222,7 @@ impl Inode {
         child_inner.set_ctime(utils::now());
         child_inner.dec_link_count(1);
         if child_inner.link_count() == 0 {
-            child_inner.write_back_inode_desc(&fs, child.ino())?;
-            fs.forget_unlinked_inode(child);
+            release_unlinked_inode(&fs, child_inner, child);
         }
         Ok(())
     }
@@ -368,8 +365,7 @@ impl Inode {
             replaced_inner.dec_link_count(1);
 
             if replaced_inner.link_count() == 0 {
-                replaced_inner.write_back_inode_desc(&fs, replaced.ino())?;
-                fs.forget_unlinked_inode(replaced);
+                release_unlinked_inode(&fs, replaced_inner, replaced);
             }
         }
 
@@ -390,6 +386,17 @@ impl Inode {
 
         Ok(())
     }
+}
+
+/// Persists and forgets an inode whose last directory entry was just removed.
+///
+/// The removal cannot be undone at this point, so a failure to stage the descriptor is
+/// only logged: the inode stays dirty, and freeing it on drop writes it again.
+fn release_unlinked_inode(fs: &Ext2, inner: &mut InodeInner, inode: &Inode) {
+    if let Err(err) = inner.write_back_inode_desc(fs, inode.ino()) {
+        warn!("failed to write back unlinked inode {}: {:?}", inode.ino(), err);
+    }
+    fs.forget_unlinked_inode(inode);
 }
 
 impl InodeInner {
