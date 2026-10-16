@@ -6,6 +6,7 @@
 
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -18,6 +19,7 @@
 #include "../../common/test.h"
 
 #define TEST_DIR "/tmp/proc_fs_links"
+#define NOBODY_UID 65534
 
 static char link_buf[PATH_MAX];
 
@@ -77,6 +79,19 @@ FN_TEST(other_process_links)
 
 	snprintf(path, sizeof(path), "/proc/%d/cwd", child);
 	TEST_RES(read_link(path), strcmp(link_buf, TEST_DIR) == 0);
+
+	// Another user cannot read the links.
+	pid_t reader = TEST_SUCC(fork());
+	if (reader == 0) {
+		CHECK(setuid(NOBODY_UID));
+		CHECK_WITH(read_link(path), _ret < 0 && errno == EACCES);
+		CHECK_WITH(open(path, O_RDONLY | O_DIRECTORY),
+			   _ret < 0 && errno == EACCES);
+		_exit(0);
+	}
+	TEST_RES(waitpid(reader, &status, 0),
+		 _ret == reader && WIFEXITED(status) &&
+			 WEXITSTATUS(status) == 0);
 
 	// The links of an exited process do not resolve.
 	TEST_RES(write(exit_pipe[1], "X", 1), _ret == 1);
