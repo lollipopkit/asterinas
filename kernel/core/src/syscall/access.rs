@@ -131,6 +131,10 @@ fn do_faccessat(
     if !permission.is_empty() {
         inode.check_permission(permission)?;
     }
+    // SUSv2 requires reporting a read-only file system for `W_OK` (Linux `do_faccessat()`).
+    if permission.contains(Permission::MAY_WRITE) && !inode.type_().is_special_file() {
+        path.check_mount_writable()?;
+    }
 
     Ok(SyscallReturn::Return(0))
 }

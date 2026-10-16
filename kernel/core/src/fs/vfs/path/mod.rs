@@ -197,10 +197,18 @@ impl Path {
             );
         }
 
-        if inode_type.is_regular_file()
+        let truncate = inode_type.is_regular_file()
             && creation_flags.contains(CreationFlags::O_TRUNC)
+            && !status_flags.contains(StatusFlags::O_PATH);
+        // Opening a directory for writing fails with `EISDIR` in `InodeHandle::new`.
+        if (truncate || open_args.access_mode.is_writable())
             && !status_flags.contains(StatusFlags::O_PATH)
+            && !inode_type.is_special_file()
+            && !inode_type.is_directory()
         {
+            self.check_mount_writable()?;
+        }
+        if truncate {
             self.resize(0)?;
         }
 
@@ -306,7 +314,10 @@ impl Path {
     }
 
     /// Checks whether the path is on a writable mount and filesystem.
-    fn check_mount_writable(&self) -> Result<()> {
+    ///
+    /// Every operation that writes to the file system calls this first and fails with
+    /// `EROFS` on a read-only mount (Linux `mnt_want_write()`).
+    pub(crate) fn check_mount_writable(&self) -> Result<()> {
         if self.mount.flags().contains(PerMountFlags::RDONLY)
             || self.fs().flags().contains(FsFlags::RDONLY)
         {
@@ -838,14 +849,17 @@ impl Path {
     ) -> Result<usize>;
 
     pub(crate) fn set_mode(&self, mode: InodeMode) -> Result<()> {
+        self.check_mount_writable()?;
         self.inode().set_mode(&self.dentry, mode)
     }
 
     pub(crate) fn set_owner(&self, uid: Uid) -> Result<()> {
+        self.check_mount_writable()?;
         self.inode().set_owner(&self.dentry, uid)
     }
 
     pub(crate) fn set_group(&self, gid: Gid) -> Result<()> {
+        self.check_mount_writable()?;
         self.inode().set_group(&self.dentry, gid)
     }
 
@@ -863,6 +877,7 @@ impl Path {
 
     /// Resizes the file.
     pub(crate) fn resize(&self, size: usize) -> Result<()> {
+        self.check_mount_writable()?;
         self.inode().check_permission(Permission::MAY_WRITE)?;
         self.resize_unchecked_access(size)
     }
@@ -882,6 +897,7 @@ impl Path {
         flags: XattrSetFlags,
         ctx: &Context,
     ) -> Result<()> {
+        self.check_mount_writable()?;
         let inode = self.inode();
         if name.full_name() == xattr::SECURITY_CAPABILITY_XATTR_NAME {
             capable_modify_file_cap(inode.as_ref(), ctx)?;
@@ -900,6 +916,7 @@ impl Path {
 
     /// Removes an xattr of the file.
     pub(crate) fn remove_xattr(&self, name: XattrName, ctx: &Context) -> Result<()> {
+        self.check_mount_writable()?;
         let inode = self.inode();
         if name.full_name() == xattr::SECURITY_CAPABILITY_XATTR_NAME {
             capable_modify_file_cap(inode.as_ref(), ctx)?;

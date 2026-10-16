@@ -18,6 +18,19 @@ pub enum InodeType {
 }
 
 impl InodeType {
+    /// Returns whether this is a device, FIFO or socket (Linux `special_file()`).
+    ///
+    /// Opening one for writing does not write to its file system.
+    pub(crate) fn is_special_file(&self) -> bool {
+        matches!(
+            self,
+            InodeType::CharDevice
+                | InodeType::BlockDevice
+                | InodeType::NamedPipe
+                | InodeType::Socket
+        )
+    }
+
     pub(crate) fn is_regular_file(&self) -> bool {
         *self == InodeType::File
     }

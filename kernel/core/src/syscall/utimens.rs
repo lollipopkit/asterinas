@@ -152,7 +152,7 @@ fn vfs_utimes(path: &Path, times: Option<TimeSpecPair>) -> Result<SyscallReturn>
         }
     };
 
-    // Update times
+    path.check_mount_writable()?;
     path.set_atime(atime);
     path.set_mtime(mtime);
     path.set_ctime(ctime);
