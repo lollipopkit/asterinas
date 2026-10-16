@@ -166,7 +166,7 @@ impl PerOpenFileOps for AgentCtlFile {
                     let buf_len = args.len;
                     args.len = effects.len() as u64;
                     args_ptr.write(&args)?;
-                    if (buf_len as usize) < effects.len() {
+                    if buf_len < effects.len() as u64 {
                         return_errno_with_message!(Errno::ERANGE, "the buffer is too small");
                     }
                     args_ptr.vm().write_bytes(args.buf as usize, &effects)?;
