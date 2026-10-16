@@ -83,13 +83,6 @@ pub(crate) fn do_execve(
     sigkill_other_threads(ctx.task, &task_set);
     drop(task_set);
 
-    // The new program is going to run, so audit the executed file and, for a script, the
-    // interpreter that is actually loaded.
-    executable_path.audit(AuditEvent::Exec);
-    if elf_path != executable_path {
-        elf_path.audit(AuditEvent::Exec);
-    }
-
     let former_tid = ctx.posix_thread.tid();
 
     // After this point, failures in subsequent operations are fatal: the process
@@ -105,6 +98,12 @@ pub(crate) fn do_execve(
     );
 
     if res.is_ok() {
+        // The new program will run, so audit the executed file and, for a script, the
+        // interpreter that is actually loaded.
+        executable_path.audit(AuditEvent::Exec);
+        if elf_path != executable_path {
+            elf_path.audit(AuditEvent::Exec);
+        }
         ctx.posix_thread
             .ptrace_may_stop_on(PtraceEvent::Exec(former_tid), ctx, user_context);
     } else {
