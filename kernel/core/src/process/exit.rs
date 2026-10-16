@@ -2,7 +2,7 @@
 
 use core::sync::atomic::Ordering;
 
-use super::{INIT_PROCESS_PID, Pid, Process, pid_table};
+use super::{INIT_PROCESS_PID, Pid, Process, Tct, pid_table};
 use crate::{
     events::IoEvents, fs::cgroupfs::CgroupMembership, prelude::*,
     process::signal::signals::kernel::KernelSignal,
@@ -26,6 +26,10 @@ pub(super) fn exit_process(current_process: &Process) {
     let children = move_children_to_reaper_process(current_process);
     send_parent_death_signal(&children);
     drop(children);
+
+    // This must happen before the process can be reaped, so that a TCT ended after
+    // waiting for its processes does not count them as live.
+    Tct::on_process_exit(current_process);
 
     // Mark the current process as a zombie. After this point, it may be reaped concurrently and
     // removed from the process tree. For example, the process may no longer have a live parent if

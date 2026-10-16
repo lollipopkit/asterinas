@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: MPL-2.0
+
+/*
+ * Regression tests for `/dev/agent_ctl` and tool-call transactions (TCTs).
+ */
+
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/ioctl.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "../common/test.h"
+
+#define AGENT_CTL_DEVICE "/dev/agent_ctl"
+
+struct agent_ctl_tct_end {
+	uint64_t id;
+	uint64_t nr_live_processes;
+};
+
+#define AGENT_CTL_TCT_BEGIN _IOR(0xA7, 1, uint64_t)
+#define AGENT_CTL_TCT_END _IOWR(0xA7, 2, struct agent_ctl_tct_end)
+#define AGENT_CTL_TCT_GET _IOR(0xA7, 3, uint64_t)
+
+#define NOBODY_UID 65534
+
+static int ctl_fd;
+
+/* Runs the statements in a child and checks that all of their tests pass. */
+#define IN_CHILD(...)                                                          \
+	do {                                                                   \
+		int __status;                                                  \
+		pid_t __child = TEST_SUCC(fork());                             \
+		if (__child == 0) {                                            \
+			int __failed_before = __tests_failed;                  \
+			__VA_ARGS__;                                           \
+			_exit(__tests_failed != __failed_before);              \
+		}                                                              \
+		TEST_RES(waitpid(__child, &__status, 0),                       \
+			 _ret == __child && WIFEXITED(__status) &&             \
+				 WEXITSTATUS(__status) == 0);                  \
+	} while (0)
+
+static uint64_t tct_get(void)
+{
+	uint64_t id = UINT64_MAX;
+
+	if (ioctl(ctl_fd, AGENT_CTL_TCT_GET, &id) < 0)
+		return UINT64_MAX;
+	return id;
+}
+
+static uint64_t tct_begin(void)
+{
+	uint64_t id = 0;
+
+	if (ioctl(ctl_fd, AGENT_CTL_TCT_BEGIN, &id) < 0)
+		return 0;
+	return id;
+}
+
+static int tct_end(uint64_t id, uint64_t *nr_live_processes)
+{
+	struct agent_ctl_tct_end end = { .id = id, .nr_live_processes = -1 };
+	int ret = ioctl(ctl_fd, AGENT_CTL_TCT_END, &end);
+
+	*nr_live_processes = end.nr_live_processes;
+	return ret;
+}
+
+/*
+ * When executed with `get <id>`, checks that the process is in the TCT `<id>`.
+ */
+FN_SETUP(exec_helper)
+{
+	int argc = 0;
+	char buf[4096];
+	char *argv[4];
+	int fd = CHECK(open("/proc/self/cmdline", O_RDONLY));
+	ssize_t len = CHECK(read(fd, buf, sizeof(buf) - 1));
+
+	CHECK(close(fd));
+	buf[len] = '\0';
+	for (char *p = buf; p < buf + len && argc < 4; p += strlen(p) + 1)
+		argv[argc++] = p;
+
+	ctl_fd = CHECK(open(AGENT_CTL_DEVICE, O_RDONLY));
+
+	if (argc == 3 && strcmp(argv[1], "get") == 0)
+		exit(tct_get() == strtoull(argv[2], NULL, 10) ? 0 : 1);
+}
+END_SETUP()
+
+FN_TEST(device_node)
+{
+	struct stat st;
+
+	TEST_RES(fstat(ctl_fd, &st),
+		 S_ISCHR(st.st_mode) && major(st.st_rdev) == 10 &&
+			 minor(st.st_rdev) == 240 &&
+			 (st.st_mode & 0777) == 0600);
+	TEST_ERRNO(ioctl(ctl_fd, _IO(0xA7, 0)), ENOTTY);
+}
+END_TEST()
+
+FN_TEST(outside_a_tct)
+{
+	uint64_t nr_live;
+
+	TEST_RES(tct_get(), _ret == 0);
+	TEST_ERRNO(tct_end(0, &nr_live), EINVAL);
+	TEST_ERRNO(tct_end(UINT64_MAX, &nr_live), EINVAL);
+}
+END_TEST()
+
+FN_TEST(begin_and_end)
+{
+	int pipe_fds[2];
+	uint64_t id = 0, nr_live;
+
+	TEST_SUCC(pipe(pipe_fds));
+	IN_CHILD({
+		uint64_t self_id = TEST_RES(tct_begin(), _ret != 0);
+		TEST_RES(tct_get(), _ret == self_id);
+		TEST_RES(write(pipe_fds[1], &self_id, sizeof(self_id)),
+			 _ret == sizeof(self_id));
+
+		// A process in a TCT cannot join another TCT or end its TCT.
+		TEST_ERRNO(tct_begin(), EPERM);
+		TEST_ERRNO(tct_end(self_id, &nr_live), EPERM);
+
+		// The TCT is inherited by children.
+		int status;
+		IN_CHILD({ TEST_RES(tct_get(), _ret == self_id); });
+
+		// The TCT is kept across exec.
+		char id_str[32];
+		snprintf(id_str, sizeof(id_str), "%llu",
+			 (unsigned long long)self_id);
+		pid_t exec_child = TEST_SUCC(fork());
+		if (exec_child == 0) {
+			execl("/proc/self/exe", "agent_ctl", "get", id_str,
+			      NULL);
+			_exit(2);
+		}
+		TEST_RES(waitpid(exec_child, &status, 0),
+			 _ret == exec_child && WIFEXITED(status) &&
+				 WEXITSTATUS(status) == 0);
+	});
+	TEST_RES(read(pipe_fds[0], &id, sizeof(id)), _ret == sizeof(id));
+	TEST_SUCC(close(pipe_fds[0]));
+	TEST_SUCC(close(pipe_fds[1]));
+
+	// All processes of the TCT have exited.
+	TEST_RES(tct_end(id, &nr_live), _ret == 0 && nr_live == 0);
+	TEST_ERRNO(tct_end(id, &nr_live), EINVAL);
+	TEST_RES(tct_get(), _ret == 0);
+
+	// A new TCT gets a new ID.
+	IN_CHILD({ TEST_RES(tct_begin(), _ret > id); });
+}
+END_TEST()
+
+FN_TEST(processes_outliving_the_tct)
+{
+	int status, id_pipe[2], hold_pipe[2];
+	uint64_t id = 0, nr_live;
+	char byte;
+
+	TEST_SUCC(prctl(PR_SET_CHILD_SUBREAPER, 1));
+	TEST_SUCC(pipe(id_pipe));
+	TEST_SUCC(pipe(hold_pipe));
+	IN_CHILD({
+		uint64_t self_id = TEST_RES(tct_begin(), _ret != 0);
+		TEST_RES(write(id_pipe[1], &self_id, sizeof(self_id)),
+			 _ret == sizeof(self_id));
+		// The grandchild stays alive until the hold pipe is closed.
+		if (TEST_SUCC(fork()) == 0) {
+			close(hold_pipe[1]);
+			_exit(read(hold_pipe[0], &byte, 1) == 0 ? 0 : 1);
+		}
+	});
+	TEST_RES(read(id_pipe[0], &id, sizeof(id)), _ret == sizeof(id));
+	TEST_SUCC(close(id_pipe[0]));
+	TEST_SUCC(close(id_pipe[1]));
+	TEST_SUCC(close(hold_pipe[0]));
+
+	TEST_RES(tct_end(id, &nr_live), _ret == 0 && nr_live == 1);
+
+	TEST_SUCC(close(hold_pipe[1]));
+	TEST_RES(wait(&status), _ret > 0 && WIFEXITED(status) &&
+					WEXITSTATUS(status) == 0);
+	TEST_SUCC(prctl(PR_SET_CHILD_SUBREAPER, 0));
+}
+END_TEST()
+
+FN_TEST(requires_cap_sys_admin)
+{
+	uint64_t nr_live;
+
+	IN_CHILD({
+		TEST_SUCC(setuid(NOBODY_UID));
+		TEST_ERRNO(tct_begin(), EPERM);
+		TEST_ERRNO(tct_end(1, &nr_live), EPERM);
+		TEST_RES(tct_get(), _ret == 0);
+		TEST_ERRNO(open(AGENT_CTL_DEVICE, O_RDONLY), EACCES);
+	});
+}
+END_TEST()

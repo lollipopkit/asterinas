@@ -11,7 +11,7 @@ use ostd::{
 };
 
 use super::{
-    Credentials, Pid, Process, pid_table,
+    Credentials, Pid, Process, Tct, pid_table,
     posix_thread::{AsPosixThread, PosixThreadBuilder},
     rlimit::ResourceLimits,
     signal::{constants::SIGCHLD, sig_disposition::SigDispositions, sig_num::SigNum},
@@ -625,6 +625,10 @@ fn clone_child_process(
     if let Some(sig) = clone_args.exit_signal {
         child.set_exit_signal(sig);
     };
+
+    // This must be after all fallible steps, since a child that fails to be created never
+    // exits and would stay counted in the TCT.
+    Tct::inherit(process, &child);
 
     // Sets parent process and group for child process.
     set_parent_and_group(clone_flags, process, &child);
