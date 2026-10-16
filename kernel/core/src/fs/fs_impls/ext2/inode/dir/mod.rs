@@ -394,7 +394,11 @@ impl Inode {
 /// only logged: the inode stays dirty, and freeing it on drop writes it again.
 fn release_unlinked_inode(fs: &Ext2, inner: &mut InodeInner, inode: &Inode) {
     if let Err(err) = inner.write_back_inode_desc(fs, inode.ino()) {
-        warn!("failed to write back unlinked inode {}: {:?}", inode.ino(), err);
+        warn!(
+            "failed to write back unlinked inode {}: {:?}",
+            inode.ino(),
+            err
+        );
     }
     fs.forget_unlinked_inode(inode);
 }

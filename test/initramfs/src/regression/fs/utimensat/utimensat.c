@@ -131,8 +131,9 @@ FN_TEST(non_owner_needs_permission)
 	struct timespec now[2] = { { .tv_nsec = UTIME_NOW },
 				   { .tv_nsec = UTIME_NOW } };
 	struct timespec explicit[2] = { { .tv_sec = 1 }, { .tv_sec = 2 } };
-	struct timespec omit[2] = { { .tv_nsec = UTIME_OMIT },
-				    { .tv_nsec = UTIME_OMIT } };
+	/* With both times omitted, `utimensat` returns before any check. */
+	struct timespec omit_atime[2] = { { .tv_nsec = UTIME_OMIT },
+					  { .tv_sec = 2 } };
 
 	/* Without write permission, even touching the file is denied. */
 	TEST_SUCC(chmod(TEST_FILE, 0644));
@@ -148,7 +149,8 @@ FN_TEST(non_owner_needs_permission)
 	TEST_RES(ERRNO_AS_OTHER_USER(
 			 utimensat(AT_FDCWD, TEST_FILE, explicit, 0)),
 		 _ret == EPERM);
-	TEST_RES(ERRNO_AS_OTHER_USER(utimensat(AT_FDCWD, TEST_FILE, omit, 0)),
+	TEST_RES(ERRNO_AS_OTHER_USER(
+			 utimensat(AT_FDCWD, TEST_FILE, omit_atime, 0)),
 		 _ret == EPERM);
 	TEST_SUCC(chmod(TEST_FILE, 0644));
 }

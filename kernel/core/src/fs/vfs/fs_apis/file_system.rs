@@ -96,7 +96,13 @@ impl dyn FileSystem {
         let is_read_only = self.flags().contains(FsFlags::RDONLY);
         self.write_state().freeze().freeze(
             || if is_read_only { Ok(()) } else { self.sync() },
-            || if is_read_only { Ok(()) } else { self.freeze_fs() },
+            || {
+                if is_read_only {
+                    Ok(())
+                } else {
+                    self.freeze_fs()
+                }
+            },
         )
     }
 
