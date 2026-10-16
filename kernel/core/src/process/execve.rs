@@ -30,6 +30,7 @@ use crate::{
             signals::kernel::KernelSignal,
         },
     },
+    security::audit::AuditEvent,
     vm::vmar::VmarHandle,
 };
 
@@ -61,7 +62,8 @@ pub(crate) fn do_execve(
 
     let executable_path = executable.path().clone();
     let program_to_load = ProgramToLoad::from_executable(executable, &path_resolver, argv, envp)?;
-    let exec_cred = prepare_exec_cred(program_to_load.elf_path(), ctx)?;
+    let elf_path = program_to_load.elf_path().clone();
+    let exec_cred = prepare_exec_cred(&elf_path, ctx)?;
 
     let new_vmar = VmarHandle::new(ProcessVm::new(executable_path.clone()));
     let elf_load_info = program_to_load.load_to_vmar(&new_vmar, &path_resolver)?;
@@ -96,6 +98,12 @@ pub(crate) fn do_execve(
     );
 
     if res.is_ok() {
+        // The new program will run, so audit the executed file and, for a script, the
+        // interpreter that is actually loaded.
+        executable_path.audit(AuditEvent::Exec);
+        if elf_path != executable_path {
+            elf_path.audit(AuditEvent::Exec);
+        }
         ctx.posix_thread
             .ptrace_may_stop_on(PtraceEvent::Exec(former_tid), ctx, user_context);
     } else {

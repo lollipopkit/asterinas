@@ -3,6 +3,7 @@
 use super::SyscallReturn;
 use crate::{
     fs::file::file_table::{RawFileDesc, get_file_fast},
+    net::socket::util::{SocketAddr, audit_connect},
     prelude::*,
     util::net::read_socket_addr_from_user,
 };
@@ -20,13 +21,21 @@ pub(super) fn sys_connect(
     let file = get_file_fast!(&mut file_table, sockfd.try_into()?);
     let socket = file.as_socket_or_err()?;
 
-    socket
-        .connect(socket_addr)
-        .map_err(|err| match err.error() {
-            // FIXME: `connect` should not be restarted if a timeout has been set on the socket using `setsockopt`.
-            Errno::EINTR => Error::new(Errno::ERESTARTSYS),
-            _ => err,
-        })?;
+    let audit_target = SocketAddr::audit_target_if_audited(Some(&socket_addr));
+    let res = socket.connect(socket_addr);
+    // A non-blocking connection is in progress towards the destination.
+    if res
+        .as_ref()
+        .err()
+        .is_none_or(|err| err.error() == Errno::EINPROGRESS)
+    {
+        audit_connect(audit_target);
+    }
+    res.map_err(|err| match err.error() {
+        // FIXME: `connect` should not be restarted if a timeout has been set on the socket using `setsockopt`.
+        Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+        _ => err,
+    })?;
 
     Ok(SyscallReturn::Return(0))
 }

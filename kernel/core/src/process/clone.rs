@@ -11,7 +11,7 @@ use ostd::{
 };
 
 use super::{
-    Credentials, Pid, Process, Tct, pid_table,
+    Credentials, Pid, Process, pid_table,
     posix_thread::{AsPosixThread, PosixThreadBuilder},
     rlimit::ResourceLimits,
     signal::{constants::SIGCHLD, sig_disposition::SigDispositions, sig_num::SigNum},
@@ -32,6 +32,7 @@ use crate::{
         stats::PROCESS_CREATION_COUNTER,
     },
     sched::Nice,
+    security::audit,
     thread::{AsThread, Tid},
     vm::vmar::{Vmar, VmarHandle},
 };
@@ -627,8 +628,8 @@ fn clone_child_process(
     };
 
     // This must be after all fallible steps, since a child that fails to be created never
-    // exits and would stay counted in the TCT.
-    Tct::inherit(process, &child);
+    // exits and would not be reported to the audit hooks as exited.
+    audit::on_fork(process, &child);
 
     // Sets parent process and group for child process.
     set_parent_and_group(clone_flags, process, &child);

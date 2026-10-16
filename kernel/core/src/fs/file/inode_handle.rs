@@ -29,7 +29,7 @@ use crate::{
         posix_thread::AsPosixThread,
         signal::{PollHandle, Pollable},
     },
-    security::lsm::hooks as lsm_hooks,
+    security::{audit::AuditEvent, lsm::hooks as lsm_hooks},
     util::ioctl::RawIoctl,
     vm::vmar::FileMmapRequest,
 };
@@ -97,6 +97,16 @@ impl InodeHandle {
                 .open(path.dentry(), access_mode, status_flags)
                 .transpose()?
         };
+
+        // Listing a directory is recorded by `readdir`.
+        if !status_flags.contains(StatusFlags::O_PATH) && inode.type_() != InodeType::Dir {
+            if access_mode.is_readable() {
+                path.audit(AuditEvent::FileRead);
+            }
+            if access_mode.is_writable() {
+                path.audit(AuditEvent::FileWritten);
+            }
+        }
 
         Ok(Self {
             open_file,
@@ -213,6 +223,7 @@ impl InodeHandle {
         let read_cnt = file_ops.readdir_at(*offset, visitor)?;
         *offset += read_cnt;
         self.file_accessed();
+        self.path().audit(AuditEvent::DirListed);
         Ok(read_cnt)
     }
 

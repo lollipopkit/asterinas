@@ -7,7 +7,7 @@ use crate::{
     fs::file::file_table::RawFileDesc,
     net::socket::{
         Socket,
-        util::{MessageHeader, SendFlags},
+        util::{MessageHeader, SendFlags, SocketAddr, audit_connect},
     },
     prelude::*,
     util::net::CUserMsgHdr,
@@ -48,18 +48,22 @@ pub(super) fn send_one_message(
     user_space: &CurrentUserSpace,
     flags: SendFlags,
 ) -> Result<usize> {
-    let message_header = {
+    let (message_header, audit_target) = {
         let addr = c_user_msghdr.read_socket_addr_from_user()?;
+        let audit_target = SocketAddr::audit_target_if_audited(addr.as_ref());
         let control_messages = c_user_msghdr.read_control_messages_from_user(user_space)?;
-        MessageHeader::new(addr, control_messages)
+        (MessageHeader::new(addr, control_messages), audit_target)
     };
     let mut io_vec_reader = c_user_msghdr.copy_reader_array_from_user(user_space)?;
 
-    socket
+    let sent_bytes = socket
         .sendmsg(&mut io_vec_reader, message_header, flags)
         .map_err(|err| match err.error() {
             // FIXME: `sendmsg` should not be restarted if a timeout has been set on the socket using `setsockopt`.
             Errno::EINTR => Error::new(Errno::ERESTARTSYS),
             _ => err,
-        })
+        })?;
+    audit_connect(audit_target);
+
+    Ok(sent_bytes)
 }

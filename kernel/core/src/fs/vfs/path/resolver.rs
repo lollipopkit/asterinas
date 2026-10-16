@@ -18,7 +18,7 @@ use crate::{
     process::{
         credentials::capabilities::CapSet, pid_table::PidTable, posix_thread::AsPosixThread,
     },
-    security::lsm::hooks as lsm_hooks,
+    security::{audit::AuditEvent, lsm::hooks as lsm_hooks},
 };
 
 /// The file descriptor of the current working directory.
@@ -754,6 +754,9 @@ impl PathResolver {
             let next_path = match self.lookup_at_path(&current_path, next_name) {
                 Ok(child) => child,
                 Err(e) => {
+                    if e.error() == Errno::ENOENT {
+                        current_path.audit_child(AuditEvent::LookupMissed, next_name);
+                    }
                     if next_is_tail && e.error() == Errno::ENOENT {
                         return Ok(LookupResult::AtParent(LookupParentResult::new(
                             current_path,

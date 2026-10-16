@@ -3,7 +3,7 @@
 use super::SyscallReturn;
 use crate::{
     fs::file::file_table::{RawFileDesc, get_file_fast},
-    net::socket::util::{MessageHeader, SendFlags},
+    net::socket::util::{MessageHeader, SendFlags, SocketAddr, audit_connect},
     prelude::*,
     util::net::read_socket_addr_from_user,
 };
@@ -32,6 +32,7 @@ pub(super) fn sys_sendto(
     let file = get_file_fast!(&mut file_table, sockfd.try_into()?);
     let socket = file.as_socket_or_err()?;
 
+    let audit_target = SocketAddr::audit_target_if_audited(socket_addr.as_ref());
     let message_header = MessageHeader::new(socket_addr, Vec::new());
 
     let user_space = ctx.user_space();
@@ -43,6 +44,7 @@ pub(super) fn sys_sendto(
             Errno::EINTR => Error::new(Errno::ERESTARTSYS),
             _ => err,
         })?;
+    audit_connect(audit_target);
 
     Ok(SyscallReturn::Return(send_size as _))
 }
