@@ -728,21 +728,18 @@ impl Mount {
 
         let need_inherit_atime = !mount_flags.intersects(ATIME_MASK | PerMountFlags::NODIRATIME);
 
+        let read_only_state = self.writers.lock_read_only_state();
         let old_flags = self.flags.load(Ordering::Relaxed);
         let new_flags = if need_inherit_atime {
             mount_flags | (old_flags & ATIME_MASK)
         } else {
             mount_flags
         };
-        let store = || {
-            self.flags.store(new_flags, Ordering::Relaxed);
-            Ok(())
-        };
         if new_flags.contains(PerMountFlags::RDONLY) && !old_flags.contains(PerMountFlags::RDONLY) {
-            self.writers.make_read_only(store)
-        } else {
-            store()
+            read_only_state.check_no_writers()?;
         }
+        self.flags.store(new_flags, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Gets the parent mount node if any.

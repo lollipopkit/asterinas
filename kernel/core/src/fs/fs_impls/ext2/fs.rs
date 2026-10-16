@@ -243,11 +243,17 @@ impl Ext2 {
     fn restore_mount_state(&self, update_mtime: bool) -> Result<()> {
         self.sync_all()?;
         let mut sb = self.super_block.write();
+        let old_sb = **sb;
         sb.set_state(*self.mount_state.lock());
         if update_mtime {
             sb.set_mtime(utils::now());
         }
-        self.write_metadata(&mut sb)
+        let result = self.write_metadata(&mut sb);
+        if result.is_err() {
+            // The volume stays marked in use on disk, so keep it so in memory.
+            **sb = old_sb;
+        }
+        result
     }
 
     /// Switches between read-only and read-write, keeping the on-disk state consistent.
@@ -974,6 +980,20 @@ mod test {
         );
         assert!(f.ext2.super_block().state().contains(FsState::VALID));
         assert!(!f.ext2.super_block().is_dirty());
+        assert_eq!(disk_super_block(&f.disk).as_bytes(), before.as_bytes());
+    }
+
+    #[ktest]
+    fn failed_ro_remount_stays_writable() {
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+        let before = disk_super_block(&f.disk);
+
+        f.disk.set_fail_writes(true);
+        assert_errno!(f.ext2.remount(FsFlags::RDONLY), Errno::EIO);
+        f.disk.set_fail_writes(false);
+
+        assert!(!f.ext2.fs_flags().contains(FsFlags::RDONLY));
+        assert!(!f.ext2.super_block().state().contains(FsState::VALID));
         assert_eq!(disk_super_block(&f.disk).as_bytes(), before.as_bytes());
     }
 

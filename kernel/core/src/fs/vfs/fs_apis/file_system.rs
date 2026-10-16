@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
 use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
 use device_id::DeviceId;
+use ostd::sync::RwMutexWriteGuard;
 
 use super::inode::Inode;
 use crate::prelude::*;
@@ -71,13 +72,11 @@ impl dyn FileSystem {
         data: Option<&str>,
         ctx: &Context,
     ) -> Result<()> {
+        let read_only_state = self.write_state().writers().lock_read_only_state();
         if flags.contains(FsFlags::RDONLY) && !self.flags().contains(FsFlags::RDONLY) {
-            self.write_state()
-                .writers()
-                .make_read_only(|| self.set_fs_flags(flags, data, ctx))
-        } else {
-            self.set_fs_flags(flags, data, ctx)
+            read_only_state.check_no_writers()?;
         }
+        self.set_fs_flags(flags, data, ctx)
     }
 
     pub(crate) fn downcast_ref<T: FileSystem>(&self) -> Option<&T> {
@@ -224,7 +223,7 @@ impl FsWriteState {
 /// Reference: Linux `mnt_get_write_access()` and `mnt_make_readonly()`.
 #[derive(Debug)]
 pub(crate) struct WriterCount {
-    /// Taken shared to add a writer and exclusively to switch to read-only.
+    /// Taken shared to add a writer and exclusively to change the read-only state.
     transition: RwMutex<()>,
     writers: AtomicUsize,
 }
@@ -253,18 +252,32 @@ impl WriterCount {
         debug_assert!(writers > 0);
     }
 
-    /// Runs `make_read_only` unless there are writers, which fails with `EBUSY`.
+    /// Locks the read-only state for a change, during which no writer can be added.
     ///
-    /// No writer can be added while `make_read_only` runs.
-    pub(crate) fn make_read_only<T>(
-        &self,
-        make_read_only: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        let _transition = self.transition.write();
+    /// Every change of the read-only state must happen under this lock, so that changes
+    /// are serialized with each other and with adding writers.
+    pub(crate) fn lock_read_only_state(&self) -> ReadOnlyStateGuard<'_> {
+        ReadOnlyStateGuard {
+            _transition: self.transition.write(),
+            writers: &self.writers,
+        }
+    }
+}
+
+/// A locked read-only state, returned by [`WriterCount::lock_read_only_state`].
+pub(crate) struct ReadOnlyStateGuard<'a> {
+    _transition: RwMutexWriteGuard<'a, ()>,
+    writers: &'a AtomicUsize,
+}
+
+impl ReadOnlyStateGuard<'_> {
+    /// Checks that the object may become read-only, which fails with `EBUSY` while it
+    /// has writers.
+    pub(crate) fn check_no_writers(&self) -> Result<()> {
         if self.writers.load(Ordering::Acquire) > 0 {
             return_errno_with_message!(Errno::EBUSY, "the mount or filesystem has writers");
         }
-        make_read_only()
+        Ok(())
     }
 }
 
