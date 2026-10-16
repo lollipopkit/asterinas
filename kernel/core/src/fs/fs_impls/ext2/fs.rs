@@ -28,7 +28,7 @@ use super::{
     block_group::{BlockGroup, RawBlockGroup},
     inode::{FilePerm, Inode, InodeDesc, RawInode},
     prelude::*,
-    super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
+    super_block::{FsState, RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
 };
 use crate::{
     fs::{
@@ -54,6 +54,12 @@ pub(crate) struct Ext2 {
     block_device: Arc<dyn BlockDevice>,
     /// Superblock with dirty tracking.
     super_block: RwMutex<Dirty<SuperBlock>>,
+    /// The on-disk state when the volume last became writable (Linux `s_mount_state`).
+    ///
+    /// While the volume is writable, the on-disk `VALID` bit stays cleared so that a crash
+    /// leaves it marked as not cleanly unmounted. Unmounting and remounting read-only write
+    /// this state back. Updated only with `super_block` write-locked.
+    mount_state: SpinLock<FsState>,
     /// Block group descriptors and caches.
     block_groups: Vec<BlockGroup>,
     /// Inodes per group.
@@ -175,9 +181,11 @@ impl Ext2 {
             block_groups
         };
 
+        let mount_state = super_block.state();
         let ext2 = Arc::new_cyclic(|weak_self| Ext2 {
             block_device: device,
             super_block: RwMutex::new(Dirty::new(super_block)),
+            mount_state: SpinLock::new(mount_state),
             block_groups,
             nr_inodes_per_group,
             group_descriptors_segment,
@@ -188,7 +196,111 @@ impl Ext2 {
             self_ref: weak_self.clone(),
         });
 
+        if !flags.contains(FsFlags::RDONLY) {
+            ext2.setup_writable()?;
+        }
+
         Ok(ext2)
+    }
+
+    /// Records a read-write mount on disk and marks the volume as in use.
+    ///
+    /// On failure, the in-memory superblock and mount state are left as they were.
+    ///
+    /// Reference: Linux `ext2_setup_super()` followed by `ext2_write_super()`.
+    fn setup_writable(&self) -> Result<()> {
+        let mut sb = self.super_block.write();
+        let (old_sb, was_dirty) = (**sb, sb.is_dirty());
+        let old_mount_state = *self.mount_state.lock();
+
+        let mount_state = sb.state();
+        *self.mount_state.lock() = mount_state;
+        if let Some(reason) = sb.fsck_reason(mount_state, utils::now()) {
+            warn!("{}, running e2fsck is recommended", reason);
+        }
+        sb.inc_mnt_count();
+        sb.set_state(mount_state - FsState::VALID);
+
+        let result = self.write_metadata(&mut sb);
+        if result.is_err() {
+            **sb = old_sb;
+            if !was_dirty {
+                sb.clear_dirty();
+            }
+            *self.mount_state.lock() = old_mount_state;
+        }
+        result
+    }
+
+    /// Syncs everything and writes back the state recorded by [`Self::setup_writable`].
+    ///
+    /// A volume that was not clean when it became writable stays not clean.
+    ///
+    /// Reference: Linux `ext2_put_super()` and the read-only branch of `ext2_reconfigure()`.
+    fn restore_mount_state(&self, update_mtime: bool) -> Result<()> {
+        self.sync_all()?;
+        let mut sb = self.super_block.write();
+        sb.set_state(*self.mount_state.lock());
+        if update_mtime {
+            sb.set_mtime(utils::now());
+        }
+        self.write_metadata(&mut sb)
+    }
+
+    /// Switches between read-only and read-write, keeping the on-disk state consistent.
+    ///
+    /// Reference: Linux `ext2_reconfigure()`.
+    pub(super) fn remount(&self, flags: FsFlags) -> Result<()> {
+        self.sync_all()?;
+        let old_flags = self.fs_flags();
+        match (
+            old_flags.contains(FsFlags::RDONLY),
+            flags.contains(FsFlags::RDONLY),
+        ) {
+            (false, true) => {
+                // Set `RDONLY` first so that the final sync does not clear `VALID` again.
+                self.set_fs_flags(flags);
+                if self.mount_state.lock().contains(FsState::VALID)
+                    && let Err(err) = self.restore_mount_state(true)
+                {
+                    // The volume is still marked in use on disk, so it stays writable.
+                    self.set_fs_flags(old_flags);
+                    return Err(err);
+                }
+            }
+            (true, false) => {
+                // Publish the volume as writable only once it is marked in use on disk.
+                self.setup_writable()?;
+                self.set_fs_flags(flags);
+            }
+            _ => self.set_fs_flags(flags),
+        }
+        Ok(())
+    }
+
+    /// Syncs the volume and marks it clean again when its last mount goes away.
+    ///
+    /// Reference: Linux `generic_shutdown_super()` calling `ext2_put_super()`.
+    pub(super) fn put_super(&self) {
+        if self.fs_flags().contains(FsFlags::RDONLY) {
+            return;
+        }
+        // The unmount path flushed the device before this final superblock write, so
+        // flush again to make the clean state durable.
+        if let Err(err) = self
+            .restore_mount_state(false)
+            .and_then(|()| self.flush_device())
+        {
+            error!("failed to mark the volume clean: {:?}", err);
+        }
+    }
+
+    /// Flushes the block device's volatile write cache.
+    pub(super) fn flush_device(&self) -> Result<()> {
+        if self.block_device.sync()? != BioStatus::Complete {
+            return_errno_with_message!(Errno::EIO, "failed to flush block device");
+        }
+        Ok(())
     }
 
     /// Returns the block device.
@@ -619,7 +731,17 @@ impl Ext2 {
     /// Flushes the superblock and all dirty group descriptors to the device.
     fn sync_metadata(&self) -> Result<()> {
         let mut sb_guard = self.super_block.write();
+        // The volume may have been checked while mounted, and `e2fsck` may have set
+        // `VALID` again (Linux `ext2_sync_fs()`).
+        if !self.fs_flags().contains(FsFlags::RDONLY) && sb_guard.state().contains(FsState::VALID) {
+            let state = sb_guard.state() - FsState::VALID;
+            sb_guard.set_state(state);
+        }
+        self.write_metadata(&mut sb_guard)
+    }
 
+    /// Writes the superblock and group descriptors to every copy if anything is dirty.
+    fn write_metadata(&self, sb_guard: &mut Dirty<SuperBlock>) -> Result<()> {
         let any_group_dirty = self.block_groups.iter().any(|group| group.is_desc_dirty());
         if !sb_guard.is_dirty() && !any_group_dirty {
             return Ok(());
@@ -692,10 +814,13 @@ mod test {
     use super::*;
     use crate::{
         fs::{
-            fs_impls::ext2::test_utils::{
-                BlockBitmapInit, Ext2FixtureBuilder, Ext2MemoryDisk, InodeBitmapInit,
-                RawInodeBuilder, assert_errno, create_file, default_fixture, make_valid_group_desc,
-                make_valid_super_block,
+            fs_impls::ext2::{
+                super_block::DEFAULT_MAX_MNT_COUNT,
+                test_utils::{
+                    BlockBitmapInit, Ext2FixtureBuilder, Ext2MemoryDisk, InodeBitmapInit,
+                    RawInodeBuilder, assert_errno, create_file, default_fixture,
+                    make_valid_group_desc, make_valid_super_block,
+                },
             },
             vfs::file_system::FileSystem as FileSystemTrait,
         },
@@ -750,6 +875,115 @@ mod test {
 
         let stat = FileSystemTrait::sb(ext2.as_ref());
         assert_eq!(stat.blocks, f.sb.total_blocks() as usize);
+    }
+
+    fn disk_super_block(disk: &Ext2MemoryDisk) -> RawSuperBlock {
+        disk.segment()
+            .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
+            .unwrap()
+    }
+
+    fn disk_state(disk: &Ext2MemoryDisk) -> FsState {
+        FsState::from_bits(disk_super_block(disk).state).unwrap()
+    }
+
+    #[ktest]
+    fn open_rw_marks_volume_in_use() {
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+
+        let raw = disk_super_block(&f.disk);
+        assert!(
+            !FsState::from_bits(raw.state)
+                .unwrap()
+                .contains(FsState::VALID)
+        );
+        assert_eq!(raw.mnt_count, 1);
+        assert_eq!(raw.max_mnt_count, DEFAULT_MAX_MNT_COUNT);
+    }
+
+    #[ktest]
+    fn put_super_marks_clean_volume_clean() {
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+
+        FileSystemTrait::shutdown(f.ext2.as_ref());
+        assert!(disk_state(&f.disk).contains(FsState::VALID));
+        assert_eq!(disk_super_block(&f.disk).mnt_count, 1);
+    }
+
+    #[ktest]
+    fn put_super_keeps_unclean_volume_unclean() {
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+        // The first open left the volume marked in use, as a crash would.
+        let ext2 = Ext2::open(
+            f.disk.clone() as Arc<dyn BlockDevice>,
+            FsFlags::empty(),
+            None,
+        )
+        .unwrap();
+
+        ext2.put_super();
+        assert!(!disk_state(&f.disk).contains(FsState::VALID));
+        assert_eq!(disk_super_block(&f.disk).mnt_count, 2);
+    }
+
+    #[ktest]
+    fn remount_switches_on_disk_state() {
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+
+        f.ext2.remount(FsFlags::RDONLY).unwrap();
+        assert!(disk_state(&f.disk).contains(FsState::VALID));
+        assert!(f.ext2.fs_flags().contains(FsFlags::RDONLY));
+
+        f.ext2.remount(FsFlags::empty()).unwrap();
+        assert!(!disk_state(&f.disk).contains(FsState::VALID));
+        assert_eq!(disk_super_block(&f.disk).mnt_count, 2);
+    }
+
+    #[ktest]
+    fn memory_disk_rejects_out_of_range_io() {
+        let disk: Arc<dyn BlockDevice> = Arc::new(Ext2MemoryDisk::new(4));
+        for bid in [3, 4] {
+            let segment = BioSegment::alloc(2, BioDirection::FromDevice);
+            let status = disk.read_blocks(Bid::new(bid), vec![segment]);
+            assert!(!matches!(status, Ok(BioStatus::Complete)), "bid {bid}");
+        }
+    }
+
+    #[ktest]
+    fn failed_rw_remount_stays_read_only() {
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+        f.ext2.remount(FsFlags::RDONLY).unwrap();
+        let before = disk_super_block(&f.disk);
+
+        f.disk.set_fail_writes(true);
+        assert_errno!(f.ext2.remount(FsFlags::empty()), Errno::EIO);
+        f.disk.set_fail_writes(false);
+
+        assert!(f.ext2.fs_flags().contains(FsFlags::RDONLY));
+        assert_eq!(
+            RawSuperBlock::from(&**f.ext2.super_block()).mnt_count,
+            before.mnt_count
+        );
+        assert!(f.ext2.super_block().state().contains(FsState::VALID));
+        assert!(!f.ext2.super_block().is_dirty());
+        assert_eq!(disk_super_block(&f.disk).as_bytes(), before.as_bytes());
+    }
+
+    #[ktest]
+    fn open_rdonly_leaves_super_block_untouched() {
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+        f.ext2.put_super();
+        let before = disk_super_block(&f.disk);
+
+        let ext2 = Ext2::open(
+            f.disk.clone() as Arc<dyn BlockDevice>,
+            FsFlags::RDONLY,
+            None,
+        )
+        .unwrap();
+        ext2.sync_all().unwrap();
+        ext2.put_super();
+        assert_eq!(disk_super_block(&f.disk).as_bytes(), before.as_bytes());
     }
 
     #[ktest]

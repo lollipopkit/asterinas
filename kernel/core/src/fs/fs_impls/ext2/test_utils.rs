@@ -67,6 +67,7 @@ pub(super) struct Ext2MemoryDisk {
     read_count: AtomicUsize,
     write_count: AtomicUsize,
     fail_flush: AtomicBool,
+    fail_writes: AtomicBool,
 }
 
 impl Ext2MemoryDisk {
@@ -82,6 +83,7 @@ impl Ext2MemoryDisk {
             read_count: AtomicUsize::new(0),
             write_count: AtomicUsize::new(0),
             fail_flush: AtomicBool::new(false),
+            fail_writes: AtomicBool::new(false),
         }
     }
 
@@ -97,6 +99,11 @@ impl Ext2MemoryDisk {
     /// Returns the number of write requests that the disk has served.
     pub(super) fn write_count(&self) -> usize {
         self.write_count.load(Ordering::Relaxed)
+    }
+
+    /// Makes every subsequent write request fail with `IoError`.
+    pub(super) fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes.store(fail, Ordering::Relaxed);
     }
 
     pub(super) fn write_super_block(&self, raw: &RawSuperBlock) {
@@ -133,6 +140,11 @@ impl BlockDevice for Ext2MemoryDisk {
             return Ok(());
         }
 
+        if bio.type_() == BioType::Write && self.fail_writes.load(Ordering::Relaxed) {
+            bio.complete(BioStatus::IoError);
+            return Ok(());
+        }
+
         match bio.type_() {
             BioType::Read => self.read_count.fetch_add(1, Ordering::Relaxed),
             BioType::Write => self.write_count.fetch_add(1, Ordering::Relaxed),
@@ -140,6 +152,16 @@ impl BlockDevice for Ext2MemoryDisk {
         };
 
         let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
+        // Like a real disk, reject requests beyond the end of the device instead of
+        // transferring a truncated range.
+        let nbytes: usize = bio.segments().iter().map(|seg| seg.nbytes()).sum();
+        if cur_device_ofs
+            .checked_add(nbytes)
+            .is_none_or(|end| end > self.segment.size())
+        {
+            bio.complete(BioStatus::IoError);
+            return Ok(());
+        }
 
         for seg in bio.segments() {
             let io_size = match bio.type_() {
@@ -158,6 +180,7 @@ impl BlockDevice for Ext2MemoryDisk {
                     return Ok(());
                 }
             };
+            debug_assert_eq!(io_size, seg.nbytes());
             cur_device_ofs += io_size;
         }
 
@@ -213,7 +236,13 @@ pub(super) fn make_valid_super_block(nr_block_groups: u32) -> SuperBlock {
 }
 
 pub(super) fn make_valid_group_desc(sb: &SuperBlock, group_idx: usize) -> RawBlockGroup {
-    let first = sb.group_first_block_no(group_idx);
+    // A group holding a superblock copy starts with it and the descriptor table, which
+    // `Ext2` rewrites on every metadata sync.
+    let first = if sb.has_super_block(group_idx) {
+        sb.group_descriptors_bid(group_idx) + sb.group_descriptor_blocks_count()
+    } else {
+        sb.group_first_block_no(group_idx)
+    };
     RawBlockGroup {
         block_bitmap_bid: first,
         inode_bitmap_bid: first + 1,
@@ -623,14 +652,16 @@ impl Ext2FixtureBuilder {
             set_bit_lsb0(bitmap, (desc.inode_table_bid + i - first) as usize);
         }
 
-        if group_idx == 0 {
-            let sb_bid = sb.bid(0);
+        if sb.has_super_block(group_idx) {
+            let sb_bid = sb.bid(group_idx);
             if sb_bid >= first && sb_bid <= last {
                 set_bit_lsb0(bitmap, (sb_bid - first) as usize);
             }
-            let group_desc_bid = sb.group_descriptors_bid(0);
-            if group_desc_bid >= first && group_desc_bid <= last {
-                set_bit_lsb0(bitmap, (group_desc_bid - first) as usize);
+            let group_desc_bid = sb.group_descriptors_bid(group_idx);
+            for bid in group_desc_bid..group_desc_bid + sb.group_descriptor_blocks_count() {
+                if bid >= first && bid <= last {
+                    set_bit_lsb0(bitmap, (bid - first) as usize);
+                }
             }
         }
     }
@@ -748,6 +779,8 @@ impl Ext2FixtureBuilder {
         let device: Arc<dyn BlockDevice> = self
             .custom_device
             .unwrap_or_else(|| disk.clone() as Arc<dyn BlockDevice>);
+        // A read-write open stamps the superblock's write time.
+        clocks::init_for_ktest();
         let ext2 = Ext2::open(device, FsFlags::empty(), None)?;
 
         Ok(Ext2Fixture {

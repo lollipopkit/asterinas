@@ -5,7 +5,7 @@
 //! Translates VFS-level mount, sync, stat, and root-inode requests into
 //! the corresponding ext2-internal operations.
 
-use aster_block::{BLOCK_SIZE, bio::BioStatus};
+use aster_block::BLOCK_SIZE;
 
 use crate::{
     fs::{
@@ -26,10 +26,7 @@ impl FileSystem for Ext2 {
 
     fn sync(&self) -> Result<()> {
         self.sync_all()?;
-        if self.block_device().sync()? != BioStatus::Complete {
-            return_errno_with_message!(Errno::EIO, "failed to flush block device");
-        }
-        Ok(())
+        self.flush_device()
     }
 
     fn root_inode(&self) -> Arc<dyn Inode> {
@@ -66,9 +63,11 @@ impl FileSystem for Ext2 {
     }
 
     fn set_fs_flags(&self, flags: FsFlags, _data: Option<&str>, _ctx: &Context) -> Result<()> {
-        self.set_fs_flags(flags);
-        warn!("ext2-specific handling for filesystem flags is not implemented");
-        Ok(())
+        self.remount(flags)
+    }
+
+    fn shutdown(&self) {
+        self.put_super();
     }
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
