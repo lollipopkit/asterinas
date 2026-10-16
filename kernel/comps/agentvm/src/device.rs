@@ -9,11 +9,17 @@
 //! processes are attributed to a TCT. A commit waits until no TCT is running, so a shim that
 //! runs tool calls in parallel ends all of them before committing any.
 //!
+//! To tag a snapshot of an epoch on the host, the shim commits with
+//! `AGENT_CTL_TCT_COMMIT_HOLD`, which keeps the commit gate closed so that no TCT begins until
+//! the shim opens it with `AGENT_CTL_TCT_COMMIT_DONE` (or closes the file) after the host has
+//! taken the snapshot.
+//!
 //! Controlling a TCT (beginning, ending, reading its effects, committing and releasing it) requires
 //! `CAP_SYS_ADMIN`, and is refused for processes that are already in a TCT, so a tool cannot
 //! leave its TCT or control it from the inside.
 
 use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use aster_core::{
     current,
@@ -34,7 +40,7 @@ use aster_core::{
         signal::{PollHandle, Pollable},
     },
     security::lsm::hooks::{self as lsm_hook, CapableContext},
-    util::ioctl::{InData, InOutData, OutData, RawIoctl},
+    util::ioctl::{InData, InOutData, NoData, OutData, RawIoctl},
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{
@@ -68,11 +74,24 @@ impl Device for AgentCtlDevice {
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
-        Ok(Box::new(AgentCtlFile))
+        Ok(Box::new(AgentCtlFile {
+            holds_commit_gate: AtomicBool::new(false),
+        }))
     }
 }
 
-struct AgentCtlFile;
+struct AgentCtlFile {
+    /// Whether a commit through this file holds the commit gate.
+    holds_commit_gate: AtomicBool,
+}
+
+impl Drop for AgentCtlFile {
+    fn drop(&mut self) {
+        if *self.holds_commit_gate.get_mut() {
+            Tct::open_commit_gate();
+        }
+    }
+}
 
 impl Pollable for AgentCtlFile {
     fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
@@ -133,6 +152,7 @@ impl PerOpenFileOps for AgentCtlFile {
             cmd @ TctBegin => {
                 let mut args: TctBeginArgs = cmd.read()?;
                 let flags = TctFlags::from_bits(args.flags)
+                    .filter(|_| args.reserved == 0)
                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid TCT flags"))?;
                 check_controller()?;
                 // Write the ID first, so a failed write does not leave the caller in a TCT
@@ -174,9 +194,47 @@ impl PerOpenFileOps for AgentCtlFile {
                 })
             }
             cmd @ TctCommit => {
-                let id = cmd.read()?;
+                let mut args: TctCommitArgs = cmd.read()?;
+                let should_hold = match args.flags {
+                    0 => false,
+                    TCT_COMMIT_HOLD => true,
+                    _ => return_errno_with_message!(Errno::EINVAL, "invalid commit flags"),
+                };
+                if args.reserved != 0 {
+                    return_errno_with_message!(Errno::EINVAL, "invalid commit flags");
+                }
                 check_controller()?;
-                Tct::get(id)?.commit().map_err(restart_on_signal)?;
+                let tct = Tct::get(args.id)?;
+                // Check that the output can be written before committing.
+                cmd.write(&args)?;
+                // The commit would wait for the gate that this file holds forever.
+                if self.holds_commit_gate.load(Ordering::Acquire) {
+                    return_errno_with_message!(Errno::EBUSY, "the file holds the commit gate");
+                }
+                let outcome = tct.commit(should_hold).map_err(restart_on_signal)?;
+                if outcome.holds_gate {
+                    self.holds_commit_gate.store(true, Ordering::Release);
+                }
+                args.flags = if outcome.holds_gate {
+                    TCT_COMMIT_HOLD
+                } else {
+                    0
+                };
+                args.epoch = outcome.epoch;
+                // If the output cannot be written now, the data is still durable, and the gate
+                // stays held until `AGENT_CTL_TCT_COMMIT_DONE` or until the file is closed.
+                cmd.write(&args)?;
+                Ok(0)
+            }
+            _cmd @ TctCommitDone => {
+                check_controller()?;
+                if !self.holds_commit_gate.swap(false, Ordering::AcqRel) {
+                    return_errno_with_message!(
+                        Errno::EINVAL,
+                        "the file does not hold the commit gate"
+                    );
+                }
+                Tct::open_commit_gate();
                 Ok(0)
             }
             cmd @ TctRelease => {
@@ -209,6 +267,23 @@ struct TctBeginArgs {
     reserved: u32,
     /// The ID of the TCT (output).
     id: u64,
+}
+
+/// Keeps the commit gate closed after a commit, see [`Tct::commit`].
+const TCT_COMMIT_HOLD: u32 = 1 << 0;
+
+/// The argument of `AGENT_CTL_TCT_COMMIT`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod)]
+struct TctCommitArgs {
+    /// The ID of the TCT to commit (input).
+    id: u64,
+    /// The commit flags (input), and `TCT_COMMIT_HOLD` if the caller holds the commit gate
+    /// (output).
+    flags: u32,
+    reserved: u32,
+    /// The epoch of the commit that covers the TCT (output).
+    epoch: u64,
 }
 
 /// The argument of `AGENT_CTL_TCT_END`.
@@ -246,7 +321,8 @@ mod ioctl_defs {
     pub(super) type TctGet     = ioc!(AGENT_CTL_TCT_GET,     0xA7, 3, OutData<u64>);
     pub(super) type TctEffects = ioc!(AGENT_CTL_TCT_EFFECTS, 0xA7, 4, InOutData<TctEffectsArgs>);
     pub(super) type TctRelease = ioc!(AGENT_CTL_TCT_RELEASE, 0xA7, 5, InData<u64>);
-    pub(super) type TctCommit  = ioc!(AGENT_CTL_TCT_COMMIT,  0xA7, 6, InData<u64>);
+    pub(super) type TctCommit  = ioc!(AGENT_CTL_TCT_COMMIT,  0xA7, 6, InOutData<TctCommitArgs>);
+    pub(super) type TctCommitDone = ioc!(AGENT_CTL_TCT_COMMIT_DONE, 0xA7, 7, NoData);
 }
 
 pub(crate) fn init() -> Result<()> {

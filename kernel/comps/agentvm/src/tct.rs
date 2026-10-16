@@ -16,6 +16,10 @@
 //! contains part of a tool call. A TCT is running if it has not ended and some of its
 //! processes have not exited; a TCT whose processes have all exited cannot write any more,
 //! even if its controller never ends it. One commit covers every TCT that is not running.
+//!
+//! Each commit creates a new epoch: the durable state that contains the TCTs that it covers.
+//! The caller of a commit can hold the commit gate after the data is durable, so that no TCT
+//! begins until the host has taken a snapshot of the epoch.
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -40,8 +44,9 @@ pub(crate) struct Tct {
     flags: TctFlags,
     nr_live_processes: AtomicUsize,
     has_ended: AtomicBool,
-    /// Whether the data of the TCT has been made durable by a commit.
-    is_committed: AtomicBool,
+    /// The epoch of the commit that has made the data of the TCT durable, or zero if the TCT
+    /// has not been committed.
+    commit_epoch: AtomicU64,
     effects: Mutex<Effects>,
 }
 
@@ -67,13 +72,17 @@ struct CommitState {
     /// The number of running TCTs, i.e., TCTs that have begun but not ended, and have
     /// processes that have not exited.
     nr_running: usize,
-    /// Whether a commit is in progress.
+    /// Whether the commit gate is closed, i.e., a commit is in progress or its caller holds
+    /// the gate.
     is_committing: bool,
+    /// The epoch of the last commit, which starts from one.
+    last_epoch: u64,
 }
 
 static COMMIT_STATE: SpinLock<CommitState> = SpinLock::new(CommitState {
     nr_running: 0,
     is_committing: false,
+    last_epoch: 0,
 });
 
 /// The wait queue for changes of [`COMMIT_STATE`].
@@ -136,7 +145,7 @@ impl Tct {
             flags,
             nr_live_processes: AtomicUsize::new(1),
             has_ended: AtomicBool::new(false),
-            is_committed: AtomicBool::new(false),
+            commit_epoch: AtomicU64::new(0),
             effects: Mutex::new(Effects::default()),
         })
     }
@@ -201,29 +210,41 @@ impl Tct {
     /// the data is durable on return.
     ///
     /// The commit waits until no TCT is running, so the caller must end the other running
-    /// TCTs that it controls first. It covers every TCT that is not running, so it returns
-    /// immediately if another commit has covered this TCT.
+    /// TCTs that it controls first. It covers every TCT that is not running. If another commit
+    /// has covered this TCT, this waits until the commit gate opens and returns without
+    /// committing again, so a TCT is reported as committed only after any snapshot of its
+    /// epoch has finished.
+    ///
+    /// If `should_hold` is true and this commit covers the TCT, the commit gate stays closed
+    /// on return until [`Self::open_commit_gate`] is called.
     ///
     /// A failed commit can be retried. Returns `EINVAL` if the TCT has not ended, or `EINTR`
     /// if a signal interrupts the wait.
-    pub(crate) fn commit(&self) -> Result<()> {
+    pub(crate) fn commit(&self, should_hold: bool) -> Result<CommitOutcome> {
         if !self.has_ended.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EINVAL, "the TCT has not ended");
         }
 
-        let should_commit = pause_on_until(&COMMIT_WAIT_QUEUE, || {
-            if self.is_committed.load(Ordering::Acquire) {
-                return Some(false);
-            }
+        let committed_epoch = pause_on_until(&COMMIT_WAIT_QUEUE, || {
             let mut state = COMMIT_STATE.lock();
-            if state.nr_running > 0 || state.is_committing {
+            if state.is_committing {
+                return None;
+            }
+            let epoch = self.commit_epoch.load(Ordering::Acquire);
+            if epoch != 0 {
+                return Some(Some(epoch));
+            }
+            if state.nr_running > 0 {
                 return None;
             }
             state.is_committing = true;
-            Some(true)
+            Some(None)
         })?;
-        if !should_commit {
-            return Ok(());
+        if let Some(epoch) = committed_epoch {
+            return Ok(CommitOutcome {
+                epoch,
+                holds_gate: false,
+            });
         }
 
         // No TCT can begin until the commit finishes, so these are all the TCTs, and none of
@@ -232,19 +253,35 @@ impl Tct {
         let tcts: Vec<_> = TCTS
             .lock()
             .values()
-            .filter(|tct| !tct.is_committed.load(Ordering::Relaxed))
+            .filter(|tct| tct.commit_epoch.load(Ordering::Relaxed) == 0)
             .cloned()
             .collect();
-        let res = sync_all_file_systems();
-        if res.is_ok() {
-            for tct in tcts {
-                tct.is_committed.store(true, Ordering::Release);
-            }
+        if let Err(err) = sync_all_file_systems() {
+            Self::open_commit_gate();
+            return Err(err);
         }
 
+        let epoch = {
+            let mut state = COMMIT_STATE.lock();
+            state.last_epoch += 1;
+            state.last_epoch
+        };
+        for tct in tcts {
+            tct.commit_epoch.store(epoch, Ordering::Release);
+        }
+        if !should_hold {
+            Self::open_commit_gate();
+        }
+        Ok(CommitOutcome {
+            epoch,
+            holds_gate: should_hold,
+        })
+    }
+
+    /// Opens the commit gate that a commit has closed, so that TCTs can begin.
+    pub(crate) fn open_commit_gate() {
         COMMIT_STATE.lock().is_committing = false;
         COMMIT_WAIT_QUEUE.wake_all();
-        res
     }
 
     /// Releases the TCT with the given ID, after which it can no longer be found by its ID.
@@ -258,7 +295,7 @@ impl Tct {
         };
         if !tct.has_ended.load(Ordering::Relaxed)
             || (tct.flags.contains(TctFlags::DEFER_SYNC)
-                && !tct.is_committed.load(Ordering::Acquire))
+                && tct.commit_epoch.load(Ordering::Acquire) == 0)
         {
             return_errno_with_message!(Errno::EBUSY, "the TCT has not ended or been committed");
         }
@@ -304,6 +341,15 @@ impl Tct {
         }
         effects.set.insert(entry);
     }
+}
+
+/// The outcome of [`Tct::commit`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CommitOutcome {
+    /// The epoch of the commit that covers the TCT.
+    pub(crate) epoch: u64,
+    /// Whether the caller holds the commit gate.
+    pub(crate) holds_gate: bool,
 }
 
 /// The sync policy that defers the sync requests in TCTs with [`TctFlags::DEFER_SYNC`].
