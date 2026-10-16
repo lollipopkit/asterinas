@@ -83,9 +83,15 @@ FN_TEST(other_process_links)
 	// Another user cannot read the links.
 	pid_t reader = TEST_SUCC(fork());
 	if (reader == 0) {
+		char root_path[64];
+
+		snprintf(root_path, sizeof(root_path), "/proc/%d/root", child);
 		CHECK(setuid(NOBODY_UID));
 		CHECK_WITH(read_link(path), _ret < 0 && errno == EACCES);
 		CHECK_WITH(open(path, O_RDONLY | O_DIRECTORY),
+			   _ret < 0 && errno == EACCES);
+		CHECK_WITH(read_link(root_path), _ret < 0 && errno == EACCES);
+		CHECK_WITH(open(root_path, O_RDONLY | O_DIRECTORY),
 			   _ret < 0 && errno == EACCES);
 		_exit(0);
 	}
