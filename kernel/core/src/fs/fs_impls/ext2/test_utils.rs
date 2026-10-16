@@ -67,6 +67,7 @@ pub(super) struct Ext2MemoryDisk {
     read_count: AtomicUsize,
     write_count: AtomicUsize,
     fail_flush: AtomicBool,
+    fail_writes: AtomicBool,
 }
 
 impl Ext2MemoryDisk {
@@ -82,6 +83,7 @@ impl Ext2MemoryDisk {
             read_count: AtomicUsize::new(0),
             write_count: AtomicUsize::new(0),
             fail_flush: AtomicBool::new(false),
+            fail_writes: AtomicBool::new(false),
         }
     }
 
@@ -97,6 +99,11 @@ impl Ext2MemoryDisk {
     /// Returns the number of write requests that the disk has served.
     pub(super) fn write_count(&self) -> usize {
         self.write_count.load(Ordering::Relaxed)
+    }
+
+    /// Makes every subsequent write request fail with `IoError`.
+    pub(super) fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes.store(fail, Ordering::Relaxed);
     }
 
     pub(super) fn write_super_block(&self, raw: &RawSuperBlock) {
@@ -133,6 +140,11 @@ impl BlockDevice for Ext2MemoryDisk {
             return Ok(());
         }
 
+        if bio.type_() == BioType::Write && self.fail_writes.load(Ordering::Relaxed) {
+            bio.complete(BioStatus::IoError);
+            return Ok(());
+        }
+
         match bio.type_() {
             BioType::Read => self.read_count.fetch_add(1, Ordering::Relaxed),
             BioType::Write => self.write_count.fetch_add(1, Ordering::Relaxed),
@@ -140,6 +152,16 @@ impl BlockDevice for Ext2MemoryDisk {
         };
 
         let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
+        // Like a real disk, reject requests beyond the end of the device instead of
+        // transferring a truncated range.
+        let nbytes: usize = bio.segments().iter().map(|seg| seg.nbytes()).sum();
+        if cur_device_ofs
+            .checked_add(nbytes)
+            .is_none_or(|end| end > self.segment.size())
+        {
+            bio.complete(BioStatus::IoError);
+            return Ok(());
+        }
 
         for seg in bio.segments() {
             let io_size = match bio.type_() {
@@ -158,6 +180,7 @@ impl BlockDevice for Ext2MemoryDisk {
                     return Ok(());
                 }
             };
+            debug_assert_eq!(io_size, seg.nbytes());
             cur_device_ofs += io_size;
         }
 
