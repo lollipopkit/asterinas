@@ -146,9 +146,11 @@ impl PerOpenFileOps for AgentCtlFile {
                 let mut end: TctEndArgs = cmd.read()?;
                 check_controller()?;
                 let tct = Tct::get(end.id)?;
-                tct.end()?;
+                // Write the output first, so a failed write does not leave the TCT ended
+                // without the caller knowing it.
                 end.nr_live_processes = tct.nr_live_processes() as u64;
                 cmd.write(&end)?;
+                tct.end()?;
                 Ok(0)
             }
             cmd @ TctGet => {

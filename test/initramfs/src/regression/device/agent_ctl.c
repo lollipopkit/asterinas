@@ -563,3 +563,20 @@ FN_TEST(commit_and_release)
 	TEST_SUCC(tct_release(id));
 }
 END_TEST()
+
+FN_TEST(end_with_bad_pointer)
+{
+	uint64_t id = IN_TCT({}), nr_live;
+	struct agent_ctl_tct_end *args = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+					      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	TEST_RES(args != MAP_FAILED, _ret);
+	args->id = id;
+	TEST_SUCC(mprotect(args, 4096, PROT_READ));
+	// The TCT does not end if its result cannot be written.
+	TEST_ERRNO(ioctl(ctl_fd, AGENT_CTL_TCT_END, args), EFAULT);
+	TEST_SUCC(munmap(args, 4096));
+	TEST_RES(tct_end(id, &nr_live), _ret == 0 && nr_live == 0);
+	TEST_SUCC(tct_release(id));
+}
+END_TEST()
