@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
@@ -561,6 +562,49 @@ FN_TEST(commit_and_release)
 	id = IN_TCT({});
 	TEST_RES(tct_end(id, &nr_live), _ret == 0);
 	TEST_SUCC(tct_release(id));
+}
+END_TEST()
+
+static void handle_alarm(int signum)
+{
+	(void)signum;
+}
+
+FN_TEST(commit_waits_for_running_tcts)
+{
+	struct sigaction alarm_action = { .sa_handler = handle_alarm };
+	int hold_pipe[2];
+	uint64_t running, ended, nr_live;
+	char byte;
+
+	TEST_SUCC(sigaction(SIGALRM, &alarm_action, NULL));
+	TEST_SUCC(pipe(hold_pipe));
+	// The grandchild stays alive until the hold pipe is closed.
+	running = IN_TCT({
+		if (TEST_SUCC(fork()) == 0) {
+			close(hold_pipe[1]);
+			_exit(read(hold_pipe[0], &byte, 1) == 0 ? 0 : 1);
+		}
+	});
+	ended = IN_TCT({});
+	TEST_RES(tct_end(ended, &nr_live), _ret == 0);
+
+	// The commit waits until the running TCT stops running.
+	alarm(1);
+	TEST_ERRNO(tct_commit(ended), EINTR);
+
+	// A TCT whose processes have all exited is not running, even if it has not ended.
+	TEST_SUCC(close(hold_pipe[0]));
+	TEST_SUCC(close(hold_pipe[1]));
+	TEST_SUCC(tct_commit(ended));
+	TEST_RES(tct_end(running, &nr_live), _ret == 0 && nr_live == 0);
+	// The commit has covered the TCT.
+	TEST_SUCC(tct_commit(running));
+	TEST_SUCC(tct_release(running));
+	TEST_SUCC(tct_release(ended));
+
+	alarm_action.sa_handler = SIG_DFL;
+	TEST_SUCC(sigaction(SIGALRM, &alarm_action, NULL));
 }
 END_TEST()
 

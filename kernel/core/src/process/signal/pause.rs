@@ -250,6 +250,21 @@ impl Pause for WaitQueue {
     }
 }
 
+/// Waits on `wait_queue` until `cond` returns `Some` or a signal interrupts the current thread.
+///
+/// This exposes [`Pause::pause_until`] to components outside the crate.
+///
+/// # Errors
+///
+/// Returns `EINTR` if a signal is received before the condition is met.
+#[track_caller]
+pub fn pause_on_until<F, R>(wait_queue: &WaitQueue, cond: F) -> Result<R>
+where
+    F: FnMut() -> Option<R>,
+{
+    wait_queue.pause_until(cond)
+}
+
 /// The reason why a process is paused by a `pause`-family method.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PauseReason {

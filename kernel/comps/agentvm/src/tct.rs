@@ -10,6 +10,12 @@
 //!
 //! The [`Effect`]s of the processes in a TCT are recorded through the audit hooks. A TCT and
 //! its effects stay available after it ends, until it is released with [`Tct::release`].
+//!
+//! The data of ended TCTs becomes durable through [`Tct::commit`]. A commit only happens when
+//! no TCT is running, and no TCT begins until it finishes, so the durable state never
+//! contains part of a tool call. A TCT is running if it has not ended and some of its
+//! processes have not exited; a TCT whose processes have all exited cannot write any more,
+//! even if its controller never ends it. One commit covers every TCT that is not running.
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -22,10 +28,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use aster_core::{
     fs::vfs::{sync_all_file_systems, sync_policy::SyncPolicy},
     prelude::*,
-    process::Process,
+    process::{Process, signal::pause_on_until},
     security::audit::{AuditEvent, AuditHooks},
 };
-use ostd::sync::Mutex;
+use ostd::sync::{Mutex, SpinLock, WaitQueue};
 
 /// A tool-call transaction.
 #[derive(Debug)]
@@ -34,9 +40,7 @@ pub(crate) struct Tct {
     flags: TctFlags,
     nr_live_processes: AtomicUsize,
     has_ended: AtomicBool,
-    /// Whether the TCT can be released without losing deferred sync requests, which is only
-    /// false for a TCT with [`TctFlags::DEFER_SYNC`] that has not been committed by
-    /// [`Tct::commit`].
+    /// Whether the data of the TCT has been made durable by a commit.
     is_committed: AtomicBool,
     effects: Mutex<Effects>,
 }
@@ -44,17 +48,36 @@ pub(crate) struct Tct {
 bitflags::bitflags! {
     /// The flags that a TCT is created with.
     pub(crate) struct TctFlags: u32 {
-        /// Defers the sync requests of the processes in the TCT until it ends, when all the
-        /// file systems (in every mount namespace) are written back and flushed at once.
+        /// Defers the sync requests of the processes in the TCT until it is committed, when
+        /// all the file systems (in every mount namespace) are written back and flushed at
+        /// once.
         ///
-        /// This is only safe if the storage is rolled back to the state of the previous TCT
-        /// after a crash, because data synced inside the TCT is not durable until it ends.
+        /// This is only safe if the storage is rolled back to the state of the last commit
+        /// after a crash, because data synced inside the TCT is not durable until then.
         const DEFER_SYNC = 1 << 0;
     }
 }
 
 /// The TCTs that have begun but not been released, indexed by ID.
 static TCTS: Mutex<BTreeMap<u64, Arc<Tct>>> = Mutex::new(BTreeMap::new());
+
+/// The commit state shared by all TCTs.
+#[derive(Debug, Default)]
+struct CommitState {
+    /// The number of running TCTs, i.e., TCTs that have begun but not ended, and have
+    /// processes that have not exited.
+    nr_running: usize,
+    /// Whether a commit is in progress.
+    is_committing: bool,
+}
+
+static COMMIT_STATE: SpinLock<CommitState> = SpinLock::new(CommitState {
+    nr_running: 0,
+    is_committing: false,
+});
+
+/// The wait queue for changes of [`COMMIT_STATE`].
+static COMMIT_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 
 /// A kind of effect that a TCT has.
 ///
@@ -113,16 +136,31 @@ impl Tct {
             flags,
             nr_live_processes: AtomicUsize::new(1),
             has_ended: AtomicBool::new(false),
-            is_committed: AtomicBool::new(!flags.contains(TctFlags::DEFER_SYNC)),
+            is_committed: AtomicBool::new(false),
             effects: Mutex::new(Effects::default()),
         })
     }
 
     /// Begins the TCT by putting `process` into it.
     ///
-    /// Returns `EPERM` if `process` is already in a TCT or has another audit context.
+    /// Waits for any commit in progress to finish first.
+    ///
+    /// Returns `EPERM` if `process` is already in a TCT or has another audit context, or
+    /// `EINTR` if a signal interrupts the wait.
     pub(crate) fn begin(self: &Arc<Self>, process: &Process) -> Result<()> {
-        process.set_audit_context(self.clone())?;
+        pause_on_until(&COMMIT_WAIT_QUEUE, || {
+            let mut state = COMMIT_STATE.lock();
+            if state.is_committing {
+                return None;
+            }
+            state.nr_running += 1;
+            Some(())
+        })?;
+        if let Err(err) = process.set_audit_context(self.clone()) {
+            COMMIT_STATE.lock().nr_running -= 1;
+            COMMIT_WAIT_QUEUE.wake_all();
+            return Err(err);
+        }
         TCTS.lock().insert(self.id, self.clone());
         Ok(())
     }
@@ -148,8 +186,13 @@ impl Tct {
     ///
     /// Returns `EINVAL` if the TCT has already ended.
     pub(crate) fn end(&self) -> Result<()> {
+        let mut state = COMMIT_STATE.lock();
         if self.has_ended.swap(true, Ordering::AcqRel) {
             return_errno_with_message!(Errno::EINVAL, "the TCT has already ended");
+        }
+        if self.nr_live_processes.load(Ordering::Relaxed) > 0 {
+            state.nr_running -= 1;
+            COMMIT_WAIT_QUEUE.wake_all();
         }
         Ok(())
     }
@@ -157,16 +200,51 @@ impl Tct {
     /// Commits the data of the TCT, writing back and flushing all the file systems, so that
     /// the data is durable on return.
     ///
-    /// A failed commit can be retried. Returns `EINVAL` if the TCT has not ended.
+    /// The commit waits until no TCT is running, so the caller must end the other running
+    /// TCTs that it controls first. It covers every TCT that is not running, so it returns
+    /// immediately if another commit has covered this TCT.
+    ///
+    /// A failed commit can be retried. Returns `EINVAL` if the TCT has not ended, or `EINTR`
+    /// if a signal interrupts the wait.
     pub(crate) fn commit(&self) -> Result<()> {
-        // The commit starts after the TCT has ended, so it covers all the sync requests that the
-        // TCT deferred.
         if !self.has_ended.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EINVAL, "the TCT has not ended");
         }
-        sync_all_file_systems()?;
-        self.is_committed.store(true, Ordering::Release);
-        Ok(())
+
+        let should_commit = pause_on_until(&COMMIT_WAIT_QUEUE, || {
+            if self.is_committed.load(Ordering::Acquire) {
+                return Some(false);
+            }
+            let mut state = COMMIT_STATE.lock();
+            if state.nr_running > 0 || state.is_committing {
+                return None;
+            }
+            state.is_committing = true;
+            Some(true)
+        })?;
+        if !should_commit {
+            return Ok(());
+        }
+
+        // No TCT can begin until the commit finishes, so these are all the TCTs, and none of
+        // them is running. Each of them ended, or had all of its processes exit, before the
+        // commit starts, so the commit covers all the sync requests that it deferred.
+        let tcts: Vec<_> = TCTS
+            .lock()
+            .values()
+            .filter(|tct| !tct.is_committed.load(Ordering::Relaxed))
+            .cloned()
+            .collect();
+        let res = sync_all_file_systems();
+        if res.is_ok() {
+            for tct in tcts {
+                tct.is_committed.store(true, Ordering::Release);
+            }
+        }
+
+        COMMIT_STATE.lock().is_committing = false;
+        COMMIT_WAIT_QUEUE.wake_all();
+        res
     }
 
     /// Releases the TCT with the given ID, after which it can no longer be found by its ID.
@@ -178,7 +256,10 @@ impl Tct {
         let Some(tct) = tcts.get(&id) else {
             return_errno_with_message!(Errno::EINVAL, "the TCT does not exist");
         };
-        if !tct.has_ended.load(Ordering::Relaxed) || !tct.is_committed.load(Ordering::Acquire) {
+        if !tct.has_ended.load(Ordering::Relaxed)
+            || (tct.flags.contains(TctFlags::DEFER_SYNC)
+                && !tct.is_committed.load(Ordering::Acquire))
+        {
             return_errno_with_message!(Errno::EBUSY, "the TCT has not ended or been committed");
         }
         tcts.remove(&id);
@@ -250,8 +331,17 @@ impl AuditHooks for TctAuditHooks {
     }
 
     fn on_exit(&self, process: &Process) {
-        if let Some(tct) = Tct::of(process) {
-            tct.nr_live_processes.fetch_sub(1, Ordering::Relaxed);
+        let Some(tct) = Tct::of(process) else {
+            return;
+        };
+        // A fork only adds a process to a TCT with a live process, so the TCT only stops
+        // running here or in `Tct::end`, which serialize on the commit state.
+        let mut state = COMMIT_STATE.lock();
+        if tct.nr_live_processes.fetch_sub(1, Ordering::Relaxed) == 1
+            && !tct.has_ended.load(Ordering::Acquire)
+        {
+            state.nr_running -= 1;
+            COMMIT_WAIT_QUEUE.wake_all();
         }
     }
 
