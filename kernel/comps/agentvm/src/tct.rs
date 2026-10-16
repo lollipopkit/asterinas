@@ -150,7 +150,7 @@ impl Tct {
     pub(crate) fn end(&self) -> Result<()> {
         // Stop deferring sync requests first, so that data synced by the processes that outlive
         // the TCT is not left out of the commit.
-        let has_ended = self.has_ended.swap(true, Ordering::Relaxed);
+        let has_ended = self.has_ended.swap(true, Ordering::AcqRel);
         if self.is_committed.load(Ordering::Acquire) {
             if has_ended {
                 return_errno_with_message!(Errno::EINVAL, "the TCT has already ended");
@@ -221,9 +221,12 @@ impl Tct {
 pub(crate) struct TctSyncPolicy;
 
 impl SyncPolicy for TctSyncPolicy {
+    /// A request may still be deferred after [`Tct::end`] starts, if it saw the TCT before
+    /// it ended. That is safe: the request only covers data written before it, which is
+    /// written back by the commit, because the commit starts after the TCT is marked ended.
     fn defers_sync(&self, process: &Process) -> bool {
         Tct::of(process).is_some_and(|tct| {
-            tct.flags.contains(TctFlags::DEFER_SYNC) && !tct.has_ended.load(Ordering::Relaxed)
+            tct.flags.contains(TctFlags::DEFER_SYNC) && !tct.has_ended.load(Ordering::Acquire)
         })
     }
 }

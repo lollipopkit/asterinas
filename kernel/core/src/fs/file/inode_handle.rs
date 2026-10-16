@@ -219,7 +219,7 @@ impl InodeHandle {
             return Ok(());
         }
         let status_flags = self.status_flags();
-        if !status_flags.contains(StatusFlags::O_DSYNC)
+        if !status_flags.intersects(StatusFlags::O_DSYNC | StatusFlags::O_SYNC)
             && !self.path().fs().flags().contains(FsFlags::SYNCHRONOUS)
         {
             return Ok(());
