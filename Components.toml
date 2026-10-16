@@ -1,5 +1,6 @@
 # template
 [components]
+agentvm = { name = "aster-agentvm" }
 block = { name = "aster-block" }
 cmdline = { name = "aster-cmdline" }
 console = { name = "aster-console" }

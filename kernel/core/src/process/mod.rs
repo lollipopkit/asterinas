@@ -20,7 +20,6 @@ mod stats;
 mod status;
 pub(crate) mod sync;
 pub(crate) mod task_set;
-mod tct;
 mod term_status;
 mod wait;
 
@@ -44,7 +43,6 @@ pub(crate) use process_vm::{INIT_STACK_SIZE, LockedHeap, ProcessVm, VmarSnapshot
 pub(crate) use program_loader::{ShebangScriptPath, UndetectedExecutable};
 pub(crate) use rlimit::ResourceType;
 pub(crate) use stats::collect_process_creation_count;
-pub(crate) use tct::{Effect, Tct};
 pub(crate) use term_status::TermStatus;
 pub(crate) use wait::{WaitOptions, WaitStatus, do_wait};
 

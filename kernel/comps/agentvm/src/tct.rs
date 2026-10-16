@@ -3,18 +3,28 @@
 //! Tool-call transactions (TCTs).
 //!
 //! A TCT groups the processes that run one agent tool call. A process joins a TCT with
-//! [`Tct::begin`] and stays in it for its lifetime: the TCT is inherited on fork and kept
-//! across exec, and a process cannot leave it or join another one. Ending a TCT does not
-//! move its processes out, so processes that outlive the tool call (e.g., daemons) remain
-//! attributable to it.
+//! [`Tct::begin`] and stays in it for its lifetime: the TCT is the audit context of the
+//! process, so it is inherited on fork and kept across exec, and a process cannot leave it
+//! or join another one. Ending a TCT does not move its processes out, so processes that
+//! outlive the tool call (e.g., daemons) remain attributable to it.
 //!
-//! The kernel records the [`Effect`]s of the processes in a TCT. A TCT and its effects stay
-//! available after it ends, until it is released with [`Tct::release`].
+//! The [`Effect`]s of the processes in a TCT are recorded through the audit hooks. A TCT and
+//! its effects stay available after it ends, until it is released with [`Tct::release`].
 
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use super::Process;
-use crate::prelude::*;
+use aster_core::{
+    prelude::*,
+    process::Process,
+    security::audit::{AuditEvent, AuditHooks},
+};
+use ostd::sync::Mutex;
 
 /// A tool-call transaction.
 #[derive(Debug)]
@@ -33,7 +43,7 @@ static TCTS: Mutex<BTreeMap<u64, Arc<Tct>>> = Mutex::new(BTreeMap::new());
 /// The value is the tag of the effect in [`Tct::export_effects`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
-pub(crate) enum Effect {
+enum Effect {
     /// A file opened for reading.
     Read = b'r',
     /// A file opened for writing, created, removed, renamed, or changed in metadata.
@@ -46,6 +56,19 @@ pub(crate) enum Effect {
     Missing = b'm',
     /// A socket address connected or sent to.
     Connect = b'c',
+}
+
+impl From<AuditEvent> for Effect {
+    fn from(event: AuditEvent) -> Self {
+        match event {
+            AuditEvent::FileRead => Self::Read,
+            AuditEvent::FileWritten => Self::Write,
+            AuditEvent::Exec => Self::Exec,
+            AuditEvent::DirListed => Self::List,
+            AuditEvent::LookupMissed => Self::Missing,
+            AuditEvent::Connect => Self::Connect,
+        }
+    }
 }
 
 /// The maximum number of distinct effects recorded for a TCT.
@@ -65,28 +88,25 @@ struct Effects {
 impl Tct {
     /// Begins a new TCT and puts `process` into it.
     ///
-    /// Returns `EPERM` if `process` is already in a TCT.
+    /// Returns `EPERM` if `process` is already in a TCT or has another audit context.
     pub(crate) fn begin(process: &Process) -> Result<Arc<Self>> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-        if process.tct().is_some() {
-            return_errno_with_message!(Errno::EPERM, "the process is already in a TCT");
-        }
-
         let tct = Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            nr_live_processes: AtomicUsize::new(0),
+            nr_live_processes: AtomicUsize::new(1),
             has_ended: AtomicBool::new(false),
             effects: Mutex::new(Effects::default()),
         });
-        // Another thread of the process may join a TCT concurrently.
-        if !Arc::ptr_eq(process.tct_once().call_once(|| tct.clone()), &tct) {
-            return_errno_with_message!(Errno::EPERM, "the process is already in a TCT");
-        }
-        tct.nr_live_processes.fetch_add(1, Ordering::Relaxed);
+        process.set_audit_context(tct.clone())?;
         TCTS.lock().insert(tct.id, tct.clone());
 
         Ok(tct)
+    }
+
+    /// Returns the TCT that `process` is in.
+    pub(crate) fn of(process: &Process) -> Option<&Self> {
+        process.audit_context()?.downcast_ref::<Self>()
     }
 
     /// Returns the TCT with the given ID, if it has not been released.
@@ -132,30 +152,6 @@ impl Tct {
         self.nr_live_processes.load(Ordering::Relaxed)
     }
 
-    /// Records an effect of the current process, if it is in a TCT.
-    ///
-    /// `target` is only called if the current process is in a TCT. The effect is not
-    /// recorded if `target` returns `None`.
-    pub(crate) fn record_current(effect: Effect, target: impl FnOnce() -> Option<String>) {
-        let Some(process) = Process::current() else {
-            return;
-        };
-        let Some(tct) = process.tct() else {
-            return;
-        };
-        let Some(target) = target() else {
-            return;
-        };
-
-        let mut effects = tct.effects.lock();
-        let entry = (effect, target);
-        if effects.set.len() >= MAX_NR_EFFECTS && !effects.set.contains(&entry) {
-            effects.is_incomplete = true;
-            return;
-        }
-        effects.set.insert(entry);
-    }
-
     /// Exports the recorded effects.
     ///
     /// Each effect is encoded as its tag, followed by its target and a NUL byte. If some
@@ -175,21 +171,36 @@ impl Tct {
         buf
     }
 
-    /// Puts a newly forked child into the TCT of its parent, if any.
-    ///
-    /// This must be called before the child starts running.
-    pub(super) fn inherit(parent: &Process, child: &Process) {
-        let Some(tct) = parent.tct() else {
+    fn record(&self, effect: Effect, target: &str) {
+        let entry = (effect, String::from(target));
+        let mut effects = self.effects.lock();
+        if effects.set.len() >= MAX_NR_EFFECTS && !effects.set.contains(&entry) {
+            effects.is_incomplete = true;
             return;
-        };
-        tct.nr_live_processes.fetch_add(1, Ordering::Relaxed);
-        child.tct_once().call_once(|| tct.clone());
+        }
+        effects.set.insert(entry);
+    }
+}
+
+/// The audit hooks that maintain TCTs.
+pub(crate) struct TctAuditHooks;
+
+impl AuditHooks for TctAuditHooks {
+    fn on_fork(&self, _parent: &Process, child: &Process) {
+        if let Some(tct) = Tct::of(child) {
+            tct.nr_live_processes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    /// Records that a process in the TCT has exited.
-    pub(super) fn on_process_exit(process: &Process) {
-        if let Some(tct) = process.tct() {
+    fn on_exit(&self, process: &Process) {
+        if let Some(tct) = Tct::of(process) {
             tct.nr_live_processes.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn on_event(&self, process: &Process, event: AuditEvent, target: &str) {
+        if let Some(tct) = Tct::of(process) {
+            tct.record(event.into(), target);
         }
     }
 }

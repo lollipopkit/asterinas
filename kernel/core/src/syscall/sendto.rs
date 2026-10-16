@@ -22,7 +22,7 @@ pub(super) fn sys_sendto(
         None
     } else {
         let socket_addr = read_socket_addr_from_user(dest_addr, addrlen)?;
-        socket_addr.record_connect_effect();
+        socket_addr.audit_connect();
         Some(socket_addr)
     };
     debug!(

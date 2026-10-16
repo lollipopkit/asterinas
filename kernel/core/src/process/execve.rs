@@ -15,7 +15,7 @@ use crate::{
     fs::vfs::path::{Path, PerMountFlags},
     prelude::*,
     process::{
-        ContextUnshareAdminApi, Credentials, Effect, Process,
+        ContextUnshareAdminApi, Credentials, Process,
         credentials::{ExecCred, FileCapabilities},
         pid_table,
         posix_thread::{
@@ -30,6 +30,7 @@ use crate::{
             signals::kernel::KernelSignal,
         },
     },
+    security::audit::AuditEvent,
     vm::vmar::VmarHandle,
 };
 
@@ -60,7 +61,7 @@ pub(crate) fn do_execve(
     );
 
     let executable_path = executable.path().clone();
-    executable_path.record_effect(Effect::Exec);
+    executable_path.audit(AuditEvent::Exec);
     let program_to_load = ProgramToLoad::from_executable(executable, &path_resolver, argv, envp)?;
     let exec_cred = prepare_exec_cred(program_to_load.elf_path(), ctx)?;
 

@@ -51,7 +51,7 @@ pub(super) fn send_one_message(
     let message_header = {
         let addr = c_user_msghdr.read_socket_addr_from_user()?;
         if let Some(addr) = addr.as_ref() {
-            addr.record_connect_effect();
+            addr.audit_connect();
         }
         let control_messages = c_user_msghdr.read_control_messages_from_user(user_space)?;
         MessageHeader::new(addr, control_messages)

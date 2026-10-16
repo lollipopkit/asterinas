@@ -34,10 +34,12 @@ use crate::{
     },
     prelude::*,
     process::{
-        Effect, Gid, Tct, Uid, UserNamespace, credentials::capabilities::CapSet,
-        posix_thread::AsPosixThread,
+        Gid, Uid, UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread,
     },
-    security::lsm::hooks as lsm_hooks,
+    security::{
+        audit::{self, AuditEvent},
+        lsm::hooks as lsm_hooks,
+    },
     time::clocks::RealTimeCoarseClock,
 };
 
@@ -88,7 +90,7 @@ impl Path {
         let new_child_dentry = dir_dentry.create_child(name, || {
             dir_dentry.inode().create(&dir_dentry, name, type_, mode)
         })?;
-        self.record_child_effect(Effect::Write, name);
+        self.audit_child(AuditEvent::FileWritten, name);
         Ok(Self::new(self.mount.clone(), new_child_dentry))
     }
 
@@ -109,7 +111,7 @@ impl Path {
                 .inode()
                 .create_symlink(&dir_dentry, name, target, mode)
         })?;
-        self.record_child_effect(Effect::Write, name);
+        self.audit_child(AuditEvent::FileWritten, name);
         Ok(Self::new(self.mount.clone(), new_child_dentry))
     }
 
@@ -417,15 +419,14 @@ impl Path {
         Some(alloc::format!("/{}", components.join("/")))
     }
 
-    /// Records an effect on this path for the TCT of the current process.
-    pub(crate) fn record_effect(&self, effect: Effect) {
-        Tct::record_current(effect, || self.abs_path_in_mnt_ns());
+    /// Audits an event on this path by the current process.
+    pub(crate) fn audit(&self, event: AuditEvent) {
+        audit::audit(event, || self.abs_path_in_mnt_ns());
     }
 
-    /// Records an effect on the child named `name` of this directory for the TCT of the
-    /// current process.
-    pub(crate) fn record_child_effect(&self, effect: Effect, name: &str) {
-        Tct::record_current(effect, || {
+    /// Audits an event on the child named `name` of this directory by the current process.
+    pub(crate) fn audit_child(&self, event: AuditEvent, name: &str) {
+        audit::audit(event, || {
             let mut path = self.abs_path_in_mnt_ns()?;
             if path != "/" {
                 path.push('/');
@@ -896,7 +897,7 @@ impl Path {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         let _write_access = self.check_dir_entry_mutation()?;
         let inner = dir_dentry.mknod(name, mode, type_)?;
-        self.record_child_effect(Effect::Write, name);
+        self.audit_child(AuditEvent::FileWritten, name);
         Ok(Self::new(self.mount.clone(), inner))
     }
 
@@ -911,7 +912,7 @@ impl Path {
         let _write_access = self.check_dir_entry_mutation()?;
         dir_dentry
             .link(&old.dentry, name)
-            .inspect(|_| self.record_child_effect(Effect::Write, name))
+            .inspect(|_| self.audit_child(AuditEvent::FileWritten, name))
     }
 
     /// Unlinks a name from the `Path`.
@@ -920,7 +921,7 @@ impl Path {
         let _write_access = self.check_dir_entry_mutation()?;
         dir_dentry
             .unlink(name)
-            .inspect(|_| self.record_child_effect(Effect::Write, name))
+            .inspect(|_| self.audit_child(AuditEvent::FileWritten, name))
     }
 
     /// Removes a directory by `rmdir()` the inner inode.
@@ -929,7 +930,7 @@ impl Path {
         let _write_access = self.check_dir_entry_mutation()?;
         dir_dentry
             .rmdir(name)
-            .inspect(|_| self.record_child_effect(Effect::Write, name))
+            .inspect(|_| self.audit_child(AuditEvent::FileWritten, name))
     }
 
     /// Renames a `Path` to the new `Path` by `rename()` the inner inode.
@@ -958,8 +959,8 @@ impl Path {
         old_dir_dentry
             .rename(old_name, &new_dir_dentry, new_name, mode)
             .inspect(|_| {
-                self.record_child_effect(Effect::Write, old_name);
-                new_dir.record_child_effect(Effect::Write, new_name);
+                self.audit_child(AuditEvent::FileWritten, old_name);
+                new_dir.audit_child(AuditEvent::FileWritten, new_name);
             })
     }
 }
@@ -997,7 +998,7 @@ impl Path {
         }
         self.inode()
             .set_mode(&self.dentry, mode)
-            .inspect(|_| self.record_effect(Effect::Write))
+            .inspect(|_| self.audit(AuditEvent::FileWritten))
     }
 
     /// Changes the owner and the group, leaving `None` ones unchanged.
@@ -1048,7 +1049,7 @@ impl Path {
         if uid.is_none() && gid.is_none() {
             inode.set_ctime(&self.dentry, RealTimeCoarseClock::get().read_time());
         }
-        self.record_effect(Effect::Write);
+        self.audit(AuditEvent::FileWritten);
         Ok(())
     }
 
@@ -1077,7 +1078,7 @@ impl Path {
         xattr::clear_file_priv(&self.dentry)?;
         inode
             .resize(&self.dentry, size)
-            .inspect(|_| self.record_effect(Effect::Write))
+            .inspect(|_| self.audit(AuditEvent::FileWritten))
     }
 
     /// Sets an xattr of the file.
@@ -1097,7 +1098,7 @@ impl Path {
         }
         inode
             .set_xattr(&self.dentry, name, value_reader, flags)
-            .inspect(|_| self.record_effect(Effect::Write))
+            .inspect(|_| self.audit(AuditEvent::FileWritten))
     }
 
     /// Gets an xattr of the file.
@@ -1118,7 +1119,7 @@ impl Path {
         }
         inode
             .remove_xattr(&self.dentry, name)
-            .inspect(|_| self.record_effect(Effect::Write))
+            .inspect(|_| self.audit(AuditEvent::FileWritten))
     }
 }
 

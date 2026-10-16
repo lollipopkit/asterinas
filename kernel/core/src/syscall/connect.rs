@@ -20,7 +20,7 @@ pub(super) fn sys_connect(
     let file = get_file_fast!(&mut file_table, sockfd.try_into()?);
     let socket = file.as_socket_or_err()?;
 
-    socket_addr.record_connect_effect();
+    socket_addr.audit_connect();
     socket
         .connect(socket_addr)
         .map_err(|err| match err.error() {

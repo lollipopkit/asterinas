@@ -21,7 +21,6 @@ use super::{
     },
     status::ProcessStatus,
     task_set::TaskSet,
-    tct::Tct,
 };
 use crate::{
     events::IoEvents,
@@ -157,10 +156,10 @@ pub struct Process {
     /// The user namespace
     user_ns: Mutex<Arc<UserNamespace>>,
 
-    /// The tool-call transaction that the process is in.
+    /// The audit context of the process, which is set at most once.
     ///
-    /// It is set at most once, because a process cannot leave a TCT.
-    tct: Once<Arc<Tct>>,
+    /// See [`crate::security::audit`].
+    audit_context: Once<Arc<dyn Any + Send + Sync>>,
 }
 
 impl Drop for Process {
@@ -275,7 +274,7 @@ impl Process {
                 timer_manager,
                 start_time: Jiffies::elapsed(),
                 user_ns: Mutex::new(user_ns),
-                tct: Once::new(),
+                audit_context: Once::new(),
             }
         })
     }
@@ -807,13 +806,25 @@ impl Process {
         self.cgroup.read()
     }
 
-    /// Returns the tool-call transaction that the process is in.
-    pub(crate) fn tct(&self) -> Option<&Arc<Tct>> {
-        self.tct.get()
+    /// Returns the audit context of the process.
+    pub fn audit_context(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+        self.audit_context.get()
     }
 
-    pub(in crate::process) fn tct_once(&self) -> &Once<Arc<Tct>> {
-        &self.tct
+    /// Sets the audit context of the process.
+    ///
+    /// Returns `EPERM` if the process already has an audit context, which it keeps for its
+    /// lifetime.
+    pub fn set_audit_context(&self, context: Arc<dyn Any + Send + Sync>) -> Result<()> {
+        let mut is_set = false;
+        self.audit_context.call_once(|| {
+            is_set = true;
+            context
+        });
+        if !is_set {
+            return_errno_with_message!(Errno::EPERM, "the process already has an audit context");
+        }
+        Ok(())
     }
 
     /// Sets the cgroup for this process.

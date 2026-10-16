@@ -7,7 +7,7 @@ use aster_bigtcp::wire::{Ipv4Address, Ipv6Address, PortNum};
 use crate::{
     net::socket::{netlink::NetlinkSocketAddr, unix::UnixSocketAddr, vsock::VsockSocketAddr},
     prelude::*,
-    process::{Effect, Tct},
+    security::audit::{self, AuditEvent},
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -20,9 +20,9 @@ pub(crate) enum SocketAddr {
 }
 
 impl SocketAddr {
-    /// Records a connection or a message to this address for the TCT of the current process.
-    pub(crate) fn record_connect_effect(&self) {
-        Tct::record_current(Effect::Connect, || match self {
+    /// Audits a connection or a message to this address by the current process.
+    pub(crate) fn audit_connect(&self) {
+        audit::audit(AuditEvent::Connect, || match self {
             Self::IPv4(addr, port) => Some(format!("{addr}:{port}")),
             Self::IPv6(addr, port) => Some(format!("[{addr}]:{port}")),
             Self::Unix(UnixSocketAddr::Path(path)) => {

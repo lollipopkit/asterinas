@@ -16,9 +16,9 @@ use crate::{
     },
     prelude::*,
     process::{
-        Effect, credentials::capabilities::CapSet, pid_table::PidTable, posix_thread::AsPosixThread,
+        credentials::capabilities::CapSet, pid_table::PidTable, posix_thread::AsPosixThread,
     },
-    security::lsm::hooks as lsm_hooks,
+    security::{audit::AuditEvent, lsm::hooks as lsm_hooks},
 };
 
 /// The file descriptor of the current working directory.
@@ -755,7 +755,7 @@ impl PathResolver {
                 Ok(child) => child,
                 Err(e) => {
                     if e.error() == Errno::ENOENT {
-                        current_path.record_child_effect(Effect::Missing, next_name);
+                        current_path.audit_child(AuditEvent::LookupMissed, next_name);
                     }
                     if next_is_tail && e.error() == Errno::ENOENT {
                         return Ok(LookupResult::AtParent(LookupParentResult::new(
