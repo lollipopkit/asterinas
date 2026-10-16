@@ -20,9 +20,11 @@ pub(crate) enum SocketAddr {
 }
 
 impl SocketAddr {
-    /// Audits a connection or a message to this address by the current process.
-    pub(crate) fn audit_connect(&self) {
-        audit::audit(AuditEvent::Connect, || match self {
+    /// Returns the target of an [`AuditEvent::Connect`] to this address.
+    ///
+    /// Returns `None` for addresses that do not reach other parties.
+    pub(crate) fn audit_target(&self) -> Option<String> {
+        match self {
             Self::IPv4(addr, port) => Some(format!("{addr}:{port}")),
             Self::IPv6(addr, port) => Some(format!("[{addr}]:{port}")),
             Self::Unix(UnixSocketAddr::Path(path)) => {
@@ -34,6 +36,24 @@ impl SocketAddr {
             Self::Vsock(addr) => Some(format!("vsock:{}:{}", addr.cid, addr.port)),
             // Unnamed Unix sockets and netlink sockets do not reach other parties.
             Self::Unix(UnixSocketAddr::Unnamed) | Self::Netlink(_) => None,
-        });
+        }
+    }
+
+    /// Returns the target to audit if the current process is audited.
+    ///
+    /// The target is reported with [`audit_connect`] after the operation succeeds.
+    pub(crate) fn audit_target_if_audited(addr: Option<&Self>) -> Option<String> {
+        if audit::is_audited() {
+            addr.and_then(Self::audit_target)
+        } else {
+            None
+        }
+    }
+}
+
+/// Reports an [`AuditEvent::Connect`] to a target from [`SocketAddr::audit_target_if_audited`].
+pub(crate) fn audit_connect(target: Option<String>) {
+    if let Some(target) = target {
+        audit::audit(AuditEvent::Connect, || Some(target));
     }
 }

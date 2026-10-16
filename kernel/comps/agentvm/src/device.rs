@@ -130,8 +130,11 @@ impl PerOpenFileOps for AgentCtlFile {
         dispatch_ioctl!(match raw_ioctl {
             cmd @ TctBegin => {
                 check_controller()?;
-                let tct = Tct::begin(&process)?;
+                // Write the ID first, so a failed write does not leave the caller in a TCT
+                // that it cannot identify.
+                let tct = Tct::new();
                 cmd.write(&tct.id())?;
+                tct.begin(&process)?;
                 Ok(0)
             }
             cmd @ TctEnd => {

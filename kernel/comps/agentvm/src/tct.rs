@@ -86,22 +86,25 @@ struct Effects {
 }
 
 impl Tct {
-    /// Begins a new TCT and puts `process` into it.
-    ///
-    /// Returns `EPERM` if `process` is already in a TCT or has another audit context.
-    pub(crate) fn begin(process: &Process) -> Result<Arc<Self>> {
+    /// Creates a new TCT, which begins when a process is put into it with [`Self::begin`].
+    pub(crate) fn new() -> Arc<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-        let tct = Arc::new(Self {
+        Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             nr_live_processes: AtomicUsize::new(1),
             has_ended: AtomicBool::new(false),
             effects: Mutex::new(Effects::default()),
-        });
-        process.set_audit_context(tct.clone())?;
-        TCTS.lock().insert(tct.id, tct.clone());
+        })
+    }
 
-        Ok(tct)
+    /// Begins the TCT by putting `process` into it.
+    ///
+    /// Returns `EPERM` if `process` is already in a TCT or has another audit context.
+    pub(crate) fn begin(self: &Arc<Self>, process: &Process) -> Result<()> {
+        process.set_audit_context(self.clone())?;
+        TCTS.lock().insert(self.id, self.clone());
+        Ok(())
     }
 
     /// Returns the TCT that `process` is in.

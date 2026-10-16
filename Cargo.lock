@@ -77,6 +77,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "aster-agentvm"
+version = "0.1.0"
+dependencies = [
+ "aster-core",
+ "component",
+ "device-id",
+ "ostd",
+ "ostd-pod",
+ "zerocopy",
+]
+
+[[package]]
 name = "aster-bigtcp"
 version = "0.1.0"
 dependencies = [
@@ -484,6 +496,7 @@ dependencies = [
 name = "asterinas"
 version = "0.1.0"
 dependencies = [
+ "aster-agentvm",
  "aster-core",
  "aster-drm",
  "aster-i8042",

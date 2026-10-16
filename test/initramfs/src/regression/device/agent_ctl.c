@@ -285,6 +285,16 @@ static int has_effect_suffix(const char *effects, size_t len, char tag,
 	return 0;
 }
 
+/* Returns the number of entries in `effects` tagged `tag`. */
+static int count_effects(const char *effects, size_t len, char tag)
+{
+	int nr = 0;
+
+	for (const char *p = effects; p < effects + len; p += strlen(p) + 1)
+		nr += p[0] == tag;
+	return nr;
+}
+
 FN_TEST(effects)
 {
 	static char effects[65536];
@@ -294,6 +304,12 @@ FN_TEST(effects)
 
 	CHECK_WITH(mkdir(EFFECT_DIR, 0755), _ret == 0 || errno == EEXIST);
 	CHECK(close(CHECK(open(EFFECT_DIR "/read", O_CREAT | O_WRONLY, 0644))));
+	fd = CHECK(open(EFFECT_DIR "/script", O_CREAT | O_WRONLY, 0755));
+	CHECK(write(fd, "#!/bin/sh\nexit 0\n", 18));
+	CHECK(close(fd));
+	fd = CHECK(open(EFFECT_DIR "/bad_exec", O_CREAT | O_WRONLY, 0755));
+	CHECK(write(fd, "garbage", 7));
+	CHECK(close(fd));
 
 	id = IN_TCT({
 		char buf[1];
@@ -328,6 +344,14 @@ FN_TEST(effects)
 			_exit(2);
 		});
 
+		IN_CHILD({
+			execl(EFFECT_DIR "/script", "script", NULL);
+			_exit(2);
+		});
+		// Failed executions are not recorded.
+		TEST_ERRNO(execl(EFFECT_DIR "/bad_exec", "bad_exec", NULL),
+			   ENOEXEC);
+
 		struct sockaddr_in addr = {
 			.sin_family = AF_INET,
 			.sin_port = htons(9),
@@ -338,6 +362,13 @@ FN_TEST(effects)
 		addr.sin_port = htons(10);
 		TEST_SUCC(sendto(sk, "x", 1, 0, (struct sockaddr *)&addr,
 				 sizeof(addr)));
+		TEST_SUCC(close(sk));
+
+		// Failed connections are not recorded.
+		addr.sin_port = htons(1);
+		sk = TEST_SUCC(socket(AF_INET, SOCK_STREAM, 0));
+		TEST_ERRNO(connect(sk, (struct sockaddr *)&addr, sizeof(addr)),
+			   ECONNREFUSED);
 		TEST_SUCC(close(sk));
 	});
 
@@ -370,6 +401,11 @@ FN_TEST(effects)
 	TEST_RES(has_effect_suffix(effects, len, 'x', "/agent_ctl"), _ret);
 	TEST_RES(has_effect(effects, len, 'c', "127.0.0.1:9"), _ret);
 	TEST_RES(has_effect(effects, len, 'c', "127.0.0.1:10"), _ret);
+	TEST_RES(has_effect(effects, len, 'c', "127.0.0.1:1"), !_ret);
+	// The script, its interpreter, and the helper are executed.
+	TEST_RES(has_effect(effects, len, 'x', EFFECT_DIR "/script"), _ret);
+	TEST_RES(count_effects(effects, len, 'x'), _ret == 3);
+	TEST_RES(has_effect(effects, len, 'x', EFFECT_DIR "/bad_exec"), !_ret);
 	TEST_RES(has_effect(effects, len, 'w', EFFECT_DIR "/outside"), !_ret);
 	TEST_RES(has_effect(effects, len, '!', ""), !_ret);
 
@@ -377,6 +413,8 @@ FN_TEST(effects)
 	TEST_ERRNO(ioctl(ctl_fd, AGENT_CTL_TCT_EFFECTS, &args), EINVAL);
 
 	TEST_SUCC(unlink(EFFECT_DIR "/read"));
+	TEST_SUCC(unlink(EFFECT_DIR "/script"));
+	TEST_SUCC(unlink(EFFECT_DIR "/bad_exec"));
 	TEST_SUCC(rmdir(EFFECT_DIR));
 }
 END_TEST()
@@ -389,5 +427,16 @@ FN_TEST(release_requires_end)
 	TEST_ERRNO(tct_release(id), EBUSY);
 	TEST_RES(tct_end(id, &nr_live), _ret == 0 && nr_live == 0);
 	TEST_SUCC(tct_release(id));
+}
+END_TEST()
+
+FN_TEST(begin_with_bad_pointer)
+{
+	IN_CHILD({
+		// The caller does not join a TCT that it cannot identify.
+		TEST_ERRNO(ioctl(ctl_fd, AGENT_CTL_TCT_BEGIN, (void *)1), EFAULT);
+		TEST_RES(tct_get(), _ret == 0);
+		TEST_RES(tct_begin(), _ret != 0);
+	});
 }
 END_TEST()

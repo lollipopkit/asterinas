@@ -61,6 +61,15 @@ pub fn register_hooks(hooks: &'static dyn AuditHooks) -> Result<()> {
     Ok(())
 }
 
+/// Returns whether the current process is audited.
+///
+/// This lets callers prepare the target of an event that is only reported after the
+/// operation succeeds.
+pub(crate) fn is_audited() -> bool {
+    HOOKS.get().is_some()
+        && Process::current().is_some_and(|process| process.audit_context().is_some())
+}
+
 /// Reports an event of the current process, if it is audited.
 ///
 /// `target` is only called if the event is reported. The event is not reported if `target`
