@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 
 SUBDIRS := \
+	direct_io \
 	empty_write \
 	ext2 \
 	fdatasync \

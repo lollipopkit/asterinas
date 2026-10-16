@@ -708,7 +708,7 @@ impl ExfatInode {
         let mut cur_offset = start_pos.1;
         for _ in Bid::from_offset(read_off)..Bid::from_offset(read_off + read_len) {
             let physical_bid =
-                Bid::from_offset(cur_cluster.cluster_id() as usize * cluster_size + cur_offset);
+                Bid::from_offset(cur_cluster.physical_cluster_start_offset() + cur_offset);
             inner
                 .fs()
                 .block_device()
@@ -830,7 +830,7 @@ impl ExfatInode {
         for _ in Bid::from_offset(offset)..Bid::from_offset(end_offset) {
             bio_segment.writer().unwrap().write_fallible(reader)?;
             let physical_bid =
-                Bid::from_offset(cur_cluster.cluster_id() as usize * cluster_size + cur_offset);
+                Bid::from_offset(cur_cluster.physical_cluster_start_offset() + cur_offset);
             let fs = inner.fs();
             fs.block_device()
                 .write_blocks(physical_bid, vec![bio_segment.clone()])?;

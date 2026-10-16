@@ -119,8 +119,9 @@ impl BlockGroup {
             last_block_no,
             &group_desc,
         )?;
+        // The last group may have fewer inodes, so the bitmap must not allocate beyond them.
         let inode_bitmap =
-            Self::load_inode_bitmap(block_device.as_ref(), nr_inodes_per_group, &group_desc)?;
+            Self::load_inode_bitmap(block_device.as_ref(), nr_inodes_in_group, &group_desc)?;
 
         group_desc.validate_metadata_blocks(
             &block_bitmap,
@@ -343,10 +344,19 @@ impl BlockGroup {
             return_errno_with_message!(Errno::EIO, "freeing blocks in system zone");
         }
 
-        // Clear bits one by one and count only allocated-to-free transitions.
+        // Count only allocated-to-free transitions, and check the new free count before changing
+        // the bitmap, so that a failure leaves the bitmap and the descriptor consistent.
         let range_start = start_bit as u16;
         let range_end = (start_bit + group_count) as u16;
-        let mut actually_freed: u32 = 0;
+        let actually_freed = (range_start..range_end)
+            .filter(|&block_bit| metadata.block_bitmap.is_allocated(block_bit))
+            .count() as u32;
+        let new_free_count = metadata
+            .desc
+            .free_blocks_count
+            .checked_add(actually_freed as u16)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "free block count overflow in group"))?;
+
         for block_bit in range_start..range_end {
             if !metadata.block_bitmap.is_allocated(block_bit) {
                 warn!(
@@ -355,18 +365,11 @@ impl BlockGroup {
                 );
             } else {
                 metadata.block_bitmap.free(block_bit);
-                actually_freed += 1;
             }
         }
 
         // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
-
-        let freed_count = actually_freed as u16;
-        metadata.desc.free_blocks_count = metadata
-            .desc
-            .free_blocks_count
-            .checked_add(freed_count)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "free block count overflow in group"))?;
+        metadata.desc.free_blocks_count = new_free_count;
 
         Ok(actually_freed)
     }
@@ -548,7 +551,7 @@ impl BlockGroup {
     /// Loads the inode bitmap for this group.
     fn load_inode_bitmap(
         block_device: &dyn BlockDevice,
-        nr_inodes_per_group: u32,
+        nr_inodes_in_group: u32,
         desc: &BlockGroupDesc,
     ) -> Result<IdBitmap> {
         let bitmap_bid = desc.inode_bitmap_bid;
@@ -561,7 +564,7 @@ impl BlockGroup {
             return_errno_with_message!(Errno::EIO, "failed to read inode bitmap");
         }
 
-        let capacity = nr_inodes_per_group as usize;
+        let capacity = nr_inodes_in_group as usize;
         debug_assert!(capacity <= IdBitmap::capacity() as usize);
 
         Ok(IdBitmap::from_buf(buf.into_boxed_slice(), capacity as u16))
