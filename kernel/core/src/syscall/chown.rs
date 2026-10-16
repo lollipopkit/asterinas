@@ -21,19 +21,11 @@ pub(super) fn sys_fchown(
 
     let uid = to_optional_id(uid, Uid::new)?;
     let gid = to_optional_id(gid, Gid::new)?;
-    if uid.is_none() && gid.is_none() {
-        return Ok(SyscallReturn::Return(0));
-    }
 
     let mut file_table = ctx.thread_local.borrow_file_table_mut();
     let file = get_file_fast!(&mut file_table, raw_fd.try_into()?);
     let path = file.path();
-    if let Some(uid) = uid {
-        path.set_owner(uid)?;
-    }
-    if let Some(gid) = gid {
-        path.set_group(gid)?;
-    }
+    path.chown(uid, gid)?;
     Ok(SyscallReturn::Return(0))
 }
 
@@ -80,9 +72,6 @@ pub(super) fn sys_fchownat(
 
     let uid = to_optional_id(uid, Uid::new)?;
     let gid = to_optional_id(gid, Gid::new)?;
-    if uid.is_none() && gid.is_none() {
-        return Ok(SyscallReturn::Return(0));
-    }
 
     let path = {
         let path_name = path_name.to_string_lossy();
@@ -98,12 +87,7 @@ pub(super) fn sys_fchownat(
         }
     };
 
-    if let Some(uid) = uid {
-        path.set_owner(uid)?;
-    }
-    if let Some(gid) = gid {
-        path.set_group(gid)?;
-    }
+    path.chown(uid, gid)?;
     Ok(SyscallReturn::Return(0))
 }
 
