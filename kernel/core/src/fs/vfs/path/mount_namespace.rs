@@ -248,24 +248,6 @@ impl MountNamespace {
         }
     }
 
-    /// Flushes all pending filesystem metadata and cached file data to the device
-    /// for all mounted filesystems in this mount namespace.
-    pub(crate) fn sync(&self) -> Result<()> {
-        let mut visited_filesystems = hashbrown::HashSet::new();
-
-        self.root().try_walk_tree(|current_mount| {
-            let fs_ptr = Arc::as_ptr(current_mount.fs());
-            // Only sync each filesystem once.
-            if visited_filesystems.insert(fs_ptr) {
-                current_mount.sync()?;
-            }
-
-            Ok(())
-        })?;
-
-        Ok(())
-    }
-
     /// Checks whether a given mount belongs to this mount namespace.
     pub(crate) fn owns(self: &Arc<Self>, mount: &Mount) -> bool {
         mount.mnt_ns().as_ptr() == Arc::as_ptr(self)

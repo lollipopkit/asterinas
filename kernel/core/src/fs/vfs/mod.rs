@@ -12,8 +12,8 @@ pub(crate) mod range_lock;
 pub mod sync_policy;
 
 // Re-export commonly used abstractions from `fs_apis`
-pub use fs_apis::inode;
 pub(crate) use fs_apis::{file_system, inode_ext, registry, xattr};
+pub use fs_apis::{file_system::sync_all_file_systems, inode};
 
 pub(super) fn init() {
     fs_apis::init();

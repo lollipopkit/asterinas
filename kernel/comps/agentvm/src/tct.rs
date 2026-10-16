@@ -20,7 +20,7 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use aster_core::{
-    fs::vfs::sync_policy::{self, SyncPolicy},
+    fs::vfs::{sync_all_file_systems, sync_policy::SyncPolicy},
     prelude::*,
     process::Process,
     security::audit::{AuditEvent, AuditHooks},
@@ -34,6 +34,9 @@ pub(crate) struct Tct {
     flags: TctFlags,
     nr_live_processes: AtomicUsize,
     has_ended: AtomicBool,
+    /// Whether the data of the TCT is durable, which is only false for a TCT with
+    /// [`TctFlags::DEFER_SYNC`] that has not been committed by [`Tct::end`].
+    is_committed: AtomicBool,
     effects: Mutex<Effects>,
 }
 
@@ -41,7 +44,7 @@ bitflags::bitflags! {
     /// The flags that a TCT is created with.
     pub(crate) struct TctFlags: u32 {
         /// Defers the sync requests of the processes in the TCT until it ends, when all the
-        /// file systems are written back and flushed at once.
+        /// file systems (in every mount namespace) are written back and flushed at once.
         ///
         /// This is only safe if the storage is rolled back to the state of the previous TCT
         /// after a crash, because data synced inside the TCT is not durable until it ends.
@@ -109,6 +112,7 @@ impl Tct {
             flags,
             nr_live_processes: AtomicUsize::new(1),
             has_ended: AtomicBool::new(false),
+            is_committed: AtomicBool::new(!flags.contains(TctFlags::DEFER_SYNC)),
             effects: Mutex::new(Effects::default()),
         })
     }
@@ -137,30 +141,37 @@ impl Tct {
 
     /// Ends the TCT.
     ///
-    /// Returns `EINVAL` if the TCT has already ended.
-    /// With [`TctFlags::DEFER_SYNC`], all the file systems in the mount namespace of the
-    /// caller are written back and flushed, so the data of the TCT is durable on return.
-    /// Processes that outlive the TCT have their sync requests served directly from then on.
+    /// Returns `EINVAL` if the TCT has already ended and been committed.
+    ///
+    /// With [`TctFlags::DEFER_SYNC`], all the file systems are written back and flushed, so
+    /// the data of the TCT is durable on return. Processes that outlive the TCT have their
+    /// sync requests served directly from then on. If committing the data fails, the TCT
+    /// stays ended but uncommitted, and ending it again retries the commit.
     pub(crate) fn end(&self) -> Result<()> {
-        if self.has_ended.swap(true, Ordering::Relaxed) {
-            return_errno_with_message!(Errno::EINVAL, "the TCT has already ended");
+        // Stop deferring sync requests first, so that data synced by the processes that outlive
+        // the TCT is not left out of the commit.
+        let has_ended = self.has_ended.swap(true, Ordering::Relaxed);
+        if self.is_committed.load(Ordering::Acquire) {
+            if has_ended {
+                return_errno_with_message!(Errno::EINVAL, "the TCT has already ended");
+            }
+            return Ok(());
         }
-        if self.flags.contains(TctFlags::DEFER_SYNC) {
-            sync_policy::sync_mnt_ns()?;
-        }
+        sync_all_file_systems()?;
+        self.is_committed.store(true, Ordering::Release);
         Ok(())
     }
 
     /// Releases the TCT with the given ID, after which it can no longer be found by its ID.
     ///
-    /// Returns `EBUSY` if the TCT has not ended.
+    /// Returns `EBUSY` if the TCT has not ended, or its data has not been committed.
     pub(crate) fn release(id: u64) -> Result<()> {
         let mut tcts = TCTS.lock();
         let Some(tct) = tcts.get(&id) else {
             return_errno_with_message!(Errno::EINVAL, "the TCT does not exist");
         };
-        if !tct.has_ended.load(Ordering::Relaxed) {
-            return_errno_with_message!(Errno::EBUSY, "the TCT has not ended");
+        if !tct.has_ended.load(Ordering::Relaxed) || !tct.is_committed.load(Ordering::Acquire) {
+            return_errno_with_message!(Errno::EBUSY, "the TCT has not ended or been committed");
         }
         tcts.remove(&id);
         Ok(())

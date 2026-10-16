@@ -8,7 +8,6 @@
 //! must make the data durable later, and must only defer requests whose data can be lost on
 //! a crash (e.g., because the storage is rolled back to an earlier snapshot after a crash).
 
-use ostd::task::Task;
 use spin::Once;
 
 use crate::{prelude::*, process::Process};
@@ -42,13 +41,4 @@ pub(crate) fn defers_current_sync() -> bool {
         return false;
     };
     Process::current().is_some_and(|process| policy.defers_sync(&process))
-}
-
-/// Writes back all the file systems in the mount namespace of the current thread and flushes
-/// their devices, like `sync(2)` but regardless of the policy.
-pub fn sync_mnt_ns() -> Result<()> {
-    let task = Task::current().unwrap();
-    let thread_local = task.as_thread_local().unwrap();
-    let ns_proxy = thread_local.borrow_ns_proxy();
-    ns_proxy.unwrap().mnt_ns().sync()
 }
