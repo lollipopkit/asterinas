@@ -19,7 +19,7 @@
 //! no two writers touch the same bytes. `next_generation` is an `AtomicU32`
 //! incremented once per newly allocated inode.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use aster_block::bio::BioCompleteFn;
 use device_id::DeviceId;
@@ -76,6 +76,9 @@ pub(crate) struct Ext2 {
     write_state: FsWriteState,
     /// Per-filesystem inode generation counter.
     next_generation: AtomicU32,
+    /// Inodes unlinked while still in use, which are freed when dropped (Linux
+    /// `s_remove_count`).
+    nr_unlinked_inodes: AtomicUsize,
     /// Weak self reference for inode back-pointers.
     self_ref: Weak<Ext2>,
 }
@@ -196,6 +199,7 @@ impl Ext2 {
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             write_state: FsWriteState::new(),
             next_generation: AtomicU32::new(utils::duration_to_ext2_secs(utils::now())),
+            nr_unlinked_inodes: AtomicUsize::new(0),
             self_ref: weak_self.clone(),
         });
 
@@ -242,6 +246,11 @@ impl Ext2 {
     /// Reference: Linux `ext2_put_super()` and the read-only branch of `ext2_reconfigure()`.
     fn restore_mount_state(&self, update_mtime: bool) -> Result<()> {
         self.sync_all()?;
+        self.write_mount_state(update_mtime)
+    }
+
+    /// Writes back the state recorded by [`Self::setup_writable`] without syncing first.
+    fn write_mount_state(&self, update_mtime: bool) -> Result<()> {
         let mut sb = self.super_block.write();
         let old_sb = **sb;
         sb.set_state(*self.mount_state.lock());
@@ -302,6 +311,39 @@ impl Ext2 {
         {
             error!("failed to mark the volume clean: {:?}", err);
         }
+    }
+
+    /// Marks the synced, writer-free volume clean so that a frozen image needs no check.
+    ///
+    /// Inodes unlinked while still in use are freed only when dropped, so with any of them
+    /// the volume stays marked in use.
+    ///
+    /// Reference: Linux `ext2_freeze()`.
+    pub(super) fn freeze(&self) -> Result<()> {
+        if self.nr_unlinked_inodes.load(Ordering::Relaxed) == 0 {
+            self.write_mount_state(false)?;
+        }
+        self.flush_device()
+    }
+
+    /// Marks the volume in use again before writes resume.
+    ///
+    /// Reference: Linux `ext2_unfreeze()`.
+    pub(super) fn unfreeze(&self) -> Result<()> {
+        self.sync_metadata()
+    }
+
+    /// Removes an inode whose last link is gone from the cache; it is freed when dropped.
+    pub(super) fn forget_unlinked_inode(&self, inode: &Inode) {
+        let _ = self.remove_inode(inode.ino());
+        if !inode.mark_unlinked() {
+            self.nr_unlinked_inodes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Records that an inode counted by [`Self::forget_unlinked_inode`] was dropped.
+    pub(super) fn unlinked_inode_dropped(&self) {
+        self.nr_unlinked_inodes.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Flushes the block device's volatile write cache.
@@ -995,6 +1037,41 @@ mod test {
         assert!(!f.ext2.fs_flags().contains(FsFlags::RDONLY));
         assert!(!f.ext2.super_block().state().contains(FsState::VALID));
         assert_eq!(disk_super_block(&f.disk).as_bytes(), before.as_bytes());
+    }
+
+    #[ktest]
+    fn freeze_marks_volume_clean_until_thawed() {
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+        let fs: &dyn FileSystemTrait = f.ext2.as_ref();
+
+        fs.freeze().unwrap();
+        assert!(disk_state(&f.disk).contains(FsState::VALID));
+        // Syncing a frozen volume must not mark it in use again.
+        fs.sync().unwrap();
+        assert!(disk_state(&f.disk).contains(FsState::VALID));
+        assert_errno!(fs.freeze(), Errno::EBUSY);
+
+        fs.thaw().unwrap();
+        assert!(!disk_state(&f.disk).contains(FsState::VALID));
+        assert_errno!(fs.thaw(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn freeze_keeps_volume_in_use_with_open_unlinked_inode() {
+        let (f, root) = default_fixture();
+        let file = create_file(&root, "unlinked");
+        root.unlink("unlinked", file.as_ref()).unwrap();
+        let fs: &dyn FileSystemTrait = f.ext2.as_ref();
+
+        fs.freeze().unwrap();
+        assert!(!disk_state(&f.disk).contains(FsState::VALID));
+        fs.thaw().unwrap();
+
+        // Once the inode is freed, a freeze marks the volume clean again.
+        drop(file);
+        fs.freeze().unwrap();
+        assert!(disk_state(&f.disk).contains(FsState::VALID));
+        fs.thaw().unwrap();
     }
 
     #[ktest]

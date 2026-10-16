@@ -776,8 +776,27 @@ impl Mount {
         &self.fs
     }
 
-    /// Gets write access to this mount and its file system.
+    /// Gets write access to this mount and its file system for a write, which first waits
+    /// while the file system is frozen (Linux `mnt_want_write()`).
+    pub(super) fn want_write(&self) -> Result<WriteAccess> {
+        let freeze = self.fs.write_state().freeze();
+        freeze.enter();
+        match self.get_write_access_inner(true) {
+            Ok(write_access) => Ok(write_access),
+            Err(err) => {
+                freeze.exit();
+                Err(err)
+            }
+        }
+    }
+
+    /// Gets write access to this mount and its file system for a file opened for writing,
+    /// which does not wait for a frozen file system (Linux `mnt_get_write_access()`).
     pub(super) fn get_write_access(&self) -> Result<WriteAccess> {
+        self.get_write_access_inner(false)
+    }
+
+    fn get_write_access_inner(&self, in_freeze_gate: bool) -> Result<WriteAccess> {
         self.writers
             .add(|| self.flags().contains(PerMountFlags::RDONLY))?;
         if let Err(err) = self
@@ -789,7 +808,10 @@ impl Mount {
             self.writers.remove();
             return Err(err);
         }
-        Ok(WriteAccess { mount: self.this() })
+        Ok(WriteAccess {
+            mount: self.this(),
+            in_freeze_gate,
+        })
     }
 
     /// Gets the associated mount flags.
@@ -874,12 +896,18 @@ impl Drop for Mount {
 /// Reference: Linux `mnt_want_write()` and `mnt_drop_write()`.
 pub(crate) struct WriteAccess {
     mount: Arc<Mount>,
+    /// Whether this is a running write that passed the freeze gate.
+    in_freeze_gate: bool,
 }
 
 impl Drop for WriteAccess {
     fn drop(&mut self) {
-        self.mount.fs.write_state().writers().remove();
+        let write_state = self.mount.fs.write_state();
+        write_state.writers().remove();
         self.mount.writers.remove();
+        if self.in_freeze_gate {
+            write_state.freeze().exit();
+        }
     }
 }
 

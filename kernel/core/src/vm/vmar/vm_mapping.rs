@@ -25,7 +25,7 @@ use super::{
 };
 use crate::{
     fs::{
-        file::{FileLike, Mappable, MappedObject},
+        file::{FileLike, InodeHandle, Mappable, MappedObject},
         vfs::{inode::Inode, path::PathResolver},
     },
     prelude::*,
@@ -418,6 +418,18 @@ impl VmMapping {
 
             return res;
         }
+
+        // A write fault on a shared file mapping dirties the file's page cache, so it waits
+        // while the file system is frozen (Linux `sb_start_pagefault()`).
+        let _fs_write = if is_write && self.map_mode.is_shared() {
+            self.file
+                .as_ref()
+                .and_then(|file| file.downcast_ref::<InodeHandle>())
+                .filter(|handle| handle.path().type_().is_regular_file())
+                .map(|handle| handle.path().fs().start_write())
+        } else {
+            None
+        };
 
         self.handle_single_page_fault(
             vm_space,

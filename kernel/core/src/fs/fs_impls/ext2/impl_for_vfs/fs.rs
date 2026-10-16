@@ -25,6 +25,11 @@ impl FileSystem for Ext2 {
     }
 
     fn sync(&self) -> Result<()> {
+        // Freezing synced everything and writes have stopped since. Syncing now would only
+        // mark the frozen volume in use again.
+        if self.write_state().freeze().is_frozen() {
+            return Ok(());
+        }
         self.sync_all()?;
         self.flush_device()
     }
@@ -68,6 +73,18 @@ impl FileSystem for Ext2 {
 
     fn shutdown(&self) {
         self.put_super();
+    }
+
+    fn supports_freeze(&self) -> bool {
+        true
+    }
+
+    fn freeze_fs(&self) -> Result<()> {
+        self.freeze()
+    }
+
+    fn unfreeze_fs(&self) -> Result<()> {
+        self.unfreeze()
     }
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {

@@ -58,7 +58,7 @@ impl Inode {
             let inner = self.inner.read();
             inner.readdir_at(offset, visitor)
         };
-        self.inner.write().set_atime(utils::now());
+        self.touch_atime();
         result
     }
 
@@ -85,7 +85,7 @@ impl Inode {
 
         if child_inner.link_count() == 0 {
             child_inner.write_back_inode_desc(&fs, child.ino())?;
-            let _ = fs.remove_inode(child.ino());
+            fs.forget_unlinked_inode(child);
         }
 
         let parent_inner = guards.inner_mut(self.ino());
@@ -225,7 +225,7 @@ impl Inode {
         child_inner.dec_link_count(1);
         if child_inner.link_count() == 0 {
             child_inner.write_back_inode_desc(&fs, child.ino())?;
-            let _ = fs.remove_inode(child.ino());
+            fs.forget_unlinked_inode(child);
         }
         Ok(())
     }
@@ -369,7 +369,7 @@ impl Inode {
 
             if replaced_inner.link_count() == 0 {
                 replaced_inner.write_back_inode_desc(&fs, replaced.ino())?;
-                let _ = fs.remove_inode(replaced.ino());
+                fs.forget_unlinked_inode(replaced);
             }
         }
 

@@ -32,7 +32,7 @@ impl Inode {
 
         let read_len = self.inner.read().read_at(offset, writer)?;
         if read_len > 0 {
-            self.inner.write().set_atime(utils::now());
+            self.touch_atime();
         }
         Ok(read_len)
     }
@@ -71,7 +71,7 @@ impl Inode {
         let fs = self.fs()?;
         let read_len = self.inner.read().read_direct_at(&fs, offset, writer)?;
         if read_len > 0 {
-            self.inner.write().set_atime(utils::now());
+            self.touch_atime();
         }
         Ok(read_len)
     }
