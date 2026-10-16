@@ -9,6 +9,3 @@ edition = "2024"
 inventory.workspace = true
 log.workspace = true
 component-macro = { path = "../component-macro" }
-
-[build-dependencies]
-json = "0.12.4"
