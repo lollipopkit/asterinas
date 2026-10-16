@@ -6,6 +6,7 @@ use core::{
 };
 
 use ostd::timer::Jiffies;
+use spin::Once;
 
 use self::timer_manager::PosixTimerManager;
 use super::{
@@ -20,6 +21,7 @@ use super::{
     },
     status::ProcessStatus,
     task_set::TaskSet,
+    tct::Tct,
 };
 use crate::{
     events::IoEvents,
@@ -154,6 +156,11 @@ pub struct Process {
     // Namespaces
     /// The user namespace
     user_ns: Mutex<Arc<UserNamespace>>,
+
+    /// The tool-call transaction that the process is in.
+    ///
+    /// It is set at most once, because a process cannot leave a TCT.
+    tct: Once<Arc<Tct>>,
 }
 
 impl Drop for Process {
@@ -268,6 +275,7 @@ impl Process {
                 timer_manager,
                 start_time: Jiffies::elapsed(),
                 user_ns: Mutex::new(user_ns),
+                tct: Once::new(),
             }
         })
     }
@@ -797,6 +805,15 @@ impl Process {
     /// [`CgroupMembership`]: crate::fs::cgroupfs::CgroupMembership
     pub(crate) fn cgroup(&self) -> RcuOptionReadGuard<'_, Arc<CgroupNode>> {
         self.cgroup.read()
+    }
+
+    /// Returns the tool-call transaction that the process is in.
+    pub(crate) fn tct(&self) -> Option<&Arc<Tct>> {
+        self.tct.get()
+    }
+
+    pub(in crate::process) fn tct_once(&self) -> &Once<Arc<Tct>> {
+        &self.tct
     }
 
     /// Sets the cgroup for this process.
