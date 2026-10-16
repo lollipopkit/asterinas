@@ -52,14 +52,29 @@ FN_TEST(freeze_and_thaw_report_state_errors)
 }
 END_TEST()
 
-/* Forks a child that runs `op` and checks that it waits until the file system is thawed. */
+/*
+ * Forks a child that runs `op` and checks that it waits until the file system is thawed.
+ *
+ * The child reports through a pipe right before `op`, so the check does not depend on when
+ * the child gets scheduled.
+ */
 #define TEST_WAITS_WHILE_FROZEN(op)                                            \
 	do {                                                                   \
-		int status;                                                    \
+		int status, pipe_fds[2];                                       \
+		char started;                                                  \
+		TEST_SUCC(pipe(pipe_fds));                                     \
 		TEST_SUCC(ioctl(mount_fd, FIFREEZE, 0));                       \
 		pid_t pid = TEST_SUCC(fork());                                 \
-		if (pid == 0)                                                  \
+		if (pid == 0) {                                                \
+			close(pipe_fds[0]);                                    \
+			if (write(pipe_fds[1], "s", 1) != 1)                   \
+				_exit(2);                                      \
 			_exit((op) < 0 ? 1 : 0);                               \
+		}                                                              \
+		TEST_SUCC(close(pipe_fds[1]));                                 \
+		TEST_RES(read(pipe_fds[0], &started, 1), _ret == 1);           \
+		TEST_SUCC(close(pipe_fds[0]));                                 \
+		/* Let `op` reach the gate, or finish if it is ungated. */     \
 		usleep(200 * 1000);                                            \
 		TEST_RES(waitpid(pid, &status, WNOHANG), _ret == 0);           \
 		TEST_SUCC(ioctl(mount_fd, FITHAW, 0));                         \
