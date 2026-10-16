@@ -54,12 +54,7 @@ impl Inode {
         offset: usize,
         visitor: &mut dyn DirentVisitor,
     ) -> Result<usize> {
-        let result = {
-            let inner = self.inner.read();
-            inner.readdir_at(offset, visitor)
-        };
-        self.touch_atime();
-        result
+        self.inner.read().readdir_at(offset, visitor)
     }
 
     /// Removes an empty sub-directory.

@@ -90,6 +90,10 @@ impl FileSystem for Ext2 {
         self.fs_event_subscriber_stats()
     }
 
+    fn updates_atime(&self) -> bool {
+        true
+    }
+
     fn write_state(&self) -> &FsWriteState {
         self.write_state()
     }

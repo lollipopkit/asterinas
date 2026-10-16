@@ -30,11 +30,7 @@ impl Inode {
             return Ok(0);
         }
 
-        let read_len = self.inner.read().read_at(offset, writer)?;
-        if read_len > 0 {
-            self.touch_atime();
-        }
-        Ok(read_len)
+        self.inner.read().read_at(offset, writer)
     }
 
     /// Writes file data at `offset` through the page cache.
@@ -70,9 +66,6 @@ impl Inode {
 
         let fs = self.fs()?;
         let read_len = self.inner.read().read_direct_at(&fs, offset, writer)?;
-        if read_len > 0 {
-            self.touch_atime();
-        }
         Ok(read_len)
     }
 

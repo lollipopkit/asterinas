@@ -6,7 +6,7 @@ use core::time::Duration;
 
 pub(crate) use dentry::Dentry;
 use inherit_methods_macro::inherit_methods;
-use mount::MountTreeCloneMode;
+use mount::{AtimePolicy, MountTreeCloneMode};
 pub(crate) use mount::{MNT_UNIQUE_ID_MIN, Mount, PerMountFlags, WriteAccess};
 pub(in crate::fs) use mount::{RecyclableMountId, UniqueMountId};
 pub(crate) use mount_namespace::MountNamespace;
@@ -39,6 +39,9 @@ use crate::{
     security::lsm::hooks as lsm_hooks,
     time::clocks::RealTimeCoarseClock,
 };
+
+/// How long `relatime` keeps an access time that is newer than the last change.
+const RELATIME_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 mod dentry;
 mod mount;
@@ -322,6 +325,46 @@ impl Path {
     /// writes, so that neither can become read-only or frozen in the meantime.
     pub(crate) fn want_write(&self) -> Result<WriteAccess> {
         self.mount.want_write()
+    }
+
+    /// Updates the access time after the file was read, as the mount's atime policy says.
+    ///
+    /// The update is skipped, without waiting or failing, when the mount or the file system
+    /// is read-only or frozen.
+    ///
+    /// Reference: Linux `touch_atime()` and `atime_needs_update()`.
+    pub(crate) fn touch_atime(&self) {
+        let inode = self.inode();
+        if !self.fs().updates_atime() {
+            return;
+        }
+        let flags = self.mount.flags();
+        let policy = flags.atime_policy();
+        if policy == AtimePolicy::Noatime
+            || (flags.contains(PerMountFlags::NODIRATIME) && inode.type_() == InodeType::Dir)
+        {
+            return;
+        }
+
+        let now = RealTimeCoarseClock::get().read_time();
+        let atime = inode.atime();
+        // With `relatime`, the access time only moves past the last change or once a day.
+        // Reference: Linux `relatime_need_update()`.
+        if policy == AtimePolicy::Relatime
+            && atime > inode.mtime()
+            && atime > inode.ctime()
+            && now.saturating_sub(atime) < RELATIME_INTERVAL
+        {
+            return;
+        }
+        if atime == now {
+            return;
+        }
+
+        let Some(_write_access) = self.mount.try_want_write() else {
+            return;
+        };
+        inode.set_atime(&self.dentry, now);
     }
 
     /// Gets write access for a file opened for writing, held until the file is closed.

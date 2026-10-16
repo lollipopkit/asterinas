@@ -53,6 +53,16 @@ pub(crate) trait FileSystem: Any + Sync + Send {
     /// Returns the write state of this file system, shared by all of its mounts.
     fn write_state(&self) -> &FsWriteState;
 
+    /// Returns whether reading a file or directory updates its access time.
+    ///
+    /// The VFS then updates it according to the mount's atime policy (Linux
+    /// `file_accessed()` in `generic_file_read_iter()` and `iterate_dir()`). File systems
+    /// whose reads are not page-cache reads of stored data, or whose server owns the
+    /// access time (Linux FUSE sets `S_NOATIME`), keep the default.
+    fn updates_atime(&self) -> bool {
+        false
+    }
+
     /// Returns whether this file system can be frozen with [`Self::freeze_fs`].
     fn supports_freeze(&self) -> bool {
         false
@@ -343,7 +353,17 @@ impl FreezeGate {
         });
     }
 
-    /// Ends a write started by [`Self::enter`].
+    /// Starts a write like [`Self::enter`] if the file system is not frozen, without waiting.
+    pub(crate) fn try_enter(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.level != FreezeLevel::Unfrozen {
+            return false;
+        }
+        state.running_writes += 1;
+        true
+    }
+
+    /// Ends a write started by [`Self::enter`] or [`Self::try_enter`].
     pub(crate) fn exit(&self) {
         let mut state = self.state.lock();
         state.running_writes -= 1;
@@ -362,11 +382,6 @@ impl FreezeGate {
             return_errno_with_message!(Errno::EBUSY, "the file system is frozen");
         }
         Ok(transition)
-    }
-
-    /// Returns whether writes may start right now.
-    pub(crate) fn is_unfrozen(&self) -> bool {
-        self.state.lock().level == FreezeLevel::Unfrozen
     }
 
     /// Returns whether the file system is completely frozen.

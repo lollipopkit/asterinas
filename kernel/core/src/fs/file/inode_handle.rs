@@ -153,6 +153,18 @@ impl InodeHandle {
             .then(|| path.fs().start_write())
     }
 
+    /// Updates the access time after the inode was read.
+    ///
+    /// Reads served by per-open operations (devices, pipes) do not count, nor do files
+    /// opened with `O_NOATIME`.
+    ///
+    /// Reference: Linux `file_accessed()`.
+    fn file_accessed(&self) {
+        if self.open_file.is_none() && !self.status_flags().contains(StatusFlags::O_NOATIME) {
+            self.path().touch_atime();
+        }
+    }
+
     pub(crate) fn offset(&self) -> usize {
         let offset = self.offset.lock();
         *offset
@@ -200,6 +212,7 @@ impl InodeHandle {
         let mut offset = self.offset.lock();
         let read_cnt = file_ops.readdir_at(*offset, visitor)?;
         *offset += read_cnt;
+        self.file_accessed();
         Ok(read_cnt)
     }
 
@@ -350,8 +363,13 @@ impl FileLike for InodeHandle {
 
         let mut offset = self.offset.lock();
 
+        let requested = writer.avail();
         let len = file_ops.read_at(*offset, writer, status_flags)?;
         *offset += len;
+        // Like Linux `filemap_read()`, an empty request does not access the file.
+        if requested > 0 {
+            self.file_accessed();
+        }
 
         Ok(len)
     }
@@ -395,7 +413,13 @@ impl FileLike for InodeHandle {
 
         let status_flags = self.status_flags();
 
-        file_ops.read_at(offset, writer, status_flags)
+        let requested = writer.avail();
+        let len = file_ops.read_at(offset, writer, status_flags)?;
+        // Like Linux `filemap_read()`, an empty request does not access the file.
+        if requested > 0 {
+            self.file_accessed();
+        }
+        Ok(len)
     }
 
     fn write_at(&self, mut offset: usize, reader: &mut VmReader) -> Result<usize> {
@@ -453,6 +477,8 @@ impl FileLike for InodeHandle {
         if let Some(page_cache) = inode.page_cache() {
             // Otherwise, if the inode has a page cache, it is a file-backed
             // mapping and we return the VMO as the mappable object.
+            // Mapping a file counts as accessing it (Linux `generic_file_mmap()`).
+            self.file_accessed();
             Ok(MappableObject::Vmo(page_cache))
         } else {
             return_errno_with_message!(Errno::ENODEV, "the file is not mappable");

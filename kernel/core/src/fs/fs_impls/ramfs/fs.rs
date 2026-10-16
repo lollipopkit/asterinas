@@ -136,6 +136,10 @@ impl FileSystem for RamFs {
         &self.fs_event_subscriber_stats
     }
 
+    fn updates_atime(&self) -> bool {
+        true
+    }
+
     fn write_state(&self) -> &FsWriteState {
         &self.write_state
     }
@@ -1052,9 +1056,6 @@ impl FileOps for RamInode {
             _ => return_errno_with_message!(Errno::EISDIR, "read is not supported"),
         };
 
-        if self.typ == InodeType::File {
-            self.metadata.lock().set_atime(now());
-        }
         Ok(read_len)
     }
 
@@ -1112,8 +1113,6 @@ impl FileOps for RamInode {
             .unwrap()
             .read()
             .visit_entry(offset, visitor)?;
-
-        self.metadata.lock().set_atime(now());
 
         Ok(cnt)
     }
