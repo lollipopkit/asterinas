@@ -6,7 +6,8 @@
 //! the shim forks a child that begins a TCT and then executes the tool; after the tool
 //! exits, the shim ends the TCT, reads its effects, commits its data (possibly while the
 //! model handles the tool result), and releases it. See [`Tct`] for how
-//! processes are attributed to a TCT.
+//! processes are attributed to a TCT. A commit waits until no TCT is running, so a shim that
+//! runs tool calls in parallel ends all of them before committing any.
 //!
 //! Controlling a TCT (beginning, ending, reading its effects, committing and releasing it) requires
 //! `CAP_SYS_ADMIN`, and is refused for processes that are already in a TCT, so a tool cannot
@@ -139,7 +140,7 @@ impl PerOpenFileOps for AgentCtlFile {
                 let tct = Tct::new(flags);
                 args.id = tct.id();
                 cmd.write(&args)?;
-                tct.begin(&process)?;
+                tct.begin(&process).map_err(restart_on_signal)?;
                 Ok(0)
             }
             cmd @ TctEnd => {
@@ -175,7 +176,7 @@ impl PerOpenFileOps for AgentCtlFile {
             cmd @ TctCommit => {
                 let id = cmd.read()?;
                 check_controller()?;
-                Tct::get(id)?.commit()?;
+                Tct::get(id)?.commit().map_err(restart_on_signal)?;
                 Ok(0)
             }
             cmd @ TctRelease => {
@@ -186,6 +187,16 @@ impl PerOpenFileOps for AgentCtlFile {
             }
             _ => return_errno_with_message!(Errno::ENOTTY, "the ioctl command is unknown"),
         })
+    }
+}
+
+/// Restarts an ioctl interrupted by a signal if the signal handler allows it.
+///
+/// This is only used for ioctls that can be retried without side effects.
+fn restart_on_signal(err: Error) -> Error {
+    match err.error() {
+        Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+        _ => err,
     }
 }
 

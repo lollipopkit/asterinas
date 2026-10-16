@@ -21,6 +21,7 @@ use ostd::{
     mm::VmIo,
     user::UserContextApi,
 };
+pub use pause::pause_on_until;
 pub(crate) use pause::{Pause, PauseReason, with_sigmask_changed};
 pub(crate) use pending::{DequeuedSignal, HandlePendingSignal};
 pub(crate) use poll::{PollAdaptor, Pollee, Poller};
