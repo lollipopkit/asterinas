@@ -829,6 +829,9 @@ impl Debug for Mount {
 
 impl Drop for Mount {
     fn drop(&mut self) {
+        if Arc::strong_count(&self.fs) == 1 {
+            self.fs.shutdown();
+        }
         self.clear_mountpoint();
         // `upgrade` returns `None` for pseudo mounts (no namespace) and for
         // mounts whose namespace is itself being dropped (the `mounts` map

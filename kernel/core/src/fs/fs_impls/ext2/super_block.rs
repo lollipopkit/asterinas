@@ -44,6 +44,9 @@ pub(super) const SUPER_BLOCK_OFFSET: usize = 1024;
 
 const SUPER_BLOCK_SIZE: usize = 1024;
 
+/// The maximal mount count given to a volume that has none (Linux `EXT2_DFL_MAX_MNT_COUNT`).
+pub(super) const DEFAULT_MAX_MNT_COUNT: u16 = 20;
+
 /// Validated, Rust-typed in-memory representation of the ext2 superblock.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SuperBlock {
@@ -604,9 +607,51 @@ impl SuperBlock {
         sb_bid + (SUPER_BLOCK_SIZE.div_ceil(self.block_size) as u32)
     }
 
-    #[expect(dead_code)]
-    const fn state(&self) -> FsState {
+    /// Returns the on-disk filesystem state.
+    pub(super) const fn state(&self) -> FsState {
         self.state
+    }
+
+    /// Sets the on-disk filesystem state.
+    pub(super) const fn set_state(&mut self, state: FsState) {
+        self.state = state;
+    }
+
+    /// Sets the last mount time.
+    pub(super) const fn set_mtime(&mut self, time: Duration) {
+        self.mtime = time;
+    }
+
+    /// Returns why `e2fsck` should be run before a read-write mount, if it should.
+    ///
+    /// `mount_state` is the state the volume had when it was opened.
+    ///
+    /// Reference: Linux `ext2_setup_super()`.
+    pub(super) fn fsck_reason(&self, mount_state: FsState, now: Duration) -> Option<&'static str> {
+        if !mount_state.contains(FsState::VALID) {
+            return Some("mounting unchecked fs");
+        }
+        if mount_state.contains(FsState::ERROR) {
+            return Some("mounting fs with errors");
+        }
+        // A negative maximal mount count disables the check.
+        if (self.max_mnt_count as i16) >= 0 && self.mnt_count >= self.max_mnt_count {
+            return Some("maximal mount count reached");
+        }
+        if !self.check_interval.is_zero() && self.last_check_time + self.check_interval <= now {
+            return Some("checktime reached");
+        }
+        None
+    }
+
+    /// Records one more read-write mount.
+    ///
+    /// Reference: Linux `ext2_setup_super()`.
+    pub(super) const fn inc_mnt_count(&mut self) {
+        if self.max_mnt_count == 0 {
+            self.max_mnt_count = DEFAULT_MAX_MNT_COUNT;
+        }
+        self.mnt_count = self.mnt_count.wrapping_add(1);
     }
 
     #[expect(dead_code)]

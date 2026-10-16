@@ -48,6 +48,14 @@ pub(crate) trait FileSystem: Any + Sync + Send {
 
     /// Returns the FS event subscriber stats of this file system.
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats;
+
+    /// Shuts down this file system when the last mount referencing it is dropped.
+    ///
+    /// The file system is still alive during the call, so it can sync and write its final
+    /// on-disk state (Linux `generic_shutdown_super()`). It is not called when another
+    /// holder outlives the last mount, which leaves such a file system as not cleanly
+    /// unmounted.
+    fn shutdown(&self) {}
 }
 
 impl dyn FileSystem {

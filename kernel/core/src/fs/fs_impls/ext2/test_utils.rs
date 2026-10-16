@@ -213,7 +213,13 @@ pub(super) fn make_valid_super_block(nr_block_groups: u32) -> SuperBlock {
 }
 
 pub(super) fn make_valid_group_desc(sb: &SuperBlock, group_idx: usize) -> RawBlockGroup {
-    let first = sb.group_first_block_no(group_idx);
+    // A group holding a superblock copy starts with it and the descriptor table, which
+    // `Ext2` rewrites on every metadata sync.
+    let first = if sb.has_super_block(group_idx) {
+        sb.group_descriptors_bid(group_idx) + sb.group_descriptor_blocks_count()
+    } else {
+        sb.group_first_block_no(group_idx)
+    };
     RawBlockGroup {
         block_bitmap_bid: first,
         inode_bitmap_bid: first + 1,
@@ -623,14 +629,16 @@ impl Ext2FixtureBuilder {
             set_bit_lsb0(bitmap, (desc.inode_table_bid + i - first) as usize);
         }
 
-        if group_idx == 0 {
-            let sb_bid = sb.bid(0);
+        if sb.has_super_block(group_idx) {
+            let sb_bid = sb.bid(group_idx);
             if sb_bid >= first && sb_bid <= last {
                 set_bit_lsb0(bitmap, (sb_bid - first) as usize);
             }
-            let group_desc_bid = sb.group_descriptors_bid(0);
-            if group_desc_bid >= first && group_desc_bid <= last {
-                set_bit_lsb0(bitmap, (group_desc_bid - first) as usize);
+            let group_desc_bid = sb.group_descriptors_bid(group_idx);
+            for bid in group_desc_bid..group_desc_bid + sb.group_descriptor_blocks_count() {
+                if bid >= first && bid <= last {
+                    set_bit_lsb0(bitmap, (bid - first) as usize);
+                }
             }
         }
     }
@@ -748,6 +756,8 @@ impl Ext2FixtureBuilder {
         let device: Arc<dyn BlockDevice> = self
             .custom_device
             .unwrap_or_else(|| disk.clone() as Arc<dyn BlockDevice>);
+        // A read-write open stamps the superblock's write time.
+        clocks::init_for_ktest();
         let ext2 = Ext2::open(device, FsFlags::empty(), None)?;
 
         Ok(Ext2Fixture {
