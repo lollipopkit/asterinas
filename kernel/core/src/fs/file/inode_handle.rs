@@ -14,11 +14,12 @@ use crate::{
     fs::{
         utils::DirentVisitor,
         vfs::{
-            file_system::FsWriteGuard,
+            file_system::{FsFlags, FsWriteGuard},
             inode::{FallocMode, FileOps},
             inode_ext::InodeExt,
             path::{Path, WriteAccess},
             range_lock::{RangeLockItem, RangeLockOwner, RangeLockType},
+            sync_policy,
             xattr::clear_file_priv,
         },
     },
@@ -207,6 +208,31 @@ impl InodeHandle {
             );
         }
         Ok(inode.as_ref())
+    }
+
+    /// Makes the written data durable if the file is opened with `O_SYNC` or `O_DSYNC`, or
+    /// its file system is mounted with `sync`.
+    ///
+    /// Reference: Linux `iocb_flags()` and `generic_write_sync()`.
+    fn sync_written(&self, len: usize) -> Result<()> {
+        if len == 0 || self.open_file.is_some() {
+            return Ok(());
+        }
+        let status_flags = self.status_flags();
+        if !status_flags.intersects(StatusFlags::O_DSYNC | StatusFlags::O_SYNC)
+            && !self.path().fs().flags().contains(FsFlags::SYNCHRONOUS)
+        {
+            return Ok(());
+        }
+        let mode = if status_flags.contains(StatusFlags::O_SYNC) {
+            SyncMode::Full
+        } else {
+            SyncMode::Data
+        };
+        if sync_policy::defers_current_sync() {
+            return Ok(());
+        }
+        self.path().sync(mode)
     }
 
     pub(crate) fn readdir(&self, visitor: &mut dyn DirentVisitor) -> Result<usize> {
@@ -412,6 +438,7 @@ impl FileLike for InodeHandle {
 
         let len = file_ops.write_at(*offset, reader, status_flags)?;
         *offset += len;
+        self.sync_written(len)?;
 
         Ok(len)
     }
@@ -453,7 +480,9 @@ impl FileLike for InodeHandle {
             offset = self.path().size();
         }
 
-        file_ops.write_at(offset, reader, status_flags)
+        let len = file_ops.write_at(offset, reader, status_flags)?;
+        self.sync_written(len)?;
+        Ok(len)
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {

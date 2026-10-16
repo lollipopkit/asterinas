@@ -88,6 +88,41 @@ pub(crate) trait FileSystem: Any + Sync + Send {
     fn shutdown(&self) {}
 }
 
+/// The file systems that have been mounted and are still alive, like Linux `super_blocks`.
+static FILE_SYSTEMS: Mutex<Vec<Weak<dyn FileSystem>>> = Mutex::new(Vec::new());
+
+/// Records a mounted file system, so that [`sync_all_file_systems`] syncs it.
+pub(in crate::fs) fn register_file_system(fs: &Arc<dyn FileSystem>) {
+    let fs = Arc::downgrade(fs);
+    let mut file_systems = FILE_SYSTEMS.lock();
+    file_systems.retain(|weak| weak.strong_count() > 0);
+    if !file_systems.iter().any(|weak| weak.ptr_eq(&fs)) {
+        file_systems.push(fs);
+    }
+}
+
+/// Writes back all the file systems and flushes their devices.
+///
+/// Unlike `sync(2)`, which ignores errors, this returns the first error after trying all the
+/// file systems.
+///
+/// Reference: Linux `ksys_sync()`.
+pub fn sync_all_file_systems() -> Result<()> {
+    let file_systems: Vec<Arc<dyn FileSystem>> = FILE_SYSTEMS
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+
+    let mut res = Ok(());
+    for fs in file_systems {
+        if let Err(err) = fs.sync() {
+            res = res.and(Err(err));
+        }
+    }
+    res
+}
+
 impl dyn FileSystem {
     /// Starts a write, waiting while this file system is frozen (Linux `sb_start_write()`).
     pub(crate) fn start_write(self: Arc<Self>) -> FsWriteGuard {

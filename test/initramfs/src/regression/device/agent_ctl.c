@@ -4,6 +4,8 @@
  * Regression tests for `/dev/agent_ctl` and tool-call transactions (TCTs).
  */
 
+#define _GNU_SOURCE
+
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -11,6 +13,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -27,7 +30,15 @@ struct agent_ctl_tct_end {
 	uint64_t nr_live_processes;
 };
 
-#define AGENT_CTL_TCT_BEGIN _IOR(0xA7, 1, uint64_t)
+struct agent_ctl_tct_begin {
+	uint32_t flags;
+	uint32_t reserved;
+	uint64_t id;
+};
+
+#define AGENT_CTL_TCT_DEFER_SYNC (1 << 0)
+
+#define AGENT_CTL_TCT_BEGIN _IOWR(0xA7, 1, struct agent_ctl_tct_begin)
 #define AGENT_CTL_TCT_END _IOWR(0xA7, 2, struct agent_ctl_tct_end)
 #define AGENT_CTL_TCT_GET _IOR(0xA7, 3, uint64_t)
 
@@ -68,13 +79,18 @@ static uint64_t tct_get(void)
 	return id;
 }
 
+static uint64_t tct_begin_with_flags(uint32_t flags)
+{
+	struct agent_ctl_tct_begin begin = { .flags = flags };
+
+	if (ioctl(ctl_fd, AGENT_CTL_TCT_BEGIN, &begin) < 0)
+		return 0;
+	return begin.id;
+}
+
 static uint64_t tct_begin(void)
 {
-	uint64_t id = 0;
-
-	if (ioctl(ctl_fd, AGENT_CTL_TCT_BEGIN, &id) < 0)
-		return 0;
-	return id;
+	return tct_begin_with_flags(0);
 }
 
 static int tct_end(uint64_t id, uint64_t *nr_live_processes)
@@ -438,5 +454,81 @@ FN_TEST(begin_with_bad_pointer)
 		TEST_RES(tct_get(), _ret == 0);
 		TEST_RES(tct_begin(), _ret != 0);
 	});
+}
+END_TEST()
+
+#define SYNC_DIR "/ext2/agent_ctl_sync"
+
+FN_TEST(begin_rejects_invalid_flags)
+{
+	IN_CHILD({
+		TEST_ERRNO(tct_begin_with_flags(1 << 31), EINVAL);
+		TEST_RES(tct_get(), _ret == 0);
+	});
+}
+END_TEST()
+
+/*
+ * Checks that the data written by `writer`, which runs in a TCT begun with `flags`, can be
+ * read back after the TCT ends.
+ */
+#define TEST_SYNCS_IN_TCT(flags)                                               \
+	do {                                                                   \
+		int __pipe[2];                                                 \
+		uint64_t __id = 0, __nr_live;                                  \
+		char __buf[8] = { 0 };                                         \
+		TEST_SUCC(pipe(__pipe));                                       \
+		IN_CHILD({                                                     \
+			__id = TEST_RES(tct_begin_with_flags(flags),           \
+					_ret != 0);                            \
+			TEST_RES(write(__pipe[1], &__id, sizeof(__id)),        \
+				 _ret == sizeof(__id));                        \
+			int __fd = TEST_SUCC(open(SYNC_DIR "/file",            \
+						  O_CREAT | O_RDWR | O_TRUNC,  \
+						  0644));                      \
+			TEST_RES(write(__fd, "fsync", 5), _ret == 5);          \
+			TEST_SUCC(fsync(__fd));                                \
+			TEST_SUCC(fdatasync(__fd));                            \
+			TEST_SUCC(syncfs(__fd));                               \
+			sync();                                                \
+			TEST_SUCC(ftruncate(__fd, 4096));                      \
+			char *__map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, \
+					   MAP_SHARED, __fd, 0);               \
+			TEST_RES(__map != MAP_FAILED, _ret);                   \
+			__map[5] = 'm';                                        \
+			TEST_SUCC(msync(__map, 4096, MS_SYNC));                \
+			TEST_SUCC(munmap(__map, 4096));                        \
+			TEST_SUCC(close(__fd));                                \
+			__fd = TEST_SUCC(open(SYNC_DIR "/file",                \
+					      O_WRONLY | O_SYNC));             \
+			TEST_RES(pwrite(__fd, "s", 1, 6), _ret == 1);          \
+			TEST_SUCC(close(__fd));                                \
+			__fd = TEST_SUCC(open(SYNC_DIR "/file",                \
+					      O_WRONLY | O_DSYNC));            \
+			TEST_RES(pwrite(__fd, "d", 1, 7), _ret == 1);          \
+			TEST_SUCC(close(__fd));                                \
+		});                                                            \
+		TEST_RES(read(__pipe[0], &__id, sizeof(__id)),                 \
+			 _ret == sizeof(__id));                                \
+		TEST_SUCC(close(__pipe[0]));                                   \
+		TEST_SUCC(close(__pipe[1]));                                   \
+		TEST_RES(tct_end(__id, &__nr_live), _ret == 0);                \
+		TEST_SUCC(tct_release(__id));                                  \
+		int __fd = TEST_SUCC(open(SYNC_DIR "/file", O_RDONLY));        \
+		TEST_RES(read(__fd, __buf, sizeof(__buf)),                     \
+			 _ret == sizeof(__buf) &&                              \
+				 memcmp(__buf, "fsyncmsd", 8) == 0);           \
+		TEST_SUCC(close(__fd));                                        \
+		TEST_SUCC(unlink(SYNC_DIR "/file"));                           \
+	} while (0)
+
+FN_TEST(syncs_in_tct)
+{
+	CHECK_WITH(mkdir(SYNC_DIR, 0755), _ret == 0 || errno == EEXIST);
+
+	TEST_SYNCS_IN_TCT(0);
+	TEST_SYNCS_IN_TCT(AGENT_CTL_TCT_DEFER_SYNC);
+
+	TEST_SUCC(rmdir(SYNC_DIR));
 }
 END_TEST()

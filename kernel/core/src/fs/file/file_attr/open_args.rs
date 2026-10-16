@@ -18,7 +18,12 @@ impl OpenArgs {
     /// Creates `OpenArgs` from the given flags and mode.
     pub(crate) fn from_flags_and_mode(flags: u32, inode_mode: InodeMode) -> Result<Self> {
         let creation_flags = CreationFlags::from_bits_truncate(flags);
-        let status_flags = StatusFlags::from_bits_truncate(flags);
+        let mut status_flags = StatusFlags::from_bits_truncate(flags);
+        // Full file integrity implies data integrity.
+        // Reference: Linux `build_open_flags()`.
+        if status_flags.contains(StatusFlags::O_SYNC) {
+            status_flags |= StatusFlags::O_DSYNC;
+        }
         let access_mode = AccessMode::from_u32(flags)?;
 
         // When `O_PATH` is set, all other flags (including `O_TMPFILE`) are

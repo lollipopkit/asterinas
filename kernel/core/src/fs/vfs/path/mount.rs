@@ -17,7 +17,7 @@ use crate::{
     fs::{
         file::InodeType,
         vfs::{
-            file_system::{FileSystem, FsFlags, WriterCount},
+            file_system::{self, FileSystem, FsFlags, WriterCount},
             path::{
                 Path,
                 dentry::{Dentry, DentryKey},
@@ -156,6 +156,7 @@ impl Mount {
     ) -> Result<Arc<Self>> {
         let id = MountId::alloc()
             .ok_or_else(|| Error::with_message(Errno::ENOMEM, "mount ID space exhausted"))?;
+        file_system::register_file_system(&fs);
 
         let mount = Arc::new_cyclic(|weak_self| Self {
             id,

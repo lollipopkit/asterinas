@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 aster-core.workspace = true
+bitflags.workspace = true
 component.workspace = true
 device-id.workspace = true
 ostd.workspace = true

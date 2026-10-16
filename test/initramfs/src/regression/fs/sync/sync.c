@@ -49,3 +49,16 @@ FN_TEST(syncfs_opath_fd)
 	TEST_SUCC(unlink(TEST_FILE));
 }
 END_TEST()
+
+FN_TEST(o_sync_implies_o_dsync)
+{
+	// `O_SYNC` is `__O_SYNC | O_DSYNC`, and Linux adds `O_DSYNC` if only `__O_SYNC` is set.
+	int fd = TEST_SUCC(
+		open(TEST_FILE, O_CREAT | O_WRONLY | (O_SYNC & ~O_DSYNC), 0600));
+
+	TEST_RES(fcntl(fd, F_GETFL), (_ret & O_SYNC) == O_SYNC);
+	TEST_RES(write(fd, "x", 1), _ret == 1);
+	TEST_SUCC(close(fd));
+	TEST_SUCC(unlink(TEST_FILE));
+}
+END_TEST()
