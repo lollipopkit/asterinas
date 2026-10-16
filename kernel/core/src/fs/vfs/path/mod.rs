@@ -313,11 +313,20 @@ impl Path {
             .check_permission(Permission::MAY_EXEC | Permission::MAY_CHDIR)
     }
 
-    /// Gets write access to the mount and file system of this path, failing with `EROFS`
-    /// when either is read-only.
+    /// Gets write access to the mount and file system of this path for a write, failing
+    /// with `EROFS` when either is read-only and first waiting while the file system is
+    /// frozen.
     ///
     /// Every operation that writes to the file system holds the returned guard while it
-    /// writes, so that neither can become read-only in the meantime.
+    /// writes, so that neither can become read-only or frozen in the meantime.
+    pub(crate) fn want_write(&self) -> Result<WriteAccess> {
+        self.mount.want_write()
+    }
+
+    /// Gets write access for a file opened for writing, held until the file is closed.
+    ///
+    /// Unlike [`Self::want_write`], it does not wait for a frozen file system; writes through
+    /// the file wait instead.
     pub(crate) fn get_write_access(&self) -> Result<WriteAccess> {
         self.mount.get_write_access()
     }
@@ -336,10 +345,29 @@ impl Path {
 
     /// Gets write access for modifying a directory entry in this directory.
     fn check_dir_entry_mutation(&self) -> Result<WriteAccess> {
-        let write_access = self.get_write_access()?;
+        let write_access = self.want_write()?;
         self.inode()
             .check_permission(Permission::MAY_WRITE | Permission::MAY_EXEC)?;
         Ok(write_access)
+    }
+
+    /// Returns whether the current thread owns the inode or has `CAP_FOWNER`.
+    ///
+    /// Reference: Linux `inode_owner_or_capable()`.
+    pub(crate) fn is_owner_or_capable(&self) -> Result<bool> {
+        let current_thread = current_thread!();
+        let Some(posix_thread) = current_thread.as_posix_thread() else {
+            return Ok(true);
+        };
+        if posix_thread.credentials().fsuid() == self.owner()? {
+            return Ok(true);
+        }
+        Ok(lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+            UserNamespace::get_init_singleton().as_ref(),
+            posix_thread,
+            CapSet::FOWNER,
+        ))
+        .is_ok())
     }
 
     /// Checks whether an inode may be used as the source of a hard link.
@@ -829,8 +857,11 @@ impl Path {
         let new_dir_dentry = new_dir.dentry.as_dir_dentry_or_err()?;
 
         let _write_access = self.check_dir_entry_mutation()?;
+        // Both directories are on the same mount, whose write access is already held.
         if !Arc::ptr_eq(&self.dentry, &new_dir.dentry) {
-            new_dir.check_dir_entry_mutation()?;
+            new_dir
+                .inode()
+                .check_permission(Permission::MAY_WRITE | Permission::MAY_EXEC)?;
         }
 
         old_dir_dentry.rename(old_name, &new_dir_dentry, new_name, mode)
@@ -857,17 +888,17 @@ impl Path {
     ) -> Result<usize>;
 
     pub(crate) fn set_mode(&self, mode: InodeMode) -> Result<()> {
-        let _write_access = self.get_write_access()?;
+        let _write_access = self.want_write()?;
         self.inode().set_mode(&self.dentry, mode)
     }
 
     pub(crate) fn set_owner(&self, uid: Uid) -> Result<()> {
-        let _write_access = self.get_write_access()?;
+        let _write_access = self.want_write()?;
         self.inode().set_owner(&self.dentry, uid)
     }
 
     pub(crate) fn set_group(&self, gid: Gid) -> Result<()> {
-        let _write_access = self.get_write_access()?;
+        let _write_access = self.want_write()?;
         self.inode().set_group(&self.dentry, gid)
     }
 
@@ -885,7 +916,7 @@ impl Path {
 
     /// Resizes the file.
     pub(crate) fn resize(&self, size: usize) -> Result<()> {
-        let _write_access = self.get_write_access()?;
+        let _write_access = self.want_write()?;
         self.inode().check_permission(Permission::MAY_WRITE)?;
         self.resize_unchecked_access(size)
     }
@@ -905,7 +936,7 @@ impl Path {
         flags: XattrSetFlags,
         ctx: &Context,
     ) -> Result<()> {
-        let _write_access = self.get_write_access()?;
+        let _write_access = self.want_write()?;
         let inode = self.inode();
         if name.full_name() == xattr::SECURITY_CAPABILITY_XATTR_NAME {
             capable_modify_file_cap(inode.as_ref(), ctx)?;
@@ -924,7 +955,7 @@ impl Path {
 
     /// Removes an xattr of the file.
     pub(crate) fn remove_xattr(&self, name: XattrName, ctx: &Context) -> Result<()> {
-        let _write_access = self.get_write_access()?;
+        let _write_access = self.want_write()?;
         let inode = self.inode();
         if name.full_name() == xattr::SECURITY_CAPABILITY_XATTR_NAME {
             capable_modify_file_cap(inode.as_ref(), ctx)?;

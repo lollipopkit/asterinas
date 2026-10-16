@@ -78,6 +78,8 @@ mod io_range;
 mod symlink;
 mod sync;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use ostd::const_assert;
 
 use self::{
@@ -139,6 +141,9 @@ pub(crate) struct Inode {
     xattr: Option<Xattr>,
     pipe: Option<Pipe>,
     extension: Extension,
+    /// Whether the inode was unlinked while still in use and is counted by
+    /// [`Ext2::forget_unlinked_inode`].
+    unlinked: AtomicBool,
 }
 
 impl Inode {
@@ -172,8 +177,14 @@ impl Inode {
                 xattr,
                 pipe,
                 extension: Extension::new(),
+                unlinked: AtomicBool::new(false),
             }
         })
+    }
+
+    /// Marks the inode as unlinked while still in use, returning whether it already was.
+    pub(super) fn mark_unlinked(&self) -> bool {
+        self.unlinked.swap(true, Ordering::Relaxed)
     }
 
     /// Returns the ext2 inode number.
@@ -221,6 +232,11 @@ impl Inode {
 
 impl Drop for Inode {
     fn drop(&mut self) {
+        if self.unlinked.load(Ordering::Relaxed)
+            && let Ok(fs) = self.fs()
+        {
+            fs.unlinked_inode_dropped();
+        }
         if let Err(err) = self.try_reclaim_deleted_inode() {
             debug!(
                 "failed to reclaim deleted inode {} during drop: {:?}",

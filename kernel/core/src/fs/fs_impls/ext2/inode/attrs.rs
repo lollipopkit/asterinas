@@ -16,6 +16,7 @@ use crate::{
         ext2::{inode::Inode, prelude::*, utils},
         file::InodeMode,
         vfs::{
+            file_system::FsFlags,
             inode::Metadata,
             xattr::{XattrName, XattrNamespace, XattrSetFlags},
         },
@@ -128,6 +129,20 @@ impl Inode {
     /// Returns the last access time.
     pub(in ext2) fn atime(&self) -> Duration {
         self.inner.read().atime()
+    }
+
+    /// Updates the last access time after a read, unless the file system is read-only or
+    /// being frozen (Linux `touch_atime()`).
+    // TODO: Honor read-only mounts and the mount's atime policy (`noatime`, `relatime`),
+    // which Linux `touch_atime()` checks in the VFS.
+    pub(in ext2) fn touch_atime(&self) {
+        let Ok(fs) = self.fs() else {
+            return;
+        };
+        if fs.fs_flags().contains(FsFlags::RDONLY) || !fs.write_state().freeze().is_unfrozen() {
+            return;
+        }
+        self.inner.write().set_atime(utils::now());
     }
 
     /// Sets the last access time.

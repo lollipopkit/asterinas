@@ -9,10 +9,12 @@ use super::{
     SettableStatusFlags, StatusFlags, SyncMode, file_table::FdFlags, flock::FlockItem,
 };
 use crate::{
+    dispatch_ioctl,
     events::IoEvents,
     fs::{
         utils::DirentVisitor,
         vfs::{
+            file_system::FsWriteGuard,
             inode::{FallocMode, FileOps},
             inode_ext::InodeExt,
             path::{Path, WriteAccess},
@@ -21,7 +23,13 @@ use crate::{
         },
     },
     prelude::*,
-    process::signal::{PollHandle, Pollable},
+    process::{
+        UserNamespace,
+        credentials::capabilities::CapSet,
+        posix_thread::AsPosixThread,
+        signal::{PollHandle, Pollable},
+    },
+    security::lsm::hooks as lsm_hooks,
     util::ioctl::RawIoctl,
     vm::vmar::FileMmapRequest,
 };
@@ -108,6 +116,41 @@ impl InodeHandle {
 
     pub(crate) fn status_flags(&self) -> StatusFlags {
         self.common.status_flags()
+    }
+
+    /// Handles the ioctl commands that act on the whole file system.
+    fn fs_ioctl(&self, raw_ioctl: RawIoctl) -> Option<Result<()>> {
+        use ioctl_defs::*;
+
+        let check_sys_admin = || {
+            let current = current_thread!();
+            let posix_thread = current.as_posix_thread().unwrap();
+            lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+                UserNamespace::get_init_singleton().as_ref(),
+                posix_thread,
+                CapSet::SYS_ADMIN,
+            ))
+        };
+
+        dispatch_ioctl!(match raw_ioctl {
+            _cmd @ Freeze => {
+                Some(check_sys_admin().and_then(|()| self.path().fs().freeze()))
+            }
+            _cmd @ Thaw => {
+                Some(check_sys_admin().and_then(|()| self.path().fs().thaw()))
+            }
+            _ => None,
+        })
+    }
+
+    /// Starts a write through this file, which waits while its file system is frozen.
+    ///
+    /// Like Linux `file_start_write()`, it only applies to regular files.
+    fn start_write(&self) -> Option<FsWriteGuard> {
+        let path = self.path();
+        path.type_()
+            .is_regular_file()
+            .then(|| path.fs().start_write())
     }
 
     pub(crate) fn offset(&self) -> usize {
@@ -317,6 +360,7 @@ impl FileLike for InodeHandle {
         if self.status_flags().contains(StatusFlags::O_PATH) || !self.access_mode().is_writable() {
             return_errno_with_message!(Errno::EBADF, "the file is not opened writable");
         }
+        let _write = self.start_write();
         if reader.remain() > 0 {
             clear_file_priv(self.path().dentry())?;
         }
@@ -359,6 +403,7 @@ impl FileLike for InodeHandle {
         if self.status_flags().contains(StatusFlags::O_PATH) || !self.access_mode().is_writable() {
             return_errno_with_message!(Errno::EBADF, "the file is not opened writable");
         }
+        let _write = self.start_write();
         if reader.remain() > 0 {
             clear_file_priv(self.path().dentry())?;
         }
@@ -379,6 +424,11 @@ impl FileLike for InodeHandle {
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
         if self.status_flags().contains(StatusFlags::O_PATH) {
             return_errno_with_message!(Errno::EBADF, "the file is opened as a path");
+        }
+
+        // Like Linux `do_vfs_ioctl()`, these apply to every file of the file system.
+        if let Some(res) = self.fs_ioctl(raw_ioctl) {
+            return res.map(|()| 0);
         }
 
         if let Some(ref open_file) = self.open_file {
@@ -423,6 +473,7 @@ impl FileLike for InodeHandle {
         }
         // `ftruncate` uses the descriptor's write mode and must not recheck current inode
         // permissions. See <https://man7.org/linux/man-pages/man2/truncate.2.html>.
+        let _write = self.start_write();
         self.path().resize_unchecked_access(new_size)
     }
 
@@ -464,6 +515,7 @@ impl FileLike for InodeHandle {
         if self.status_flags().contains(StatusFlags::O_PATH) || !self.access_mode().is_writable() {
             return_errno_with_message!(Errno::EBADF, "the file is not opened writable");
         }
+        let _write = self.start_write();
 
         let dentry = self.path().dentry();
         let inode = dentry.inode().as_ref();
@@ -659,4 +711,13 @@ fn do_seek_util(offset: &Mutex<usize>, pos: SeekFrom, end: Option<usize>) -> Res
 
     *offset = new_offset;
     Ok(new_offset)
+}
+
+mod ioctl_defs {
+    use crate::{ioc, util::ioctl::InOutData};
+
+    // Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/linux/fs.h>
+
+    pub(super) type Freeze = ioc!(FIFREEZE, b'X', 119, InOutData<i32>);
+    pub(super) type Thaw   = ioc!(FITHAW,   b'X', 120, InOutData<i32>);
 }
