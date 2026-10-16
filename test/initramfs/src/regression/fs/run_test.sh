@@ -95,6 +95,7 @@ test_ext2 "/ext2" "test_file.txt"
 ./ext2/open_unlink
 ./ext2/permissions
 ./ext2/readdir
+./ext2/readonly_mount
 ./ext2/rename
 ./ext2/rmdir
 ./ext2/shared_block_device
