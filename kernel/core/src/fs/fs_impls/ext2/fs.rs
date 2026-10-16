@@ -33,7 +33,7 @@ use super::{
 use crate::{
     fs::{
         ext2::utils,
-        vfs::file_system::{AtomicFsFlags, FsEventSubscriberStats, FsFlags},
+        vfs::file_system::{AtomicFsFlags, FsEventSubscriberStats, FsFlags, FsWriteState},
     },
     process::{Gid, UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
     security::lsm::hooks as lsm_hooks,
@@ -72,6 +72,8 @@ pub(crate) struct Ext2 {
     flags: AtomicFsFlags,
     /// FS event stats for VFS.
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
     /// Per-filesystem inode generation counter.
     next_generation: AtomicU32,
     /// Weak self reference for inode back-pointers.
@@ -192,6 +194,7 @@ impl Ext2 {
             mount_options,
             flags: AtomicFsFlags::new(flags),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            write_state: FsWriteState::new(),
             next_generation: AtomicU32::new(utils::duration_to_ext2_secs(utils::now())),
             self_ref: weak_self.clone(),
         });
@@ -349,6 +352,11 @@ impl Ext2 {
     /// Returns the fs event subscriber stats.
     pub(super) fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    /// Returns the writers across all mounts.
+    pub(super) fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 
     /// Returns the root inode.

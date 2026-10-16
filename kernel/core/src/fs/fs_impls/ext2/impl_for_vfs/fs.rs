@@ -12,7 +12,7 @@ use crate::{
         fs_impls::ext2::{Ext2, super_block::MAGIC_NUM},
         utils::NAME_MAX,
         vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, FsFlags, SuperBlock},
+            file_system::{FileSystem, FsEventSubscriberStats, FsFlags, FsWriteState, SuperBlock},
             inode::Inode,
         },
     },
@@ -72,5 +72,9 @@ impl FileSystem for Ext2 {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         self.fs_event_subscriber_stats()
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        self.write_state()
     }
 }

@@ -16,7 +16,7 @@ use crate::{
         pseudofs::AnonDeviceId,
         utils::{DirEntryVecExt, DirentVisitor, NAME_MAX},
         vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+            file_system::{FileSystem, FsEventSubscriberStats, FsWriteState, SuperBlock},
             inode::{
                 Extension, FileOps, Inode, Metadata, MknodType, RenameMode, RevalidationPolicy,
             },
@@ -53,6 +53,8 @@ pub(crate) struct DevPts {
     root: Arc<RootInode>,
     index_alloc: Mutex<IdAlloc>,
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
     this: Weak<Self>,
 }
 
@@ -66,6 +68,7 @@ impl DevPts {
             root: RootInode::new(weak_self.clone(), &sb),
             index_alloc: Mutex::new(IdAlloc::with_capacity(MAX_PTY_NUM)),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            write_state: FsWriteState::new(),
             this: weak_self.clone(),
         })
     }
@@ -122,6 +125,10 @@ impl FileSystem for DevPts {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 }
 

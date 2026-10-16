@@ -24,7 +24,7 @@ use crate::{
         pseudofs::AnonDeviceId,
         utils::{CStr256, DirentVisitor},
         vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+            file_system::{FileSystem, FsEventSubscriberStats, FsWriteState, SuperBlock},
             inode::{
                 Extension, FallocMode, FileOps, HardLinkability, Inode, Metadata, MknodType,
                 RenameMode, RevalidationPolicy, SymbolicLink,
@@ -54,6 +54,8 @@ pub(crate) struct RamFs {
     inode_allocator: AtomicU64,
     /// FS event subscriber stats for this file system
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
 }
 
 impl RamFs {
@@ -97,6 +99,7 @@ impl RamFs {
             }),
             inode_allocator: AtomicU64::new(ROOT_INO + 1),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            write_state: FsWriteState::new(),
         })
     }
 
@@ -131,6 +134,10 @@ impl FileSystem for RamFs {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 }
 

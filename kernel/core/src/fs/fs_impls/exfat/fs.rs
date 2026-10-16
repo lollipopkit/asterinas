@@ -32,7 +32,7 @@ use crate::{
         exfat::{constants::*, inode::Ino},
         file::SyncMode,
         vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+            file_system::{FileSystem, FsEventSubscriberStats, FsWriteState, SuperBlock},
             inode::Inode,
             registry::{FsCache, FsCreationCtx, FsProperties, FsType},
         },
@@ -65,6 +65,8 @@ pub(crate) struct ExfatFs {
     mutex: Mutex<()>,
 
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
 }
 
 const FAT_LRU_CACHE_SIZE: usize = 1024;
@@ -93,6 +95,7 @@ impl ExfatFs {
             meta_cache: PageCache::new_with_backend(fs_size, weak_self.clone() as _).unwrap(),
             mutex: Mutex::new(()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            write_state: FsWriteState::new(),
         });
 
         // TODO: if the main superblock is corrupted, should we load the backup?
@@ -443,6 +446,10 @@ impl FileSystem for ExfatFs {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 }
 

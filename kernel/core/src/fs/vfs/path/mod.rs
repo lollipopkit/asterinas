@@ -7,7 +7,7 @@ use core::time::Duration;
 pub(crate) use dentry::Dentry;
 use inherit_methods_macro::inherit_methods;
 use mount::MountTreeCloneMode;
-pub(crate) use mount::{MNT_UNIQUE_ID_MIN, Mount, PerMountFlags};
+pub(crate) use mount::{MNT_UNIQUE_ID_MIN, Mount, PerMountFlags, WriteAccess};
 pub(in crate::fs) use mount::{RecyclableMountId, UniqueMountId};
 pub(crate) use mount_namespace::MountNamespace;
 pub(crate) use mount_propagation::MountPropType;
@@ -79,7 +79,7 @@ impl Path {
         debug_assert_ne!(type_, InodeType::SymLink);
 
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
-        self.check_dir_entry_mutation()?;
+        let _write_access = self.check_dir_entry_mutation()?;
         let new_child_dentry = dir_dentry.create_child(name, || {
             dir_dentry.inode().create(&dir_dentry, name, type_, mode)
         })?;
@@ -97,7 +97,7 @@ impl Path {
         mode: InodeMode,
     ) -> Result<Self> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
-        self.check_dir_entry_mutation()?;
+        let _write_access = self.check_dir_entry_mutation()?;
         let new_child_dentry = dir_dentry.create_child(name, || {
             dir_dentry
                 .inode()
@@ -126,7 +126,7 @@ impl Path {
         hard_linkability: HardLinkability,
     ) -> Result<Self> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
-        self.check_dir_entry_mutation()?;
+        let _write_access = self.check_dir_entry_mutation()?;
         let tmp_inode = self
             .inode()
             .create_tmpfile(&self.dentry, mode, hard_linkability)?;
@@ -313,10 +313,17 @@ impl Path {
             .check_permission(Permission::MAY_EXEC | Permission::MAY_CHDIR)
     }
 
-    /// Checks whether the path is on a writable mount and filesystem.
+    /// Gets write access to the mount and file system of this path, failing with `EROFS`
+    /// when either is read-only.
     ///
-    /// Every operation that writes to the file system calls this first and fails with
-    /// `EROFS` on a read-only mount (Linux `mnt_want_write()`).
+    /// Every operation that writes to the file system holds the returned guard while it
+    /// writes, so that neither can become read-only in the meantime.
+    pub(crate) fn get_write_access(&self) -> Result<WriteAccess> {
+        self.mount.get_write_access()
+    }
+
+    /// Checks whether the path is on a writable mount and file system, without getting
+    /// write access (Linux `__mnt_is_readonly()`).
     pub(crate) fn check_mount_writable(&self) -> Result<()> {
         if self.mount.flags().contains(PerMountFlags::RDONLY)
             || self.fs().flags().contains(FsFlags::RDONLY)
@@ -327,11 +334,12 @@ impl Path {
         Ok(())
     }
 
-    /// Checks whether a directory entry may be modified in this directory.
-    fn check_dir_entry_mutation(&self) -> Result<()> {
-        self.check_mount_writable()?;
+    /// Gets write access for modifying a directory entry in this directory.
+    fn check_dir_entry_mutation(&self) -> Result<WriteAccess> {
+        let write_access = self.get_write_access()?;
         self.inode()
-            .check_permission(Permission::MAY_WRITE | Permission::MAY_EXEC)
+            .check_permission(Permission::MAY_WRITE | Permission::MAY_EXEC)?;
+        Ok(write_access)
     }
 
     /// Checks whether an inode may be used as the source of a hard link.
@@ -774,7 +782,7 @@ impl Path {
     /// Creates a `Path` by making an inode of the `type_` with the `mode`.
     pub(crate) fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Self> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
-        self.check_dir_entry_mutation()?;
+        let _write_access = self.check_dir_entry_mutation()?;
         let inner = dir_dentry.mknod(name, mode, type_)?;
         Ok(Self::new(self.mount.clone(), inner))
     }
@@ -787,21 +795,21 @@ impl Path {
 
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         old.check_hardlink_source()?;
-        self.check_dir_entry_mutation()?;
+        let _write_access = self.check_dir_entry_mutation()?;
         dir_dentry.link(&old.dentry, name)
     }
 
     /// Unlinks a name from the `Path`.
     pub(crate) fn unlink(&self, name: &str) -> Result<()> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
-        self.check_dir_entry_mutation()?;
+        let _write_access = self.check_dir_entry_mutation()?;
         dir_dentry.unlink(name)
     }
 
     /// Removes a directory by `rmdir()` the inner inode.
     pub(crate) fn rmdir(&self, name: &str) -> Result<()> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
-        self.check_dir_entry_mutation()?;
+        let _write_access = self.check_dir_entry_mutation()?;
         dir_dentry.rmdir(name)
     }
 
@@ -820,7 +828,7 @@ impl Path {
         let old_dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         let new_dir_dentry = new_dir.dentry.as_dir_dentry_or_err()?;
 
-        self.check_dir_entry_mutation()?;
+        let _write_access = self.check_dir_entry_mutation()?;
         if !Arc::ptr_eq(&self.dentry, &new_dir.dentry) {
             new_dir.check_dir_entry_mutation()?;
         }
@@ -849,17 +857,17 @@ impl Path {
     ) -> Result<usize>;
 
     pub(crate) fn set_mode(&self, mode: InodeMode) -> Result<()> {
-        self.check_mount_writable()?;
+        let _write_access = self.get_write_access()?;
         self.inode().set_mode(&self.dentry, mode)
     }
 
     pub(crate) fn set_owner(&self, uid: Uid) -> Result<()> {
-        self.check_mount_writable()?;
+        let _write_access = self.get_write_access()?;
         self.inode().set_owner(&self.dentry, uid)
     }
 
     pub(crate) fn set_group(&self, gid: Gid) -> Result<()> {
-        self.check_mount_writable()?;
+        let _write_access = self.get_write_access()?;
         self.inode().set_group(&self.dentry, gid)
     }
 
@@ -877,7 +885,7 @@ impl Path {
 
     /// Resizes the file.
     pub(crate) fn resize(&self, size: usize) -> Result<()> {
-        self.check_mount_writable()?;
+        let _write_access = self.get_write_access()?;
         self.inode().check_permission(Permission::MAY_WRITE)?;
         self.resize_unchecked_access(size)
     }
@@ -897,7 +905,7 @@ impl Path {
         flags: XattrSetFlags,
         ctx: &Context,
     ) -> Result<()> {
-        self.check_mount_writable()?;
+        let _write_access = self.get_write_access()?;
         let inode = self.inode();
         if name.full_name() == xattr::SECURITY_CAPABILITY_XATTR_NAME {
             capable_modify_file_cap(inode.as_ref(), ctx)?;
@@ -916,7 +924,7 @@ impl Path {
 
     /// Removes an xattr of the file.
     pub(crate) fn remove_xattr(&self, name: XattrName, ctx: &Context) -> Result<()> {
-        self.check_mount_writable()?;
+        let _write_access = self.get_write_access()?;
         let inode = self.inode();
         if name.full_name() == xattr::SECURITY_CAPABILITY_XATTR_NAME {
             capable_modify_file_cap(inode.as_ref(), ctx)?;

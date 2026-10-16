@@ -13,7 +13,7 @@ use crate::{
         pseudofs::AnonDeviceId,
         utils::systree_inode::SysTreeInodeTy,
         vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+            file_system::{FileSystem, FsEventSubscriberStats, FsWriteState, SuperBlock},
             inode::Inode,
             registry::{FsCreationCtx, FsProperties, FsType},
         },
@@ -26,6 +26,8 @@ pub(super) struct CgroupFs {
     _anon_device_id: AnonDeviceId,
     sb: SuperBlock,
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
 }
 
 // Magic number for cgroupfs v2 (taken from Linux)
@@ -50,6 +52,7 @@ impl CgroupFs {
             _anon_device_id: anon_device_id,
             sb,
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            write_state: FsWriteState::new(),
         })
     }
 }
@@ -79,6 +82,10 @@ impl FileSystem for CgroupFs {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 }
 

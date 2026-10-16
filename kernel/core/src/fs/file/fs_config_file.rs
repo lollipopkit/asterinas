@@ -233,7 +233,7 @@ impl FsConfigFile {
         let fs = fs.clone();
 
         let data = (!config.extra_options.is_empty()).then_some(config.extra_options.as_str());
-        let result = fs.set_fs_flags(config.flags, data, ctx);
+        let result = fs.reconfigure(config.flags, data, ctx);
         if let Err(err) = result {
             config.state = FsConfigState::Failed;
             return Err(err);

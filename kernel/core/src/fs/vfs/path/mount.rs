@@ -17,7 +17,7 @@ use crate::{
     fs::{
         file::InodeType,
         vfs::{
-            file_system::{FileSystem, FsFlags},
+            file_system::{FileSystem, FsFlags, WriterCount},
             path::{
                 Path,
                 dentry::{Dentry, DentryKey},
@@ -63,6 +63,8 @@ pub(crate) struct Mount {
     propagation: RwLock<MountPropagation>,
     /// The flags of this mount.
     flags: AtomicPerMountFlags,
+    /// Writers through this mount.
+    writers: WriterCount,
     /// Reference to self.
     this: Weak<Self>,
 }
@@ -166,6 +168,7 @@ impl Mount {
             mnt_ns,
             propagation: RwLock::new(MountPropagation::default()),
             flags: AtomicPerMountFlags::new(flags),
+            writers: WriterCount::new(),
             this: weak_self.clone(),
         });
         // `upgrade` returns `None` for pseudo mounts (no namespace) and for
@@ -293,6 +296,7 @@ impl Mount {
             mnt_ns: new_ns.clone(),
             propagation: RwLock::new(propagation),
             flags: AtomicPerMountFlags::new(self.flags.load(Ordering::Relaxed)),
+            writers: WriterCount::new(),
             this: weak_self.clone(),
         });
         if let Some(ns) = mount.mnt_ns.upgrade() {
@@ -710,7 +714,7 @@ impl Mount {
         _topology: &mut MountTopology,
     ) -> Result<()> {
         if let Some(flags) = fs_flags {
-            self.fs.set_fs_flags(flags, data, ctx)?;
+            self.fs.reconfigure(flags, data, ctx)?;
         }
 
         // The logics here are consistent with Linux.
@@ -724,15 +728,21 @@ impl Mount {
 
         let need_inherit_atime = !mount_flags.intersects(ATIME_MASK | PerMountFlags::NODIRATIME);
 
-        if need_inherit_atime {
-            let old_flags = self.flags.load(Ordering::Relaxed);
-            let new_flags = mount_flags | (old_flags & ATIME_MASK);
-            self.flags.store(new_flags, Ordering::Relaxed);
+        let old_flags = self.flags.load(Ordering::Relaxed);
+        let new_flags = if need_inherit_atime {
+            mount_flags | (old_flags & ATIME_MASK)
         } else {
-            self.flags.store(mount_flags, Ordering::Relaxed);
+            mount_flags
+        };
+        let store = || {
+            self.flags.store(new_flags, Ordering::Relaxed);
+            Ok(())
+        };
+        if new_flags.contains(PerMountFlags::RDONLY) && !old_flags.contains(PerMountFlags::RDONLY) {
+            self.writers.make_read_only(store)
+        } else {
+            store()
         }
-
-        Ok(())
     }
 
     /// Gets the parent mount node if any.
@@ -767,6 +777,22 @@ impl Mount {
     /// Gets the associated FS.
     pub(crate) fn fs(&self) -> &Arc<dyn FileSystem> {
         &self.fs
+    }
+
+    /// Gets write access to this mount and its file system.
+    pub(super) fn get_write_access(&self) -> Result<WriteAccess> {
+        self.writers
+            .add(|| self.flags().contains(PerMountFlags::RDONLY))?;
+        if let Err(err) = self
+            .fs
+            .write_state()
+            .writers()
+            .add(|| self.fs.flags().contains(FsFlags::RDONLY))
+        {
+            self.writers.remove();
+            return Err(err);
+        }
+        Ok(WriteAccess { mount: self.this() })
     }
 
     /// Gets the associated mount flags.
@@ -840,6 +866,23 @@ impl Drop for Mount {
             ns.deregister_mount(self.id.unique_id());
         }
         // The recyclable ID is returned to the pool by `MountId`'s `Drop`.
+    }
+}
+
+/// Write access to a mount and its file system, which keeps either from becoming read-only.
+///
+/// An operation that writes holds it for its duration, and a file opened for writing holds
+/// it until the file is closed.
+///
+/// Reference: Linux `mnt_want_write()` and `mnt_drop_write()`.
+pub(crate) struct WriteAccess {
+    mount: Arc<Mount>,
+}
+
+impl Drop for WriteAccess {
+    fn drop(&mut self) {
+        self.mount.fs.write_state().writers().remove();
+        self.mount.writers.remove();
     }
 }
 

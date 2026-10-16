@@ -83,6 +83,29 @@ FN_TEST(readonly_bind_mount_rejects_writes)
 }
 END_TEST()
 
+FN_TEST(remount_readonly_fails_with_writers)
+{
+	int fd;
+
+	TEST_SUCC(
+		mount_block_device(block_device_fd, MOUNT_DIR, "ext2", 0));
+	fd = TEST_SUCC(open(FILE_PATH, O_WRONLY));
+
+	/* A file open for writing keeps both the file system and the mount writable. */
+	TEST_ERRNO(mount(NULL, MOUNT_DIR, NULL, MS_REMOUNT | MS_RDONLY, NULL),
+		   EBUSY);
+	TEST_ERRNO(mount(NULL, MOUNT_DIR, NULL,
+			 MS_REMOUNT | MS_BIND | MS_RDONLY, NULL),
+		   EBUSY);
+	TEST_RES(write(fd, "x", 1), _ret == 1);
+
+	TEST_SUCC(close(fd));
+	TEST_SUCC(mount(NULL, MOUNT_DIR, NULL, MS_REMOUNT | MS_RDONLY, NULL));
+	TEST_ERRNO(open(FILE_PATH, O_WRONLY), EROFS);
+	TEST_SUCC(umount_block_device(MOUNT_DIR));
+}
+END_TEST()
+
 FN_SETUP(cleanup)
 {
 	CHECK(mount_block_device(block_device_fd, MOUNT_DIR, "ext2", 0));
