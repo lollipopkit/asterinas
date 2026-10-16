@@ -51,7 +51,17 @@ struct agent_ctl_tct_effects {
 
 #define AGENT_CTL_TCT_EFFECTS _IOWR(0xA7, 4, struct agent_ctl_tct_effects)
 #define AGENT_CTL_TCT_RELEASE _IOW(0xA7, 5, uint64_t)
-#define AGENT_CTL_TCT_COMMIT _IOW(0xA7, 6, uint64_t)
+struct agent_ctl_tct_commit {
+	uint64_t id;
+	uint32_t flags;
+	uint32_t reserved;
+	uint64_t epoch;
+};
+
+#define AGENT_CTL_TCT_COMMIT_HOLD (1 << 0)
+
+#define AGENT_CTL_TCT_COMMIT _IOWR(0xA7, 6, struct agent_ctl_tct_commit)
+#define AGENT_CTL_TCT_COMMIT_DONE _IO(0xA7, 7)
 
 #define NOBODY_UID 65534
 
@@ -109,9 +119,19 @@ static int tct_release(uint64_t id)
 	return ioctl(ctl_fd, AGENT_CTL_TCT_RELEASE, &id);
 }
 
+/* Commits the TCT through `fd`, and stores the outcome in `commit`. */
+static int tct_commit_with(int fd, uint64_t id, uint32_t flags,
+			   struct agent_ctl_tct_commit *commit)
+{
+	*commit = (struct agent_ctl_tct_commit){ .id = id, .flags = flags };
+	return ioctl(fd, AGENT_CTL_TCT_COMMIT, commit);
+}
+
 static int tct_commit(uint64_t id)
 {
-	return ioctl(ctl_fd, AGENT_CTL_TCT_COMMIT, &id);
+	struct agent_ctl_tct_commit commit;
+
+	return tct_commit_with(ctl_fd, id, 0, &commit);
 }
 
 /* Runs the statements in a child that begins a TCT, and returns the TCT's ID. */
@@ -602,6 +622,64 @@ FN_TEST(commit_waits_for_running_tcts)
 	TEST_SUCC(tct_commit(running));
 	TEST_SUCC(tct_release(running));
 	TEST_SUCC(tct_release(ended));
+
+	alarm_action.sa_handler = SIG_DFL;
+	TEST_SUCC(sigaction(SIGALRM, &alarm_action, NULL));
+}
+END_TEST()
+
+FN_TEST(commit_hold)
+{
+	struct sigaction alarm_action = { .sa_handler = handle_alarm };
+	struct agent_ctl_tct_commit commit;
+	uint64_t first, second, nr_live, epoch;
+	int fd;
+
+	TEST_SUCC(sigaction(SIGALRM, &alarm_action, NULL));
+	first = IN_TCT({});
+	second = IN_TCT({});
+	TEST_RES(tct_end(first, &nr_live), _ret == 0);
+	TEST_RES(tct_end(second, &nr_live), _ret == 0);
+
+	TEST_ERRNO(tct_commit_with(ctl_fd, first, 2, &commit), EINVAL);
+	commit = (struct agent_ctl_tct_commit){ .id = first, .reserved = 1 };
+	TEST_ERRNO(ioctl(ctl_fd, AGENT_CTL_TCT_COMMIT, &commit), EINVAL);
+	TEST_ERRNO(ioctl(ctl_fd, AGENT_CTL_TCT_COMMIT_DONE), EINVAL);
+
+	// The commit covers both TCTs and holds the gate.
+	TEST_RES(tct_commit_with(ctl_fd, first, AGENT_CTL_TCT_COMMIT_HOLD,
+				 &commit),
+		 _ret == 0 && commit.flags == AGENT_CTL_TCT_COMMIT_HOLD &&
+			 commit.epoch > 0);
+	epoch = commit.epoch;
+	TEST_ERRNO(tct_commit(second), EBUSY);
+
+	// No TCT begins while the gate is held.
+	IN_CHILD({
+		alarm(1);
+		TEST_ERRNO(tct_begin(), EINTR);
+	});
+
+	TEST_SUCC(ioctl(ctl_fd, AGENT_CTL_TCT_COMMIT_DONE));
+	TEST_ERRNO(ioctl(ctl_fd, AGENT_CTL_TCT_COMMIT_DONE), EINVAL);
+	TEST_RES(tct_commit_with(ctl_fd, second, AGENT_CTL_TCT_COMMIT_HOLD,
+				 &commit),
+		 _ret == 0 && commit.flags == 0 && commit.epoch == epoch);
+	TEST_SUCC(tct_release(first));
+	TEST_SUCC(tct_release(second));
+
+	// Closing the file opens the gate.
+	first = IN_TCT({});
+	TEST_RES(tct_end(first, &nr_live), _ret == 0);
+	fd = TEST_SUCC(open(AGENT_CTL_DEVICE, O_RDONLY));
+	TEST_RES(tct_commit_with(fd, first, AGENT_CTL_TCT_COMMIT_HOLD, &commit),
+		 _ret == 0 && commit.flags == AGENT_CTL_TCT_COMMIT_HOLD &&
+			 commit.epoch > epoch);
+	TEST_SUCC(close(fd));
+	second = IN_TCT({});
+	TEST_RES(tct_end(second, &nr_live), _ret == 0);
+	TEST_SUCC(tct_release(first));
+	TEST_SUCC(tct_release(second));
 
 	alarm_action.sa_handler = SIG_DFL;
 	TEST_SUCC(sigaction(SIGALRM, &alarm_action, NULL));
