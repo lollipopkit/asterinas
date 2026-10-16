@@ -152,7 +152,7 @@ fn vfs_utimes(path: &Path, times: Option<TimeSpecPair>) -> Result<SyscallReturn>
         }
     };
 
-    path.check_mount_writable()?;
+    let _write_access = path.get_write_access()?;
     path.set_atime(atime);
     path.set_mtime(mtime);
     path.set_ctime(ctime);

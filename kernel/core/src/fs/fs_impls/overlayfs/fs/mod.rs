@@ -25,7 +25,7 @@ use crate::{
             real::{RealObject, RealObjectStack},
         },
         vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, FsFlags, SuperBlock},
+            file_system::{FileSystem, FsEventSubscriberStats, FsFlags, FsWriteState, SuperBlock},
             inode::Inode,
         },
     },
@@ -41,6 +41,8 @@ pub(super) struct OverlayFs {
     whiteout_cache: WhiteoutCache,
     inodes: InodeCache,
     fs_event_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
     self_weak: Weak<OverlayFs>,
 }
 
@@ -144,5 +146,9 @@ impl FileSystem for OverlayFs {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_stats
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 }

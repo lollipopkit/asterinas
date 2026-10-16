@@ -12,7 +12,7 @@ use crate::fs::{
     pseudofs::AnonDeviceId,
     utils::systree_inode::SysTreeInodeTy,
     vfs::{
-        file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+        file_system::{FileSystem, FsEventSubscriberStats, FsWriteState, SuperBlock},
         inode::Inode,
         registry::{FsCreationCtx, FsProperties, FsType},
     },
@@ -29,6 +29,8 @@ pub(crate) struct ConfigFs {
     sb: SuperBlock,
     root: Arc<dyn Inode>,
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
 }
 
 // Magic number for `ConfigFs` (taken from Linux).
@@ -55,6 +57,7 @@ impl ConfigFs {
             sb,
             root: root_inode,
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            write_state: FsWriteState::new(),
         })
     }
 }
@@ -79,6 +82,10 @@ impl FileSystem for ConfigFs {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 }
 

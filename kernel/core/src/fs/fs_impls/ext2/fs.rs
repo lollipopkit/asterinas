@@ -33,7 +33,7 @@ use super::{
 use crate::{
     fs::{
         ext2::utils,
-        vfs::file_system::{AtomicFsFlags, FsEventSubscriberStats, FsFlags},
+        vfs::file_system::{AtomicFsFlags, FsEventSubscriberStats, FsFlags, FsWriteState},
     },
     process::{Gid, UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
     security::lsm::hooks as lsm_hooks,
@@ -72,6 +72,8 @@ pub(crate) struct Ext2 {
     flags: AtomicFsFlags,
     /// FS event stats for VFS.
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
     /// Per-filesystem inode generation counter.
     next_generation: AtomicU32,
     /// Weak self reference for inode back-pointers.
@@ -192,6 +194,7 @@ impl Ext2 {
             mount_options,
             flags: AtomicFsFlags::new(flags),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            write_state: FsWriteState::new(),
             next_generation: AtomicU32::new(utils::duration_to_ext2_secs(utils::now())),
             self_ref: weak_self.clone(),
         });
@@ -240,11 +243,17 @@ impl Ext2 {
     fn restore_mount_state(&self, update_mtime: bool) -> Result<()> {
         self.sync_all()?;
         let mut sb = self.super_block.write();
+        let old_sb = **sb;
         sb.set_state(*self.mount_state.lock());
         if update_mtime {
             sb.set_mtime(utils::now());
         }
-        self.write_metadata(&mut sb)
+        let result = self.write_metadata(&mut sb);
+        if result.is_err() {
+            // The volume stays marked in use on disk, so keep it so in memory.
+            **sb = old_sb;
+        }
+        result
     }
 
     /// Switches between read-only and read-write, keeping the on-disk state consistent.
@@ -349,6 +358,11 @@ impl Ext2 {
     /// Returns the fs event subscriber stats.
     pub(super) fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    /// Returns the writers across all mounts.
+    pub(super) fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 
     /// Returns the root inode.
@@ -966,6 +980,20 @@ mod test {
         );
         assert!(f.ext2.super_block().state().contains(FsState::VALID));
         assert!(!f.ext2.super_block().is_dirty());
+        assert_eq!(disk_super_block(&f.disk).as_bytes(), before.as_bytes());
+    }
+
+    #[ktest]
+    fn failed_ro_remount_stays_writable() {
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+        let before = disk_super_block(&f.disk);
+
+        f.disk.set_fail_writes(true);
+        assert_errno!(f.ext2.remount(FsFlags::RDONLY), Errno::EIO);
+        f.disk.set_fail_writes(false);
+
+        assert!(!f.ext2.fs_flags().contains(FsFlags::RDONLY));
+        assert!(!f.ext2.super_block().state().contains(FsState::VALID));
         assert_eq!(disk_super_block(&f.disk).as_bytes(), before.as_bytes());
     }
 

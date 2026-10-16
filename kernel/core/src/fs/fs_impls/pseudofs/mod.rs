@@ -43,7 +43,7 @@ use crate::{
         file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags, mkmod},
         utils::NAME_MAX,
         vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+            file_system::{FileSystem, FsEventSubscriberStats, FsWriteState, SuperBlock},
             inode::{Extension, FileOps, Inode, Metadata},
             path::Dentry,
         },
@@ -69,6 +69,8 @@ pub(crate) struct NaivePseudoFs {
     root: Arc<dyn Inode>,
     inode_allocator: AtomicU64,
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
 }
 
 impl FileSystem for NaivePseudoFs {
@@ -91,6 +93,10 @@ impl FileSystem for NaivePseudoFs {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 }
 
@@ -121,6 +127,7 @@ impl NaivePseudoFs {
                 )),
                 inode_allocator: AtomicU64::new(ROOT_INO + 1),
                 fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+                write_state: FsWriteState::new(),
             })
         })
     }

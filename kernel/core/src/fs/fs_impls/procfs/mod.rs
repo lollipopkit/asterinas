@@ -28,7 +28,7 @@ use crate::{
         pseudofs::AnonDeviceId,
         utils::NAME_MAX,
         vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+            file_system::{FileSystem, FsEventSubscriberStats, FsWriteState, SuperBlock},
             inode::{Inode, RevalidationPolicy},
             registry::{FsCreationCtx, FsProperties, FsType},
         },
@@ -76,6 +76,8 @@ struct ProcFs {
     root: Arc<dyn Inode>,
     inode_allocator: AtomicU64,
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
 }
 
 impl ProcFs {
@@ -88,6 +90,7 @@ impl ProcFs {
             root: RootDirOps::new_inode(weak_fs.clone(), &sb),
             inode_allocator: AtomicU64::new(PROC_ROOT_INO + 1),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            write_state: FsWriteState::new(),
         })
     }
 
@@ -115,6 +118,10 @@ impl FileSystem for ProcFs {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 }
 

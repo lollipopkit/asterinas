@@ -16,7 +16,7 @@ use crate::{
         pseudofs::AnonDeviceId,
         utils::NAME_MAX,
         vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+            file_system::{FileSystem, FsEventSubscriberStats, FsWriteState, SuperBlock},
             inode::Inode,
             registry::{FsCache, FsCreationCtx, FsProperties, FsType},
         },
@@ -84,6 +84,8 @@ pub(super) struct VirtioFs {
     session: Arc<FuseSession>,
     inode_cache: InodeCache,
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Write state shared by all mounts.
+    write_state: FsWriteState,
 }
 
 impl VirtioFs {
@@ -119,6 +121,7 @@ impl VirtioFs {
                 session,
                 inode_cache,
                 fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+                write_state: FsWriteState::new(),
             }
         }))
     }
@@ -196,5 +199,9 @@ impl FileSystem for VirtioFs {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    fn write_state(&self) -> &FsWriteState {
+        &self.write_state
     }
 }

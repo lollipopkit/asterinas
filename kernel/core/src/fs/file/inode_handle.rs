@@ -15,7 +15,7 @@ use crate::{
         vfs::{
             inode::{FallocMode, FileOps},
             inode_ext::InodeExt,
-            path::Path,
+            path::{Path, WriteAccess},
             range_lock::{RangeLockItem, RangeLockOwner, RangeLockType},
             xattr::clear_file_priv,
         },
@@ -32,6 +32,8 @@ pub(crate) struct InodeHandle {
     /// and `ioctl` will be provided by the per-open file object instead of `path`.
     open_file: Option<Box<dyn PerOpenFileOps>>,
     offset: Mutex<usize>,
+    /// Write access held while the file is open for writing (Linux `FMODE_WRITER`).
+    _write_access: Option<WriteAccess>,
     /// Path and common states of the handle.
     //
     // This field is placed last so that its `Path` keeps the corresponding filesystem alive
@@ -65,6 +67,16 @@ impl InodeHandle {
         status_flags: StatusFlags,
     ) -> Result<Self> {
         let inode = path.inode();
+        // Writing to a device, FIFO or socket does not write to its file system.
+        let write_access = if access_mode.is_writable()
+            && !status_flags.contains(StatusFlags::O_PATH)
+            && !inode.type_().is_special_file()
+            && inode.type_() != InodeType::Dir
+        {
+            Some(path.get_write_access()?)
+        } else {
+            None
+        };
         let open_file = if status_flags.contains(StatusFlags::O_PATH) {
             // The file is opened with `O_PATH`. We follow Linux to report `O_RDONLY` here (e.g.,
             // in `/proc/[pid]/fdinfo/[n]`).
@@ -81,6 +93,7 @@ impl InodeHandle {
         Ok(Self {
             open_file,
             offset: Mutex::new(0),
+            _write_access: write_access,
             common: FileCommon::new(path, access_mode, status_flags),
         })
     }
