@@ -4,10 +4,11 @@
 //!
 //! An agent shim inside the VM uses it to mark tool-call boundaries. To run a tool call,
 //! the shim forks a child that begins a TCT and then executes the tool; after the tool
-//! exits, the shim ends the TCT, reads its effects and releases it. See [`Tct`] for how
+//! exits, the shim ends the TCT, reads its effects, commits its data (possibly while the
+//! model handles the tool result), and releases it. See [`Tct`] for how
 //! processes are attributed to a TCT.
 //!
-//! Controlling a TCT (beginning, ending, reading its effects and releasing it) requires
+//! Controlling a TCT (beginning, ending, reading its effects, committing and releasing it) requires
 //! `CAP_SYS_ADMIN`, and is refused for processes that are already in a TCT, so a tool cannot
 //! leave its TCT or control it from the inside.
 
@@ -145,9 +146,11 @@ impl PerOpenFileOps for AgentCtlFile {
                 let mut end: TctEndArgs = cmd.read()?;
                 check_controller()?;
                 let tct = Tct::get(end.id)?;
-                tct.end()?;
+                // Write the output first, so a failed write does not leave the TCT ended
+                // without the caller knowing it.
                 end.nr_live_processes = tct.nr_live_processes() as u64;
                 cmd.write(&end)?;
+                tct.end()?;
                 Ok(0)
             }
             cmd @ TctGet => {
@@ -168,6 +171,12 @@ impl PerOpenFileOps for AgentCtlFile {
                     args_ptr.vm().write_bytes(args.buf as usize, &effects)?;
                     Ok(0)
                 })
+            }
+            cmd @ TctCommit => {
+                let id = cmd.read()?;
+                check_controller()?;
+                Tct::get(id)?.commit()?;
+                Ok(0)
             }
             cmd @ TctRelease => {
                 let id = cmd.read()?;
@@ -226,6 +235,7 @@ mod ioctl_defs {
     pub(super) type TctGet     = ioc!(AGENT_CTL_TCT_GET,     0xA7, 3, OutData<u64>);
     pub(super) type TctEffects = ioc!(AGENT_CTL_TCT_EFFECTS, 0xA7, 4, InOutData<TctEffectsArgs>);
     pub(super) type TctRelease = ioc!(AGENT_CTL_TCT_RELEASE, 0xA7, 5, InData<u64>);
+    pub(super) type TctCommit  = ioc!(AGENT_CTL_TCT_COMMIT,  0xA7, 6, InData<u64>);
 }
 
 pub(crate) fn init() -> Result<()> {

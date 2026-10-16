@@ -34,8 +34,9 @@ pub(crate) struct Tct {
     flags: TctFlags,
     nr_live_processes: AtomicUsize,
     has_ended: AtomicBool,
-    /// Whether the data of the TCT is durable, which is only false for a TCT with
-    /// [`TctFlags::DEFER_SYNC`] that has not been committed by [`Tct::end`].
+    /// Whether the TCT can be released without losing deferred sync requests, which is only
+    /// false for a TCT with [`TctFlags::DEFER_SYNC`] that has not been committed by
+    /// [`Tct::commit`].
     is_committed: AtomicBool,
     effects: Mutex<Effects>,
 }
@@ -141,21 +142,27 @@ impl Tct {
 
     /// Ends the TCT.
     ///
-    /// Returns `EINVAL` if the TCT has already ended and been committed.
+    /// Processes that outlive the TCT have their sync requests served directly from then on.
+    /// The data of the TCT becomes durable once it is committed with [`Self::commit`], which
+    /// the agent shim can do while the model handles the result of the tool call.
     ///
-    /// With [`TctFlags::DEFER_SYNC`], all the file systems are written back and flushed, so
-    /// the data of the TCT is durable on return. Processes that outlive the TCT have their
-    /// sync requests served directly from then on. If committing the data fails, the TCT
-    /// stays ended but uncommitted, and ending it again retries the commit.
+    /// Returns `EINVAL` if the TCT has already ended.
     pub(crate) fn end(&self) -> Result<()> {
-        // Stop deferring sync requests first, so that data synced by the processes that outlive
-        // the TCT is not left out of the commit.
-        let has_ended = self.has_ended.swap(true, Ordering::AcqRel);
-        if self.is_committed.load(Ordering::Acquire) {
-            if has_ended {
-                return_errno_with_message!(Errno::EINVAL, "the TCT has already ended");
-            }
-            return Ok(());
+        if self.has_ended.swap(true, Ordering::AcqRel) {
+            return_errno_with_message!(Errno::EINVAL, "the TCT has already ended");
+        }
+        Ok(())
+    }
+
+    /// Commits the data of the TCT, writing back and flushing all the file systems, so that
+    /// the data is durable on return.
+    ///
+    /// A failed commit can be retried. Returns `EINVAL` if the TCT has not ended.
+    pub(crate) fn commit(&self) -> Result<()> {
+        // The commit starts after the TCT has ended, so it covers all the sync requests that the
+        // TCT deferred.
+        if !self.has_ended.load(Ordering::Acquire) {
+            return_errno_with_message!(Errno::EINVAL, "the TCT has not ended");
         }
         sync_all_file_systems()?;
         self.is_committed.store(true, Ordering::Release);
@@ -164,7 +171,8 @@ impl Tct {
 
     /// Releases the TCT with the given ID, after which it can no longer be found by its ID.
     ///
-    /// Returns `EBUSY` if the TCT has not ended, or its data has not been committed.
+    /// Returns `EBUSY` if the TCT has not ended, or if it deferred sync requests and has not
+    /// been committed.
     pub(crate) fn release(id: u64) -> Result<()> {
         let mut tcts = TCTS.lock();
         let Some(tct) = tcts.get(&id) else {
