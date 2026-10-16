@@ -1057,6 +1057,19 @@ mod test {
     }
 
     #[ktest]
+    fn sync_flushes_device_once() {
+        let (f, root) = default_fixture();
+        for i in 0..8 {
+            create_file(&root, &alloc::format!("file{i}"));
+        }
+        let fs: &dyn FileSystemTrait = f.ext2.as_ref();
+
+        let nr_flushes = f.disk.flush_count();
+        fs.sync().unwrap();
+        assert_eq!(f.disk.flush_count(), nr_flushes + 1);
+    }
+
+    #[ktest]
     fn freeze_keeps_volume_in_use_with_open_unlinked_inode() {
         let (f, root) = default_fixture();
         let file = create_file(&root, "unlinked");

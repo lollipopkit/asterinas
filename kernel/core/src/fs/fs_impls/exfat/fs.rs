@@ -11,7 +11,7 @@ use core::{
 
 use aster_block::{
     BlockDevice,
-    bio::{BioCompleteFn, BioSegment},
+    bio::{BioCompleteFn, BioSegment, BioStatus},
     id::BlockId,
 };
 use device_id::DeviceId;
@@ -146,7 +146,7 @@ impl ExfatFs {
             if inode.is_deleted() {
                 inode.reclaim_space()?;
             } else {
-                inode.sync(SyncMode::Full)?;
+                inode.write_back(SyncMode::Full)?;
             }
         }
         self.inodes.write().remove(&hash);
@@ -155,6 +155,18 @@ impl ExfatFs {
 
     pub(super) fn insert_inode(&self, inode: Arc<ExfatInode>) -> Option<Arc<ExfatInode>> {
         self.inodes.write().insert(inode.hash_index(), inode)
+    }
+
+    /// Writes back all the cached metadata (e.g., the FAT and the allocation bitmap) and
+    /// flushes the device.
+    ///
+    /// Reference: Linux `sync_blockdev()` and `blkdev_issue_flush()` in `exfat_file_fsync()`.
+    pub(super) fn flush_meta_and_device(&self) -> Result<()> {
+        self.meta_cache.flush_range(0..self.fs_size())?;
+        if self.block_device().sync()? != BioStatus::Complete {
+            return_errno_with_message!(Errno::EIO, "failed to flush block device");
+        }
+        Ok(())
     }
 
     pub(super) fn sync_meta_at(&self, range: Range<usize>) -> Result<()> {
@@ -425,10 +437,9 @@ impl FileSystem for ExfatFs {
 
     fn sync(&self) -> Result<()> {
         for inode in self.inodes.read().values() {
-            inode.sync(SyncMode::Full)?;
+            inode.write_back(SyncMode::Full)?;
         }
-        self.meta_cache.flush_range(0..self.fs_size())?;
-        Ok(())
+        self.flush_meta_and_device()
     }
 
     fn root_inode(&self) -> Arc<dyn Inode> {
