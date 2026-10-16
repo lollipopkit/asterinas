@@ -34,7 +34,8 @@ use crate::{
     },
     prelude::*,
     process::{
-        Gid, Uid, UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread,
+        Effect, Gid, Tct, Uid, UserNamespace, credentials::capabilities::CapSet,
+        posix_thread::AsPosixThread,
     },
     security::lsm::hooks as lsm_hooks,
     time::clocks::RealTimeCoarseClock,
@@ -87,6 +88,7 @@ impl Path {
         let new_child_dentry = dir_dentry.create_child(name, || {
             dir_dentry.inode().create(&dir_dentry, name, type_, mode)
         })?;
+        self.record_child_effect(Effect::Write, name);
         Ok(Self::new(self.mount.clone(), new_child_dentry))
     }
 
@@ -107,6 +109,7 @@ impl Path {
                 .inode()
                 .create_symlink(&dir_dentry, name, target, mode)
         })?;
+        self.record_child_effect(Effect::Write, name);
         Ok(Self::new(self.mount.clone(), new_child_dentry))
     }
 
@@ -385,6 +388,51 @@ impl Path {
         }
 
         Ok(())
+    }
+
+    /// Returns the absolute path in the mount namespace, or `None` for a pseudo path.
+    ///
+    /// Unlike [`PathResolver::make_abs_path`], the result does not depend on the root
+    /// directory of the current process, and no lock is taken.
+    pub(crate) fn abs_path_in_mnt_ns(&self) -> Option<String> {
+        let mut components = Vec::new();
+        let mut current = self.clone();
+        loop {
+            if current.is_mount_root() {
+                let parent_mount = current.mount.parent().and_then(|parent| parent.upgrade());
+                match (parent_mount, current.mount.mountpoint()) {
+                    (Some(parent_mount), Some(mountpoint)) => {
+                        current = Self::new(parent_mount, mountpoint);
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+            let parent = current.dentry.parent()?;
+            components.push(current.name());
+            current = Self::new(current.mount.clone(), parent);
+        }
+
+        components.reverse();
+        Some(alloc::format!("/{}", components.join("/")))
+    }
+
+    /// Records an effect on this path for the TCT of the current process.
+    pub(crate) fn record_effect(&self, effect: Effect) {
+        Tct::record_current(effect, || self.abs_path_in_mnt_ns());
+    }
+
+    /// Records an effect on the child named `name` of this directory for the TCT of the
+    /// current process.
+    pub(crate) fn record_child_effect(&self, effect: Effect, name: &str) {
+        Tct::record_current(effect, || {
+            let mut path = self.abs_path_in_mnt_ns()?;
+            if path != "/" {
+                path.push('/');
+            }
+            path.push_str(name);
+            Some(path)
+        });
     }
 
     /// Gets write access for modifying a directory entry in this directory.
@@ -848,6 +896,7 @@ impl Path {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         let _write_access = self.check_dir_entry_mutation()?;
         let inner = dir_dentry.mknod(name, mode, type_)?;
+        self.record_child_effect(Effect::Write, name);
         Ok(Self::new(self.mount.clone(), inner))
     }
 
@@ -860,21 +909,27 @@ impl Path {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         old.check_hardlink_source()?;
         let _write_access = self.check_dir_entry_mutation()?;
-        dir_dentry.link(&old.dentry, name)
+        dir_dentry
+            .link(&old.dentry, name)
+            .inspect(|_| self.record_child_effect(Effect::Write, name))
     }
 
     /// Unlinks a name from the `Path`.
     pub(crate) fn unlink(&self, name: &str) -> Result<()> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         let _write_access = self.check_dir_entry_mutation()?;
-        dir_dentry.unlink(name)
+        dir_dentry
+            .unlink(name)
+            .inspect(|_| self.record_child_effect(Effect::Write, name))
     }
 
     /// Removes a directory by `rmdir()` the inner inode.
     pub(crate) fn rmdir(&self, name: &str) -> Result<()> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         let _write_access = self.check_dir_entry_mutation()?;
-        dir_dentry.rmdir(name)
+        dir_dentry
+            .rmdir(name)
+            .inspect(|_| self.record_child_effect(Effect::Write, name))
     }
 
     /// Renames a `Path` to the new `Path` by `rename()` the inner inode.
@@ -900,7 +955,12 @@ impl Path {
                 .check_permission(Permission::MAY_WRITE | Permission::MAY_EXEC)?;
         }
 
-        old_dir_dentry.rename(old_name, &new_dir_dentry, new_name, mode)
+        old_dir_dentry
+            .rename(old_name, &new_dir_dentry, new_name, mode)
+            .inspect(|_| {
+                self.record_child_effect(Effect::Write, old_name);
+                new_dir.record_child_effect(Effect::Write, new_name);
+            })
     }
 }
 
@@ -935,7 +995,9 @@ impl Path {
         if mode.has_set_gid() && !is_in_group_or_capable(self.group()?) {
             mode.remove(InodeMode::S_ISGID);
         }
-        self.inode().set_mode(&self.dentry, mode)
+        self.inode()
+            .set_mode(&self.dentry, mode)
+            .inspect(|_| self.record_effect(Effect::Write))
     }
 
     /// Changes the owner and the group, leaving `None` ones unchanged.
@@ -986,6 +1048,7 @@ impl Path {
         if uid.is_none() && gid.is_none() {
             inode.set_ctime(&self.dentry, RealTimeCoarseClock::get().read_time());
         }
+        self.record_effect(Effect::Write);
         Ok(())
     }
 
@@ -1012,7 +1075,9 @@ impl Path {
     pub(in crate::fs) fn resize_unchecked_access(&self, size: usize) -> Result<()> {
         let inode = self.inode();
         xattr::clear_file_priv(&self.dentry)?;
-        inode.resize(&self.dentry, size)
+        inode
+            .resize(&self.dentry, size)
+            .inspect(|_| self.record_effect(Effect::Write))
     }
 
     /// Sets an xattr of the file.
@@ -1030,7 +1095,9 @@ impl Path {
         } else {
             inode.check_permission(Permission::MAY_WRITE)?;
         }
-        inode.set_xattr(&self.dentry, name, value_reader, flags)
+        inode
+            .set_xattr(&self.dentry, name, value_reader, flags)
+            .inspect(|_| self.record_effect(Effect::Write))
     }
 
     /// Gets an xattr of the file.
@@ -1049,7 +1116,9 @@ impl Path {
         } else {
             inode.check_permission(Permission::MAY_WRITE)?;
         }
-        inode.remove_xattr(&self.dentry, name)
+        inode
+            .remove_xattr(&self.dentry, name)
+            .inspect(|_| self.record_effect(Effect::Write))
     }
 }
 

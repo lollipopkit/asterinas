@@ -15,6 +15,7 @@ use crate::{
         vfs::path::{AT_FDCWD, EmptyPathStr, FsPath, Path},
     },
     prelude::*,
+    process::Effect,
     time::{clocks::RealTimeCoarseClock, timespec_t, timeval_t},
 };
 
@@ -188,6 +189,7 @@ fn vfs_utimes(path: &Path, times: Option<TimeSpecPair>) -> Result<SyscallReturn>
     }
     path.set_ctime(now);
     fs::vfs::notify::on_attr_change(path);
+    path.record_effect(Effect::Write);
     Ok(SyscallReturn::Return(0))
 }
 

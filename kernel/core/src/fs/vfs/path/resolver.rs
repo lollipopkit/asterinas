@@ -16,7 +16,7 @@ use crate::{
     },
     prelude::*,
     process::{
-        credentials::capabilities::CapSet, pid_table::PidTable, posix_thread::AsPosixThread,
+        Effect, credentials::capabilities::CapSet, pid_table::PidTable, posix_thread::AsPosixThread,
     },
     security::lsm::hooks as lsm_hooks,
 };
@@ -754,6 +754,9 @@ impl PathResolver {
             let next_path = match self.lookup_at_path(&current_path, next_name) {
                 Ok(child) => child,
                 Err(e) => {
+                    if e.error() == Errno::ENOENT {
+                        current_path.record_child_effect(Effect::Missing, next_name);
+                    }
                     if next_is_tail && e.error() == Errno::ENOENT {
                         return Ok(LookupResult::AtParent(LookupParentResult::new(
                             current_path,

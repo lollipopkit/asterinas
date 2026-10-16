@@ -6,12 +6,15 @@
 //! the shim forks a child that begins a TCT and then executes the tool; after the tool
 //! exits, the shim ends the TCT. See [`Tct`] for how processes are attributed to a TCT.
 //!
-//! Beginning and ending a TCT require `CAP_SYS_ADMIN`, and are refused for processes that
-//! are already in a TCT, so a tool cannot leave its TCT or end it from the inside.
+//! Controlling a TCT (beginning, ending, reading its effects and releasing it) requires
+//! `CAP_SYS_ADMIN`, and is refused for processes that are already in a TCT, so a tool cannot
+//! leave its TCT or control it from the inside.
 
 use device_id::{DeviceId, MinorId};
+use ostd::mm::VmIo;
 
 use crate::{
+    context::current_userspace,
     device::{Device, DeviceType, registry::char},
     dispatch_ioctl,
     events::IoEvents,
@@ -101,7 +104,7 @@ impl PerOpenFileOps for AgentCtlFile {
         let posix_thread = current.as_posix_thread().unwrap();
         let process = posix_thread.process();
 
-        // Checks that the caller may begin or end a TCT.
+        // Checks that the caller may control a TCT.
         let check_controller = || {
             lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
                 UserNamespace::get_init_singleton().as_ref(),
@@ -124,13 +127,33 @@ impl PerOpenFileOps for AgentCtlFile {
             cmd @ TctEnd => {
                 let mut end: TctEndArgs = cmd.read()?;
                 check_controller()?;
-                let tct = Tct::end(end.id)?;
+                let tct = Tct::get(end.id)?;
+                tct.end()?;
                 end.nr_live_processes = tct.nr_live_processes() as u64;
                 cmd.write(&end)?;
                 Ok(0)
             }
             cmd @ TctGet => {
                 cmd.write(&process.tct().map_or(0, |tct| tct.id()))?;
+                Ok(0)
+            }
+            cmd @ TctEffects => {
+                let mut args: TctEffectsArgs = cmd.read()?;
+                check_controller()?;
+                let effects = Tct::get(args.id)?.export_effects();
+                let buf_len = args.len;
+                args.len = effects.len() as u64;
+                cmd.write(&args)?;
+                if (buf_len as usize) < effects.len() {
+                    return_errno_with_message!(Errno::ERANGE, "the buffer is too small");
+                }
+                current_userspace!().write_bytes(args.buf as Vaddr, &effects)?;
+                Ok(0)
+            }
+            cmd @ TctRelease => {
+                let id = cmd.read()?;
+                check_controller()?;
+                Tct::release(id)?;
                 Ok(0)
             }
             _ => return_errno_with_message!(Errno::ENOTTY, "the ioctl command is unknown"),
@@ -148,17 +171,35 @@ struct TctEndArgs {
     nr_live_processes: u64,
 }
 
+/// The argument of `AGENT_CTL_TCT_EFFECTS`.
+///
+/// The effects are written to `buf` in the format of [`Tct::export_effects`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod)]
+struct TctEffectsArgs {
+    /// The ID of the TCT (input).
+    id: u64,
+    /// The user buffer to write the effects to (input).
+    buf: u64,
+    /// The length of `buf` (input), and the length of the effects (output).
+    ///
+    /// If `buf` is too short, nothing is written to it and `ERANGE` is returned.
+    len: u64,
+}
+
 mod ioctl_defs {
-    use super::TctEndArgs;
+    use super::{TctEffectsArgs, TctEndArgs};
     use crate::{
         ioc,
-        util::ioctl::{InOutData, OutData},
+        util::ioctl::{InData, InOutData, OutData},
     };
 
     // TCT IDs start from 1; `AGENT_CTL_TCT_GET` returns 0 outside a TCT.
     pub(super) type TctBegin = ioc!(AGENT_CTL_TCT_BEGIN, 0xA7, 1, OutData<u64>);
     pub(super) type TctEnd   = ioc!(AGENT_CTL_TCT_END,   0xA7, 2, InOutData<TctEndArgs>);
     pub(super) type TctGet   = ioc!(AGENT_CTL_TCT_GET,   0xA7, 3, OutData<u64>);
+    pub(super) type TctEffects = ioc!(AGENT_CTL_TCT_EFFECTS, 0xA7, 4, InOutData<TctEffectsArgs>);
+    pub(super) type TctRelease = ioc!(AGENT_CTL_TCT_RELEASE, 0xA7, 5, InData<u64>);
 }
 
 pub(super) fn init_in_first_kthread() {

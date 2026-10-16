@@ -4,11 +4,15 @@
  * Regression tests for `/dev/agent_ctl` and tool-call transactions (TCTs).
  */
 
+#include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
@@ -26,6 +30,15 @@ struct agent_ctl_tct_end {
 #define AGENT_CTL_TCT_BEGIN _IOR(0xA7, 1, uint64_t)
 #define AGENT_CTL_TCT_END _IOWR(0xA7, 2, struct agent_ctl_tct_end)
 #define AGENT_CTL_TCT_GET _IOR(0xA7, 3, uint64_t)
+
+struct agent_ctl_tct_effects {
+	uint64_t id;
+	uint64_t buf;
+	uint64_t len;
+};
+
+#define AGENT_CTL_TCT_EFFECTS _IOWR(0xA7, 4, struct agent_ctl_tct_effects)
+#define AGENT_CTL_TCT_RELEASE _IOW(0xA7, 5, uint64_t)
 
 #define NOBODY_UID 65534
 
@@ -72,6 +85,31 @@ static int tct_end(uint64_t id, uint64_t *nr_live_processes)
 	*nr_live_processes = end.nr_live_processes;
 	return ret;
 }
+
+static int tct_release(uint64_t id)
+{
+	return ioctl(ctl_fd, AGENT_CTL_TCT_RELEASE, &id);
+}
+
+/* Runs the statements in a child that begins a TCT, and returns the TCT's ID. */
+#define IN_TCT(...)                                                            \
+	({                                                                     \
+		int __id_pipe[2];                                              \
+		uint64_t __id = 0;                                             \
+		TEST_SUCC(pipe(__id_pipe));                                    \
+		IN_CHILD({                                                     \
+			uint64_t __self_id = TEST_RES(tct_begin(), _ret != 0); \
+			TEST_RES(write(__id_pipe[1], &__self_id,               \
+				       sizeof(__self_id)),                     \
+				 _ret == sizeof(__self_id));                   \
+			__VA_ARGS__;                                           \
+		});                                                            \
+		TEST_RES(read(__id_pipe[0], &__id, sizeof(__id)),              \
+			 _ret == sizeof(__id));                                \
+		TEST_SUCC(close(__id_pipe[0]));                                \
+		TEST_SUCC(close(__id_pipe[1]));                                \
+		__id;                                                          \
+	})
 
 /*
  * When executed with `get <id>`, checks that the process is in the TCT `<id>`.
@@ -161,6 +199,11 @@ FN_TEST(begin_and_end)
 	TEST_ERRNO(tct_end(id, &nr_live), EINVAL);
 	TEST_RES(tct_get(), _ret == 0);
 
+	// An ended TCT is kept until it is released.
+	TEST_SUCC(tct_release(id));
+	TEST_ERRNO(tct_release(id), EINVAL);
+	TEST_ERRNO(tct_end(id, &nr_live), EINVAL);
+
 	// A new TCT gets a new ID.
 	IN_CHILD({ TEST_RES(tct_begin(), _ret > id); });
 }
@@ -207,8 +250,144 @@ FN_TEST(requires_cap_sys_admin)
 		TEST_SUCC(setuid(NOBODY_UID));
 		TEST_ERRNO(tct_begin(), EPERM);
 		TEST_ERRNO(tct_end(1, &nr_live), EPERM);
+		TEST_ERRNO(tct_release(1), EPERM);
 		TEST_RES(tct_get(), _ret == 0);
 		TEST_ERRNO(open(AGENT_CTL_DEVICE, O_RDONLY), EACCES);
 	});
+}
+END_TEST()
+
+#define EFFECT_DIR "/tmp/agent_ctl_effects"
+
+/* Returns whether `effects` has an entry tagged `tag` whose target is `target`. */
+static int has_effect(const char *effects, size_t len, char tag,
+		      const char *target)
+{
+	for (const char *p = effects; p < effects + len; p += strlen(p) + 1) {
+		if (p[0] == tag && strcmp(p + 1, target) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/* Returns whether `effects` has an entry tagged `tag` whose target ends with `suffix`. */
+static int has_effect_suffix(const char *effects, size_t len, char tag,
+			     const char *suffix)
+{
+	size_t suffix_len = strlen(suffix);
+
+	for (const char *p = effects; p < effects + len; p += strlen(p) + 1) {
+		size_t target_len = strlen(p + 1);
+		if (p[0] == tag && target_len >= suffix_len &&
+		    strcmp(p + 1 + target_len - suffix_len, suffix) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+FN_TEST(effects)
+{
+	static char effects[65536];
+	struct agent_ctl_tct_effects args;
+	uint64_t id, nr_live;
+	int fd;
+
+	CHECK_WITH(mkdir(EFFECT_DIR, 0755), _ret == 0 || errno == EEXIST);
+	CHECK(close(CHECK(open(EFFECT_DIR "/read", O_CREAT | O_WRONLY, 0644))));
+
+	id = IN_TCT({
+		char buf[1];
+		int fd = TEST_SUCC(open(EFFECT_DIR "/read", O_RDONLY));
+		TEST_SUCC(read(fd, buf, sizeof(buf)));
+		TEST_SUCC(close(fd));
+
+		TEST_SUCC(close(TEST_SUCC(
+			open(EFFECT_DIR "/created", O_CREAT | O_WRONLY, 0644))));
+		TEST_SUCC(rename(EFFECT_DIR "/created", EFFECT_DIR "/renamed"));
+		TEST_SUCC(unlink(EFFECT_DIR "/renamed"));
+		TEST_SUCC(mkdir(EFFECT_DIR "/dir", 0755));
+		TEST_SUCC(rmdir(EFFECT_DIR "/dir"));
+		TEST_SUCC(chmod(EFFECT_DIR "/read", 0644));
+
+		TEST_ERRNO(open(EFFECT_DIR "/missing", O_RDONLY), ENOENT);
+		TEST_ERRNO(access(EFFECT_DIR "/missing_dir/file", F_OK),
+			   ENOENT);
+
+		DIR *dir = opendir(EFFECT_DIR);
+		TEST_RES(dir != NULL, _ret);
+		while (readdir(dir) != NULL)
+			;
+		TEST_SUCC(closedir(dir));
+
+		char id_str[32];
+		snprintf(id_str, sizeof(id_str), "%llu",
+			 (unsigned long long)tct_get());
+		IN_CHILD({
+			execl("/proc/self/exe", "agent_ctl", "get", id_str,
+			      NULL);
+			_exit(2);
+		});
+
+		struct sockaddr_in addr = {
+			.sin_family = AF_INET,
+			.sin_port = htons(9),
+			.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+		};
+		int sk = TEST_SUCC(socket(AF_INET, SOCK_DGRAM, 0));
+		TEST_SUCC(connect(sk, (struct sockaddr *)&addr, sizeof(addr)));
+		addr.sin_port = htons(10);
+		TEST_SUCC(sendto(sk, "x", 1, 0, (struct sockaddr *)&addr,
+				 sizeof(addr)));
+		TEST_SUCC(close(sk));
+	});
+
+	// Effects of processes outside the TCT are not recorded.
+	fd = TEST_SUCC(open(EFFECT_DIR "/outside", O_CREAT | O_WRONLY, 0644));
+	TEST_SUCC(close(fd));
+	TEST_SUCC(unlink(EFFECT_DIR "/outside"));
+
+	// The effects stay available after the TCT ends.
+	TEST_RES(tct_end(id, &nr_live), _ret == 0 && nr_live == 0);
+
+	args = (struct agent_ctl_tct_effects){ .id = id, .buf = 0, .len = 0 };
+	TEST_ERRNO(ioctl(ctl_fd, AGENT_CTL_TCT_EFFECTS, &args), ERANGE);
+	TEST_RES(args.len, _ret > 0 && _ret <= sizeof(effects));
+	args.buf = (uint64_t)effects;
+	args.len = sizeof(effects);
+	TEST_RES(ioctl(ctl_fd, AGENT_CTL_TCT_EFFECTS, &args),
+		 _ret == 0 && args.len > 0 && effects[args.len - 1] == '\0');
+
+	size_t len = args.len;
+	TEST_RES(has_effect(effects, len, 'r', EFFECT_DIR "/read"), _ret);
+	TEST_RES(has_effect(effects, len, 'w', EFFECT_DIR "/read"), _ret);
+	TEST_RES(has_effect(effects, len, 'w', EFFECT_DIR "/created"), _ret);
+	TEST_RES(has_effect(effects, len, 'w', EFFECT_DIR "/renamed"), _ret);
+	TEST_RES(has_effect(effects, len, 'w', EFFECT_DIR "/dir"), _ret);
+	TEST_RES(has_effect(effects, len, 'm', EFFECT_DIR "/missing"), _ret);
+	TEST_RES(has_effect(effects, len, 'm', EFFECT_DIR "/missing_dir"),
+		 _ret);
+	TEST_RES(has_effect(effects, len, 'l', EFFECT_DIR), _ret);
+	TEST_RES(has_effect_suffix(effects, len, 'x', "/agent_ctl"), _ret);
+	TEST_RES(has_effect(effects, len, 'c', "127.0.0.1:9"), _ret);
+	TEST_RES(has_effect(effects, len, 'c', "127.0.0.1:10"), _ret);
+	TEST_RES(has_effect(effects, len, 'w', EFFECT_DIR "/outside"), !_ret);
+	TEST_RES(has_effect(effects, len, '!', ""), !_ret);
+
+	TEST_SUCC(tct_release(id));
+	TEST_ERRNO(ioctl(ctl_fd, AGENT_CTL_TCT_EFFECTS, &args), EINVAL);
+
+	TEST_SUCC(unlink(EFFECT_DIR "/read"));
+	TEST_SUCC(rmdir(EFFECT_DIR));
+}
+END_TEST()
+
+FN_TEST(release_requires_end)
+{
+	uint64_t nr_live;
+	uint64_t id = IN_TCT({});
+
+	TEST_ERRNO(tct_release(id), EBUSY);
+	TEST_RES(tct_end(id, &nr_live), _ret == 0 && nr_live == 0);
+	TEST_SUCC(tct_release(id));
 }
 END_TEST()

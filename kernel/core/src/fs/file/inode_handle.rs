@@ -24,7 +24,7 @@ use crate::{
     },
     prelude::*,
     process::{
-        UserNamespace,
+        Effect, UserNamespace,
         credentials::capabilities::CapSet,
         posix_thread::AsPosixThread,
         signal::{PollHandle, Pollable},
@@ -97,6 +97,16 @@ impl InodeHandle {
                 .open(path.dentry(), access_mode, status_flags)
                 .transpose()?
         };
+
+        // Listing a directory is recorded by `readdir`.
+        if !status_flags.contains(StatusFlags::O_PATH) && inode.type_() != InodeType::Dir {
+            if access_mode.is_readable() {
+                path.record_effect(Effect::Read);
+            }
+            if access_mode.is_writable() {
+                path.record_effect(Effect::Write);
+            }
+        }
 
         Ok(Self {
             open_file,
@@ -213,6 +223,7 @@ impl InodeHandle {
         let read_cnt = file_ops.readdir_at(*offset, visitor)?;
         *offset += read_cnt;
         self.file_accessed();
+        self.path().record_effect(Effect::List);
         Ok(read_cnt)
     }
 
