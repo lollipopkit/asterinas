@@ -5,11 +5,30 @@ use std::{
     str::FromStr,
 };
 
-use json::JsonValue;
 use proc_macro2::{Group, TokenStream};
 use quote::{ToTokens, TokenStreamExt};
+use serde::Deserialize;
 
 use crate::COMPONENT_FILE_NAME;
+
+/// The output of `cargo metadata`, keeping only the fields in use.
+#[derive(Deserialize)]
+struct Metadata {
+    workspace_root: String,
+    packages: Vec<Package>,
+}
+
+#[derive(Deserialize)]
+struct Package {
+    name: String,
+    id: String,
+    dependencies: Vec<Dependency>,
+}
+
+#[derive(Deserialize)]
+struct Dependency {
+    name: String,
+}
 
 #[derive(Debug)]
 pub struct ComponentInfo {
@@ -32,41 +51,31 @@ impl ToTokens for ComponentInfo {
 /// Automatic generate all the component information
 pub fn component_generate() -> Vec<ComponentInfo> {
     // extract components information
-    let mut metadata = metadata();
+    let metadata = metadata();
 
+    let workspace_root = metadata.workspace_root.replace('\\', "/");
+
+    let comps_name = get_components_name(&workspace_root, &metadata.packages);
     let mut component_packages = vec![];
-    let workspace_root = metadata["workspace_root"].as_str().unwrap();
-    let workspace_root = String::from_str(workspace_root).unwrap().replace('\\', "/");
-
-    let comps_name = get_components_name(&workspace_root, &metadata["packages"]);
-    for package in metadata["packages"].members_mut() {
-        let name = package["name"].as_str().unwrap();
-        if comps_name.contains(&name.to_string()) {
+    for mut package in metadata.packages {
+        if comps_name.contains(&package.name) {
             // remove useless depend
-            let mut depends = JsonValue::Array(Vec::new());
-            loop {
-                let depend = package["dependencies"].pop();
-                if depend == JsonValue::Null {
-                    break;
-                }
-                if comps_name.contains(&depend["name"].as_str().unwrap().to_string()) {
-                    depends.push(depend).unwrap();
-                }
-            }
-            package["dependencies"] = depends;
+            package
+                .dependencies
+                .retain(|depend| comps_name.contains(&depend.name));
             component_packages.push(package);
         }
     }
 
     // calculate priority
     let mut mapping: HashMap<String, u16> = HashMap::new();
-    let mut component_packages_map: HashMap<String, &mut JsonValue> = HashMap::new();
-    for i in component_packages.iter_mut() {
-        component_packages_map.insert(i["name"].as_str().unwrap().to_string(), i);
-    }
+    let component_packages_map: HashMap<String, &Package> = component_packages
+        .iter()
+        .map(|package| (package.name.clone(), package))
+        .collect();
 
-    for (name, package) in component_packages_map.iter() {
-        if mapping.contains_key(package["name"].as_str().unwrap()) {
+    for name in component_packages_map.keys() {
+        if mapping.contains_key(name) {
             continue;
         }
         calculate_priority(&mut mapping, &component_packages_map, name.clone());
@@ -80,7 +89,7 @@ pub fn component_generate() -> Vec<ComponentInfo> {
             // Parse the package ID <https://doc.rust-lang.org/cargo/reference/pkgid-spec.html>
             // and extract the path. Let's take `path+file:///path/to/comps/pci#aster-pci@0.1.0`
             // as an example package ID.
-            let id = package["id"].as_str().unwrap();
+            let id = package.id.as_str();
             // Remove the prefix `path+file://`.
             assert!(id.starts_with("path+file://"));
             let id = id.trim_start_matches("path+file://");
@@ -89,7 +98,7 @@ pub fn component_generate() -> Vec<ComponentInfo> {
             id.split(['#', '@']).next().unwrap()
         };
         let component_info = {
-            let package_name = package["name"].as_str().unwrap().to_string();
+            let package_name = package.name.clone();
             ComponentInfo {
                 name: package_name.clone(),
                 path: PathBuf::from(&workspace_root)
@@ -108,10 +117,8 @@ pub fn component_generate() -> Vec<ComponentInfo> {
 
 /// Get the path to the Components.toml file
 pub fn get_component_toml_path() -> TokenStream {
-    let metadata = metadata();
-    let workspace_root = metadata["workspace_root"].as_str().unwrap();
-    let mut workspace_root = String::from_str(workspace_root)
-        .unwrap()
+    let mut workspace_root = metadata()
+        .workspace_root
         .replace('\\', "/")
         .add("/")
         .add(COMPONENT_FILE_NAME)
@@ -120,32 +127,28 @@ pub fn get_component_toml_path() -> TokenStream {
     TokenStream::from_str(workspace_root.as_str()).unwrap()
 }
 
-fn is_component(package: &JsonValue) -> bool {
-    for depend in package["dependencies"].members() {
-        if depend["name"].as_str().unwrap() == "component" {
-            return true;
-        }
-    }
-    false
+fn is_component(package: &Package) -> bool {
+    package
+        .dependencies
+        .iter()
+        .any(|depend| depend.name == "component")
 }
 
 /// Get all the components name, this function will also check if the Components.toml contain all the components.
-fn get_components_name(workspace_root: &str, packages: &JsonValue) -> Vec<String> {
+fn get_components_name(workspace_root: &str, packages: &[Package]) -> Vec<String> {
     let file_components_name = read_component_file(workspace_root);
     let mut comps_name = Vec::new();
-    for package in packages.members() {
+    for package in packages {
         if is_component(package) {
-            if !file_components_name.contains(&package["name"].as_str().unwrap().to_string()) {
-                // if the package is in the workspace_root
-                if package["id"].as_str().unwrap().contains(workspace_root) {
-                    panic!(
-                        "Package {} in the workspace that not written in the {} file",
-                        package["name"].as_str().unwrap(),
-                        COMPONENT_FILE_NAME
-                    );
-                }
+            // if the package is in the workspace_root
+            if !file_components_name.contains(&package.name) && package.id.contains(workspace_root)
+            {
+                panic!(
+                    "Package {} in the workspace that not written in the {} file",
+                    package.name, COMPONENT_FILE_NAME
+                );
             }
-            comps_name.push(package["name"].as_str().unwrap().to_string());
+            comps_name.push(package.name.clone());
         }
     }
     comps_name
@@ -186,30 +189,25 @@ fn read_component_file(workspace_root: &str) -> Vec<String> {
 /// calculate the priority of one node
 fn calculate_priority(
     prioritys: &mut HashMap<String, u16>,
-    package_mapping: &HashMap<String, &mut JsonValue>,
+    package_mapping: &HashMap<String, &Package>,
     node_name: String,
 ) -> u16 {
     if prioritys.contains_key(&node_name) {
         return *prioritys.get(&node_name).unwrap();
     }
 
-    let package = &package_mapping[&node_name];
+    let package = package_mapping[&node_name];
     let mut lowest_priority: u16 = 0;
-    for depends in package["dependencies"].members() {
-        lowest_priority = lowest_priority.max(
-            calculate_priority(
-                prioritys,
-                package_mapping,
-                depends["name"].as_str().unwrap().to_string(),
-            ) + 1,
-        );
+    for depends in package.dependencies.iter() {
+        lowest_priority = lowest_priority
+            .max(calculate_priority(prioritys, package_mapping, depends.name.clone()) + 1);
     }
 
     prioritys.insert(node_name.to_string(), lowest_priority);
     lowest_priority
 }
 
-fn metadata() -> json::JsonValue {
+fn metadata() -> Metadata {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.arg("metadata");
     cmd.arg("--format-version").arg("1");
@@ -219,6 +217,5 @@ fn metadata() -> json::JsonValue {
         panic!("cannot get metadata");
     }
 
-    let output = String::from_utf8(output.stdout).unwrap();
-    json::parse(&output).unwrap()
+    serde_json::from_slice(&output.stdout).unwrap()
 }
