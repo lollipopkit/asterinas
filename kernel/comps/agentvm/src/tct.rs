@@ -150,7 +150,7 @@ impl Tct {
         })
     }
 
-    /// Begins the TCT by putting `process` into it.
+    /// Begins the TCT by putting `process`, which must be the current process, into it.
     ///
     /// Waits for any commit in progress to finish first.
     ///
@@ -170,6 +170,9 @@ impl Tct {
             COMMIT_WAIT_QUEUE.wake_all();
             return Err(err);
         }
+        // The TCT keeps running until it is inserted, because `process` is the current process,
+        // which cannot exit before this returns, and the TCT cannot be ended before it can be
+        // found by its ID. So no commit can start in between.
         TCTS.lock().insert(self.id, self.clone());
         Ok(())
     }
