@@ -92,12 +92,13 @@ impl dyn FileSystem {
         if !self.supports_freeze() {
             return_errno_with_message!(Errno::EOPNOTSUPP, "the file system cannot be frozen");
         }
-        // A read-only file system has nothing to write back.
-        let is_read_only = self.flags().contains(FsFlags::RDONLY);
+        // A read-only file system has nothing to write back. The flags are read under the
+        // freeze transition lock, which also serializes `reconfigure`.
+        let is_read_only = || self.flags().contains(FsFlags::RDONLY);
         self.write_state().freeze().freeze(
-            || if is_read_only { Ok(()) } else { self.sync() },
+            || if is_read_only() { Ok(()) } else { self.sync() },
             || {
-                if is_read_only {
+                if is_read_only() {
                     Ok(())
                 } else {
                     self.freeze_fs()
