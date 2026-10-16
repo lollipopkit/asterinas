@@ -50,6 +50,7 @@ struct agent_ctl_tct_effects {
 
 #define AGENT_CTL_TCT_EFFECTS _IOWR(0xA7, 4, struct agent_ctl_tct_effects)
 #define AGENT_CTL_TCT_RELEASE _IOW(0xA7, 5, uint64_t)
+#define AGENT_CTL_TCT_COMMIT _IOW(0xA7, 6, uint64_t)
 
 #define NOBODY_UID 65534
 
@@ -107,14 +108,23 @@ static int tct_release(uint64_t id)
 	return ioctl(ctl_fd, AGENT_CTL_TCT_RELEASE, &id);
 }
 
+static int tct_commit(uint64_t id)
+{
+	return ioctl(ctl_fd, AGENT_CTL_TCT_COMMIT, &id);
+}
+
 /* Runs the statements in a child that begins a TCT, and returns the TCT's ID. */
-#define IN_TCT(...)                                                            \
+#define IN_TCT(...) IN_TCT_WITH_FLAGS(0, __VA_ARGS__)
+
+/* Like `IN_TCT`, but begins the TCT with `flags`. */
+#define IN_TCT_WITH_FLAGS(flags, ...)                                          \
 	({                                                                     \
 		int __id_pipe[2];                                              \
 		uint64_t __id = 0;                                             \
 		TEST_SUCC(pipe(__id_pipe));                                    \
 		IN_CHILD({                                                     \
-			uint64_t __self_id = TEST_RES(tct_begin(), _ret != 0); \
+			uint64_t __self_id = TEST_RES(                         \
+				tct_begin_with_flags(flags), _ret != 0);       \
 			TEST_RES(write(__id_pipe[1], &__self_id,               \
 				       sizeof(__self_id)),                     \
 				 _ret == sizeof(__self_id));                   \
@@ -513,6 +523,7 @@ END_TEST()
 		TEST_SUCC(close(__pipe[0]));                                   \
 		TEST_SUCC(close(__pipe[1]));                                   \
 		TEST_RES(tct_end(__id, &__nr_live), _ret == 0);                \
+		TEST_SUCC(tct_commit(__id));                                   \
 		TEST_SUCC(tct_release(__id));                                  \
 		int __fd = TEST_SUCC(open(SYNC_DIR "/file", O_RDONLY));        \
 		TEST_RES(read(__fd, __buf, sizeof(__buf)),                     \
@@ -530,5 +541,25 @@ FN_TEST(syncs_in_tct)
 	TEST_SYNCS_IN_TCT(AGENT_CTL_TCT_DEFER_SYNC);
 
 	TEST_SUCC(rmdir(SYNC_DIR));
+}
+END_TEST()
+
+FN_TEST(commit_and_release)
+{
+	uint64_t id, nr_live;
+
+	// A TCT that defers sync requests cannot be released before it is committed.
+	id = IN_TCT_WITH_FLAGS(AGENT_CTL_TCT_DEFER_SYNC, {});
+	TEST_ERRNO(tct_commit(id), EINVAL);
+	TEST_RES(tct_end(id, &nr_live), _ret == 0);
+	TEST_ERRNO(tct_release(id), EBUSY);
+	TEST_SUCC(tct_commit(id));
+	TEST_SUCC(tct_commit(id));
+	TEST_SUCC(tct_release(id));
+
+	// Committing a TCT that does not defer sync requests is optional.
+	id = IN_TCT({});
+	TEST_RES(tct_end(id, &nr_live), _ret == 0);
+	TEST_SUCC(tct_release(id));
 }
 END_TEST()
