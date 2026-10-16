@@ -9,7 +9,7 @@ use crate::{
     fs,
     fs::{
         file::{
-            StatusFlags,
+            Permission, StatusFlags,
             file_table::{RawFileDesc, get_file_fast},
         },
         vfs::path::{AT_FDCWD, EmptyPathStr, FsPath, Path},
@@ -123,39 +123,70 @@ struct Utimbuf {
     modtime: i64,
 }
 
+/// How `utimensat` changes one timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimeUpdate {
+    /// `UTIME_OMIT`: leaves the timestamp unchanged.
+    Omit,
+    /// `UTIME_NOW`: sets the timestamp to the current time.
+    Now,
+    Set(Duration),
+}
+
+impl TryFrom<timespec_t> for TimeUpdate {
+    type Error = Error;
+
+    fn try_from(time: timespec_t) -> Result<Self> {
+        if !time.is_valid() {
+            return_errno_with_message!(Errno::EINVAL, "invalid time");
+        }
+        Ok(if time.is_utime_omit() {
+            Self::Omit
+        } else if time.is_utime_now() {
+            Self::Now
+        } else {
+            Self::Set(Duration::try_from(time)?)
+        })
+    }
+}
+
+/// Reference: Linux `vfs_utimes()`.
 fn vfs_utimes(path: &Path, times: Option<TimeSpecPair>) -> Result<SyscallReturn> {
-    let (atime, mtime, ctime) = match times {
-        Some(times) => {
-            if !times.atime.is_valid() || !times.mtime.is_valid() {
-                return_errno_with_message!(Errno::EINVAL, "invalid time")
-            }
-            let now = RealTimeCoarseClock::get().read_time();
-            let atime = if times.atime.is_utime_omit() {
-                path.atime()
-            } else if times.atime.is_utime_now() {
-                now
-            } else {
-                Duration::try_from(times.atime)?
-            };
-            let mtime = if times.mtime.is_utime_omit() {
-                path.mtime()
-            } else if times.mtime.is_utime_now() {
-                now
-            } else {
-                Duration::try_from(times.mtime)?
-            };
-            (atime, mtime, now)
-        }
-        None => {
-            let now = RealTimeCoarseClock::get().read_time();
-            (now, now, now)
-        }
+    let (atime, mtime) = match times {
+        Some(times) => (
+            TimeUpdate::try_from(times.atime)?,
+            TimeUpdate::try_from(times.mtime)?,
+        ),
+        None => (TimeUpdate::Now, TimeUpdate::Now),
     };
 
     let _write_access = path.want_write()?;
-    path.set_atime(atime);
-    path.set_mtime(mtime);
-    path.set_ctime(ctime);
+
+    // Setting both times to now needs only write permission; setting any time explicitly,
+    // even with `UTIME_OMIT`, needs ownership (Linux `setattr_prepare()` for `ATTR_TOUCH`
+    // and `ATTR_TIMES_SET`).
+    if !path.is_owner_or_capable()? {
+        if atime == TimeUpdate::Now && mtime == TimeUpdate::Now {
+            path.inode().check_permission(Permission::MAY_WRITE)?;
+        } else {
+            return_errno_with_message!(Errno::EPERM, "only the owner can set explicit times");
+        }
+    }
+
+    // Read the clock only after any wait for write access.
+    let now = RealTimeCoarseClock::get().read_time();
+    let resolve = |update| match update {
+        TimeUpdate::Omit => None,
+        TimeUpdate::Now => Some(now),
+        TimeUpdate::Set(time) => Some(time),
+    };
+    if let Some(atime) = resolve(atime) {
+        path.set_atime(atime);
+    }
+    if let Some(mtime) = resolve(mtime) {
+        path.set_mtime(mtime);
+    }
+    path.set_ctime(now);
     fs::vfs::notify::on_attr_change(path);
     Ok(SyscallReturn::Return(0))
 }

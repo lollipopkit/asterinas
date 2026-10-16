@@ -2,11 +2,13 @@
 
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../../common/test.h"
@@ -105,6 +107,64 @@ FN_TEST(at_empty_path_on_o_path_symlink_updates_symlink)
 
 	TEST_SUCC(close(sym_fd));
 	TEST_SUCC(unlink(symlink_path));
+}
+END_TEST()
+
+#define OTHER_UID 1000
+
+/* Runs `op` as an unprivileged user that does not own `TEST_FILE` and returns its errno. */
+#define ERRNO_AS_OTHER_USER(op)                                                \
+	({                                                                     \
+		int status;                                                    \
+		pid_t pid = CHECK(fork());                                     \
+		if (pid == 0) {                                                \
+			if (setresuid(OTHER_UID, OTHER_UID, OTHER_UID) < 0)     \
+				_exit(255);                                    \
+			_exit((op) < 0 ? errno : 0);                           \
+		}                                                              \
+		CHECK(waitpid(pid, &status, 0));                               \
+		WEXITSTATUS(status);                                           \
+	})
+
+FN_TEST(non_owner_needs_permission)
+{
+	struct timespec now[2] = { { .tv_nsec = UTIME_NOW },
+				   { .tv_nsec = UTIME_NOW } };
+	struct timespec explicit[2] = { { .tv_sec = 1 }, { .tv_sec = 2 } };
+	struct timespec omit[2] = { { .tv_nsec = UTIME_OMIT },
+				    { .tv_nsec = UTIME_OMIT } };
+
+	/* Without write permission, even touching the file is denied. */
+	TEST_SUCC(chmod(TEST_FILE, 0644));
+	TEST_RES(ERRNO_AS_OTHER_USER(utimensat(AT_FDCWD, TEST_FILE, NULL, 0)),
+		 _ret == EACCES);
+	TEST_RES(ERRNO_AS_OTHER_USER(utimensat(AT_FDCWD, TEST_FILE, now, 0)),
+		 _ret == EACCES);
+
+	/* Write permission allows touching, but not setting explicit times. */
+	TEST_SUCC(chmod(TEST_FILE, 0666));
+	TEST_RES(ERRNO_AS_OTHER_USER(utimensat(AT_FDCWD, TEST_FILE, NULL, 0)),
+		 _ret == 0);
+	TEST_RES(ERRNO_AS_OTHER_USER(
+			 utimensat(AT_FDCWD, TEST_FILE, explicit, 0)),
+		 _ret == EPERM);
+	TEST_RES(ERRNO_AS_OTHER_USER(utimensat(AT_FDCWD, TEST_FILE, omit, 0)),
+		 _ret == EPERM);
+	TEST_SUCC(chmod(TEST_FILE, 0644));
+}
+END_TEST()
+
+FN_TEST(omit_keeps_the_time)
+{
+	struct timespec set[2] = { { .tv_sec = 100 }, { .tv_sec = 200 } };
+	struct timespec omit_atime[2] = { { .tv_nsec = UTIME_OMIT },
+					  { .tv_sec = 300 } };
+	struct stat st;
+
+	TEST_SUCC(utimensat(AT_FDCWD, TEST_FILE, set, 0));
+	TEST_SUCC(utimensat(AT_FDCWD, TEST_FILE, omit_atime, 0));
+	TEST_RES(stat(TEST_FILE, &st),
+		 st.st_atim.tv_sec == 100 && st.st_mtim.tv_sec == 300);
 }
 END_TEST()
 

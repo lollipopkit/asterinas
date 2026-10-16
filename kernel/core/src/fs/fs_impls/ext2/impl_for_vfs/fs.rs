@@ -25,13 +25,12 @@ impl FileSystem for Ext2 {
     }
 
     fn sync(&self) -> Result<()> {
-        // Freezing synced everything and writes have stopped since. Syncing now would only
-        // mark the frozen volume in use again.
-        if self.write_state().freeze().is_frozen() {
-            return Ok(());
-        }
-        self.sync_all()?;
-        self.flush_device()
+        // Freezing synced everything and writes have stopped since. Syncing a frozen volume
+        // would only mark it in use again.
+        self.write_state().freeze().sync_unless_frozen(|| {
+            self.sync_all()?;
+            self.flush_device()
+        })
     }
 
     fn root_inode(&self) -> Arc<dyn Inode> {

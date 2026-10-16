@@ -92,14 +92,12 @@ impl dyn FileSystem {
         if !self.supports_freeze() {
             return_errno_with_message!(Errno::EOPNOTSUPP, "the file system cannot be frozen");
         }
-        self.write_state().freeze().freeze(|| {
-            // A read-only file system has nothing to write back.
-            if self.flags().contains(FsFlags::RDONLY) {
-                return Ok(());
-            }
-            self.sync()?;
-            self.freeze_fs()
-        })
+        // A read-only file system has nothing to write back.
+        let is_read_only = self.flags().contains(FsFlags::RDONLY);
+        self.write_state().freeze().freeze(
+            || if is_read_only { Ok(()) } else { self.sync() },
+            || if is_read_only { Ok(()) } else { self.freeze_fs() },
+        )
     }
 
     /// Thaws this file system and lets blocked writes continue.
@@ -299,6 +297,9 @@ pub(crate) struct FreezeGate {
     state: SpinLock<FreezeGateState>,
     /// Woken when writes may resume or the last running write ends.
     wait_queue: WaitQueue,
+    /// Taken shared by syncs and exclusively while the file system becomes frozen, so that
+    /// no sync started before the freeze writes after it.
+    sync_lock: RwMutex<()>,
     /// Serializes freezing and thawing.
     transition: Mutex<()>,
 }
@@ -319,6 +320,7 @@ impl FreezeGate {
                 running_writes: 0,
             }),
             wait_queue: WaitQueue::new(),
+            sync_lock: RwMutex::new(()),
             transition: Mutex::new(()),
         }
     }
@@ -370,7 +372,22 @@ impl FreezeGate {
         self.wait_queue.wake_all();
     }
 
-    fn freeze(&self, sync_and_freeze: impl FnOnce() -> Result<()>) -> Result<()> {
+    /// Runs `sync` unless the file system is frozen, in which case there is nothing to sync.
+    ///
+    /// A file system's sync must run inside this, or it could undo what freezing wrote.
+    pub(crate) fn sync_unless_frozen(&self, sync: impl FnOnce() -> Result<()>) -> Result<()> {
+        let _sync = self.sync_lock.read();
+        if self.is_frozen() {
+            return Ok(());
+        }
+        sync()
+    }
+
+    fn freeze(
+        &self,
+        sync: impl FnOnce() -> Result<()>,
+        freeze_fs: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let _transition = self.transition.lock();
         {
             let mut state = self.state.lock();
@@ -382,12 +399,16 @@ impl FreezeGate {
         self.wait_queue
             .wait_until(|| (self.state.lock().running_writes == 0).then_some(()));
 
-        if let Err(err) = sync_and_freeze() {
+        let result = sync().and_then(|()| {
+            let _sync = self.sync_lock.write();
+            freeze_fs()?;
+            self.set_level(FreezeLevel::Frozen);
+            Ok(())
+        });
+        if result.is_err() {
             self.set_level(FreezeLevel::Unfrozen);
-            return Err(err);
         }
-        self.set_level(FreezeLevel::Frozen);
-        Ok(())
+        result
     }
 
     fn thaw(&self, unfreeze: impl FnOnce() -> Result<()>) -> Result<()> {

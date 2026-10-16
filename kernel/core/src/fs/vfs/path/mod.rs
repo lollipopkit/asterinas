@@ -351,6 +351,25 @@ impl Path {
         Ok(write_access)
     }
 
+    /// Returns whether the current thread owns the inode or has `CAP_FOWNER`.
+    ///
+    /// Reference: Linux `inode_owner_or_capable()`.
+    pub(crate) fn is_owner_or_capable(&self) -> Result<bool> {
+        let current_thread = current_thread!();
+        let Some(posix_thread) = current_thread.as_posix_thread() else {
+            return Ok(true);
+        };
+        if posix_thread.credentials().fsuid() == self.owner()? {
+            return Ok(true);
+        }
+        Ok(lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+            UserNamespace::get_init_singleton().as_ref(),
+            posix_thread,
+            CapSet::FOWNER,
+        ))
+        .is_ok())
+    }
+
     /// Checks whether an inode may be used as the source of a hard link.
     fn check_hardlink_source(&self) -> Result<()> {
         let current_thread = current_thread!();
