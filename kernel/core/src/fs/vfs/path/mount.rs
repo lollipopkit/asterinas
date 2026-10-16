@@ -790,6 +790,19 @@ impl Mount {
         }
     }
 
+    /// Gets write access like [`Self::want_write`], but only if that needs no waiting.
+    pub(super) fn try_want_write(&self) -> Option<WriteAccess> {
+        let freeze = self.fs.write_state().freeze();
+        if !freeze.try_enter() {
+            return None;
+        }
+        let write_access = self.get_write_access_inner(true);
+        if write_access.is_err() {
+            freeze.exit();
+        }
+        write_access.ok()
+    }
+
     /// Gets write access to this mount and its file system for a file opened for writing,
     /// which does not wait for a frozen file system (Linux `mnt_get_write_access()`).
     pub(super) fn get_write_access(&self) -> Result<WriteAccess> {
@@ -1060,7 +1073,7 @@ impl Default for PerMountFlags {
 
 impl PerMountFlags {
     /// Gets the atime policy.
-    fn atime_policy(&self) -> AtimePolicy {
+    pub(super) fn atime_policy(&self) -> AtimePolicy {
         if self.contains(PerMountFlags::STRICTATIME) {
             AtimePolicy::Strictatime
         } else if self.contains(PerMountFlags::NOATIME) {
@@ -1075,7 +1088,7 @@ impl PerMountFlags {
 ///
 /// A Mount can only have one of the following atime policies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AtimePolicy {
+pub(super) enum AtimePolicy {
     Relatime,
     Noatime,
     Strictatime,

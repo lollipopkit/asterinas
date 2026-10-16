@@ -30,11 +30,7 @@ impl Inode {
             return Ok(0);
         }
 
-        let read_len = self.inner.read().read_at(offset, writer)?;
-        if read_len > 0 {
-            self.touch_atime();
-        }
-        Ok(read_len)
+        self.inner.read().read_at(offset, writer)
     }
 
     /// Writes file data at `offset` through the page cache.
@@ -70,9 +66,6 @@ impl Inode {
 
         let fs = self.fs()?;
         let read_len = self.inner.read().read_direct_at(&fs, offset, writer)?;
-        if read_len > 0 {
-            self.touch_atime();
-        }
         Ok(read_len)
     }
 
@@ -148,28 +141,18 @@ impl Inode {
             inner.ensure_size_within_limit(&fs, end)?;
         }
 
+        // Like Linux ext4, a failed request keeps the blocks it allocated and leaves the size
+        // unchanged. The blocks cannot be told apart from earlier allocations beyond the end
+        // of the file, which freeing them must keep.
         match mode {
             FallocMode::Allocate => {
-                if let Err(err) =
-                    inner.allocate_range_blocks(offset, end, NewBlockInit::ZeroOnDevice)
-                {
-                    inner.rollback_fallocate(old_size);
-                    return Err(err);
-                }
-                if end > old_size
-                    && let Err(err) = inner.expand(&fs, end)
-                {
-                    inner.rollback_fallocate(old_size);
-                    return Err(err);
+                inner.allocate_range_blocks(offset, end, NewBlockInit::ZeroOnDevice)?;
+                if end > old_size {
+                    inner.expand(&fs, end)?;
                 }
             }
             FallocMode::AllocateKeepSize => {
-                if let Err(err) =
-                    inner.allocate_range_blocks(offset, end, NewBlockInit::ZeroOnDevice)
-                {
-                    inner.rollback_fallocate(old_size);
-                    return Err(err);
-                }
+                inner.allocate_range_blocks(offset, end, NewBlockInit::ZeroOnDevice)?;
             }
             _ => {
                 return_errno_with_message!(
@@ -272,13 +255,6 @@ impl InodeInner {
             );
         }
 
-        if let Ok(block_manager) = self.block_manager() {
-            block_manager.truncate_to_byte_len(old_size);
-        }
-    }
-
-    /// Truncates only block mappings after a failed fallocate.
-    fn rollback_fallocate(&mut self, old_size: usize) {
         if let Ok(block_manager) = self.block_manager() {
             block_manager.truncate_to_byte_len(old_size);
         }
@@ -662,6 +638,37 @@ mod test {
                 .unwrap();
             assert_eq!(block, expected);
         }
+    }
+
+    #[ktest]
+    fn falloc_failure_keeps_earlier_allocations_beyond_eof() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(2, 2)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(
+            &f.ext2,
+            69,
+            0,
+            0,
+            FileFlags::empty(),
+            [0; RAW_BLOCK_PTRS_LEN],
+        );
+
+        file.fallocate(FallocMode::AllocateKeepSize, BLOCK_SIZE * 4, BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(f.ext2.super_block().free_blocks_count(), 1);
+
+        // Two blocks are needed but only one is left.
+        assert_errno!(
+            file.fallocate(FallocMode::Allocate, 0, BLOCK_SIZE * 2),
+            Errno::ENOSPC
+        );
+        assert_eq!(file.file_size(), 0);
+        // The earlier reservation and the block the failed request got both stay.
+        assert_eq!(f.ext2.super_block().free_blocks_count(), 0);
     }
 
     #[ktest]

@@ -6,7 +6,7 @@ use core::time::Duration;
 
 pub(crate) use dentry::Dentry;
 use inherit_methods_macro::inherit_methods;
-use mount::MountTreeCloneMode;
+use mount::{AtimePolicy, MountTreeCloneMode};
 pub(crate) use mount::{MNT_UNIQUE_ID_MIN, Mount, PerMountFlags, WriteAccess};
 pub(in crate::fs) use mount::{RecyclableMountId, UniqueMountId};
 pub(crate) use mount_namespace::MountNamespace;
@@ -37,7 +37,11 @@ use crate::{
         Gid, Uid, UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread,
     },
     security::lsm::hooks as lsm_hooks,
+    time::clocks::RealTimeCoarseClock,
 };
+
+/// How long `relatime` keeps an access time that is newer than the last change.
+const RELATIME_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 mod dentry;
 mod mount;
@@ -323,6 +327,46 @@ impl Path {
         self.mount.want_write()
     }
 
+    /// Updates the access time after the file was read, as the mount's atime policy says.
+    ///
+    /// The update is skipped, without waiting or failing, when the mount or the file system
+    /// is read-only or frozen.
+    ///
+    /// Reference: Linux `touch_atime()` and `atime_needs_update()`.
+    pub(crate) fn touch_atime(&self) {
+        let inode = self.inode();
+        if !self.fs().updates_atime() {
+            return;
+        }
+        let flags = self.mount.flags();
+        let policy = flags.atime_policy();
+        if policy == AtimePolicy::Noatime
+            || (flags.contains(PerMountFlags::NODIRATIME) && inode.type_() == InodeType::Dir)
+        {
+            return;
+        }
+
+        let now = RealTimeCoarseClock::get().read_time();
+        let atime = inode.atime();
+        // With `relatime`, the access time only moves past the last change or once a day.
+        // Reference: Linux `relatime_need_update()`.
+        if policy == AtimePolicy::Relatime
+            && atime > inode.mtime()
+            && atime > inode.ctime()
+            && now.saturating_sub(atime) < RELATIME_INTERVAL
+        {
+            return;
+        }
+        if atime == now {
+            return;
+        }
+
+        let Some(_write_access) = self.mount.try_want_write() else {
+            return;
+        };
+        inode.set_atime(&self.dentry, now);
+    }
+
     /// Gets write access for a file opened for writing, held until the file is closed.
     ///
     /// Unlike [`Self::want_write`], it does not wait for a frozen file system; writes through
@@ -359,15 +403,7 @@ impl Path {
         let Some(posix_thread) = current_thread.as_posix_thread() else {
             return Ok(true);
         };
-        if posix_thread.credentials().fsuid() == self.owner()? {
-            return Ok(true);
-        }
-        Ok(lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
-            UserNamespace::get_init_singleton().as_ref(),
-            posix_thread,
-            CapSet::FOWNER,
-        ))
-        .is_ok())
+        Ok(posix_thread.credentials().fsuid() == self.owner()? || is_capable(CapSet::FOWNER))
     }
 
     /// Checks whether an inode may be used as the source of a hard link.
@@ -887,19 +923,70 @@ impl Path {
         list_writer: &mut VmWriter,
     ) -> Result<usize>;
 
-    pub(crate) fn set_mode(&self, mode: InodeMode) -> Result<()> {
+    /// Changes the mode, which only the owner or a caller with `CAP_FOWNER` may do.
+    ///
+    /// Reference: Linux `chmod_common()` and `setattr_prepare()`.
+    pub(crate) fn set_mode(&self, mut mode: InodeMode) -> Result<()> {
         let _write_access = self.want_write()?;
+        if !self.is_owner_or_capable()? {
+            return_errno_with_message!(Errno::EPERM, "only the owner can change the mode");
+        }
+        // A caller outside the file's group cannot set the set-group-ID bit.
+        if mode.has_set_gid() && !is_in_group_or_capable(self.group()?) {
+            mode.remove(InodeMode::S_ISGID);
+        }
         self.inode().set_mode(&self.dentry, mode)
     }
 
-    pub(crate) fn set_owner(&self, uid: Uid) -> Result<()> {
+    /// Changes the owner and the group, leaving `None` ones unchanged.
+    ///
+    /// Giving a file away needs `CAP_CHOWN`; the owner may only change the group to one
+    /// it belongs to. A non-directory loses its set-user-ID bit, its set-group-ID bit if
+    /// that is unsafe to keep, and its file capabilities, even if no ID changes.
+    ///
+    /// Reference: Linux `chown_common()`, `chown_ok()`, `chgrp_ok()` and `notify_change()`.
+    pub(crate) fn chown(&self, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
         let _write_access = self.want_write()?;
-        self.inode().set_owner(&self.dentry, uid)
-    }
+        let inode = self.inode();
+        let (old_uid, old_gid) = (inode.owner()?, inode.group()?);
+        let is_owner = current_thread!()
+            .as_posix_thread()
+            .is_none_or(|thread| thread.credentials().fsuid() == old_uid);
 
-    pub(crate) fn set_group(&self, gid: Gid) -> Result<()> {
-        let _write_access = self.want_write()?;
-        self.inode().set_group(&self.dentry, gid)
+        let uid_ok =
+            uid.is_none_or(|uid| (is_owner && uid == old_uid) || is_capable(CapSet::CHOWN));
+        let gid_ok = gid.is_none_or(|gid| {
+            (is_owner && (gid == old_gid || is_in_group(gid))) || is_capable(CapSet::CHOWN)
+        });
+        if !uid_ok || !gid_ok {
+            return_errno_with_message!(Errno::EPERM, "the owner or group cannot be changed");
+        }
+
+        if let Some(uid) = uid {
+            inode.set_owner(&self.dentry, uid)?;
+        }
+        if let Some(gid) = gid {
+            inode.set_group(&self.dentry, gid)?;
+        }
+
+        if self.type_() != InodeType::Dir {
+            let old_mode = inode.mode()?;
+            let mut mode = old_mode - InodeMode::S_ISUID;
+            // Linux `setattr_should_drop_sgid()`.
+            if mode.has_set_gid()
+                && (mode.is_group_executable() || !is_in_group_or_capable(old_gid))
+            {
+                mode.remove(InodeMode::S_ISGID);
+            }
+            if mode != old_mode {
+                inode.set_mode(&self.dentry, mode)?;
+            }
+            xattr::remove_file_caps(&self.dentry)?;
+        }
+        if uid.is_none() && gid.is_none() {
+            inode.set_ctime(&self.dentry, RealTimeCoarseClock::get().read_time());
+        }
+        Ok(())
     }
 
     pub(crate) fn set_atime(&self, time: Duration) {
@@ -964,6 +1051,36 @@ impl Path {
         }
         inode.remove_xattr(&self.dentry, name)
     }
+}
+
+/// Returns whether the current thread has `cap`.
+fn is_capable(cap: CapSet) -> bool {
+    let current_thread = current_thread!();
+    let Some(posix_thread) = current_thread.as_posix_thread() else {
+        return true;
+    };
+    lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+        UserNamespace::get_init_singleton().as_ref(),
+        posix_thread,
+        cap,
+    ))
+    .is_ok()
+}
+
+/// Returns whether `gid` is the current thread's file system group or a supplementary group
+/// (Linux `in_group_p()`).
+fn is_in_group(gid: Gid) -> bool {
+    let current_thread = current_thread!();
+    let Some(posix_thread) = current_thread.as_posix_thread() else {
+        return true;
+    };
+    let credentials = posix_thread.credentials();
+    credentials.fsgid() == gid || credentials.groups().contains(&gid)
+}
+
+/// Linux `in_group_or_capable()`.
+fn is_in_group_or_capable(gid: Gid) -> bool {
+    is_in_group(gid) || is_capable(CapSet::FSETID)
 }
 
 fn capable_modify_file_cap(inode: &dyn Inode, ctx: &Context) -> Result<()> {

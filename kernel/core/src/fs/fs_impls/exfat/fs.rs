@@ -448,6 +448,10 @@ impl FileSystem for ExfatFs {
         &self.fs_event_subscriber_stats
     }
 
+    fn updates_atime(&self) -> bool {
+        true
+    }
+
     fn write_state(&self) -> &FsWriteState {
         &self.write_state
     }

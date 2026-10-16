@@ -22,14 +22,23 @@ pub(in crate::fs) fn clear_file_priv(dentry: &Dentry) -> Result<()> {
         return Ok(());
     }
 
+    remove_file_caps(dentry)?;
+    clear_set_id_bits(dentry)
+}
+
+/// Removes the file capabilities of a regular file (Linux `cap_inode_killpriv()`).
+pub(in crate::fs) fn remove_file_caps(dentry: &Dentry) -> Result<()> {
+    let inode = dentry.inode().as_ref();
+    if inode.type_() != InodeType::File {
+        return Ok(());
+    }
+
     let xattr_name = XattrName::try_from_full_name(SECURITY_CAPABILITY_XATTR_NAME).unwrap();
     match inode.remove_xattr(dentry, xattr_name) {
         Ok(()) => Ok(()),
         Err(error) if matches!(error.error(), Errno::ENODATA | Errno::EOPNOTSUPP) => Ok(()),
         Err(error) => Err(error),
-    }?;
-
-    clear_set_id_bits(dentry)
+    }
 }
 
 fn clear_set_id_bits(dentry: &Dentry) -> Result<()> {

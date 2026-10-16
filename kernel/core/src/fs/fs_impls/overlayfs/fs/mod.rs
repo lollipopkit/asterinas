@@ -75,6 +75,8 @@ impl OverlayFs {
     }
 }
 
+// TODO: Update the access time of an existing upper inode on reads, without copying up
+// (Linux `ovl_update_time()`); setting it through the overlay inode copies up.
 impl FileSystem for OverlayFs {
     fn name(&self) -> &'static str {
         OVERLAY_FS_NAME

@@ -87,6 +87,7 @@ test_mount_bind_file() {
 
 echo "Start ext2 fs test......"
 test_ext2 "/ext2" "test_file.txt"
+./ext2/atime
 ./ext2/fallocate
 ./ext2/file_io
 ./ext2/freeze

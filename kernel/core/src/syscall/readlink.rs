@@ -5,7 +5,7 @@ use ostd::mm::VmIo;
 use super::SyscallReturn;
 use crate::{
     fs::{
-        file::file_table::RawFileDesc,
+        file::{InodeType, file_table::RawFileDesc},
         vfs::{
             inode::SymbolicLink,
             path::{AT_FDCWD, EmptyPathStr, FsPath},
@@ -40,6 +40,9 @@ pub(super) fn sys_readlinkat(
         let path_name = path_name.to_string_lossy();
         let fs_path = FsPath::from_fd_at(dirfd, &path_name, EmptyPathStr::Allow)?;
         let path = path_resolver.lookup_no_follow(&fs_path)?;
+        if path.type_() == InodeType::SymLink {
+            path.touch_atime();
+        }
 
         match path.inode().read_link()? {
             SymbolicLink::Plain(s) => s,
