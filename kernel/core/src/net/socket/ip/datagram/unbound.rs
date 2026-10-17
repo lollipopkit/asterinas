@@ -11,18 +11,9 @@ use super::{
 };
 use crate::{
     events::IoEvents,
-    net::{
-        iface::BoundUdpPort,
-        socket::{
-            ip::{
-                addr::UNSPECIFIED_LOCAL_ENDPOINT,
-                common::{
-                    get_ephemeral_endpoint, map_unspecified_to_localhost,
-                    resolve_bind_iface_and_config,
-                },
-            },
-            util::datagram_common,
-        },
+    net::socket::{
+        ip::{addr::UNSPECIFIED_LOCAL_ENDPOINT, common::bind_ports},
+        util::datagram_common,
     },
     prelude::*,
     process::signal::Pollee,
@@ -73,23 +64,23 @@ impl datagram_common::Unbound for UnboundDatagram {
         new_bound(endpoint, options.can_reuse, locks, pollee)
     }
 
+    /// Binds the socket to an ephemeral port.
+    ///
+    /// Like Linux, the socket is bound at the unspecified address unless the local address is
+    /// kept after `connect(AF_UNSPEC)`. If the socket is then connected, the local address will be
+    /// selected by routing.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L181-L196>
     fn bind_ephemeral(
         &mut self,
-        remote_endpoint: &Self::Endpoint,
+        _remote_endpoint: &Self::Endpoint,
         pollee: &Pollee,
     ) -> Result<Self::Bound> {
-        let (endpoint, locks) = if let Some(local_addr) = self.local_addr {
-            let locks = BindLocks {
-                addr: true,
-                port: false,
-            };
-            (IpEndpoint::new(local_addr, 0), locks)
-        } else {
-            let remote_endpoint = map_unspecified_to_localhost(*remote_endpoint);
-            let endpoint = get_ephemeral_endpoint(&remote_endpoint)?;
-            (endpoint, BindLocks::default())
+        let locks = BindLocks {
+            addr: self.local_addr.is_some(),
+            port: false,
         };
-        new_bound(&endpoint, false, locks, pollee)
+        new_bound(&self.local_endpoint(), false, locks, pollee)
     }
 
     fn check_io_events(&self) -> IoEvents {
@@ -103,20 +94,21 @@ fn new_bound(
     locks: BindLocks,
     pollee: &Pollee,
 ) -> Result<BoundDatagram> {
-    let bound_port = bind_port(endpoint, can_reuse)?;
+    let bound_ports = bind_ports(endpoint, can_reuse, false, |iface, config| {
+        iface.bind_udp(config)
+    })?;
 
-    let bound_socket = match UdpSocket::new_bind(bound_port, DatagramObserver::new(pollee.clone()))
-    {
-        Ok(bound_socket) => bound_socket,
-        Err((_, err)) => {
-            unreachable!("`new_bind` fails with {:?}, which should not happen", err)
-        }
-    };
+    let bound_sockets = bound_ports
+        .into_iter()
+        .map(|bound_port| {
+            match UdpSocket::new_bind(bound_port, DatagramObserver::new(pollee.clone())) {
+                Ok(bound_socket) => bound_socket,
+                Err((_, err)) => {
+                    unreachable!("`new_bind` fails with {:?}, which should not happen", err)
+                }
+            }
+        })
+        .collect();
 
-    Ok(BoundDatagram::new(bound_socket, locks))
-}
-
-fn bind_port(endpoint: &IpEndpoint, can_reuse: bool) -> Result<BoundUdpPort> {
-    let (iface, config) = resolve_bind_iface_and_config(endpoint, can_reuse)?;
-    Ok(iface.bind_udp(config)?)
+    Ok(BoundDatagram::new(bound_sockets, locks))
 }

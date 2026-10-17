@@ -8,7 +8,7 @@ use ostd::sync::SpinLock;
 use smoltcp::{
     iface::Context,
     socket::udp::UdpMetadata,
-    wire::{IpEndpoint, IpRepr, UdpRepr},
+    wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpRepr, UdpRepr},
 };
 
 use super::{
@@ -28,8 +28,16 @@ pub type UdpSocket<E> = Socket<UdpSocketInner, E>;
 pub struct UdpSocketInner {
     socket: SpinLock<Box<RawUdpSocket>, BottomHalfDisabled>,
     need_dispatch: AtomicBool,
+    connection: SpinLock<Option<UdpConnection>, BottomHalfDisabled>,
+}
+
+/// The association that a UDP socket establishes by connecting.
+#[derive(Clone, Copy)]
+struct UdpConnection {
     /// The remote endpoint that the socket is connected to.
-    remote_endpoint: SpinLock<Option<IpEndpoint>, BottomHalfDisabled>,
+    remote_endpoint: IpEndpoint,
+    /// The local address that replaces the unspecified bound address.
+    local_addr: Option<IpAddress>,
 }
 
 impl<E: Ext> Inner<E> for UdpSocketInner {
@@ -77,34 +85,57 @@ impl<E: Ext> UdpSocketBg<E> {
     /// Returns how well an incoming packet matches the socket, or `None` if the socket does not
     /// accept the packet.
     ///
-    /// Like Linux, a connected socket only accepts packets from its remote endpoint, and is
-    /// preferred over unconnected sockets.
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L381>
+    /// Like Linux, a socket bound at the destination address is preferred over sockets bound at
+    /// the unspecified address, since it is looked up first. Among sockets bound at the same
+    /// address, a connected socket only accepts packets from its remote endpoint, and is preferred
+    /// over unconnected sockets.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L696-L726>
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L375-L391>
     pub(crate) fn score(&self, ip_repr: &IpRepr, udp_repr: &UdpRepr) -> Option<u8> {
         // This must be stricter than `RawUdpSocket::accepts` so that `RawUdpSocket::process` is
         // guaranteed to work correctly if this method returns `Some(_)`.
         //
         // `RawUdpSocket::accepts` accepts all incoming broadcast and multicast packets, which is not
         // what we want.
-        if ip_repr.dst_addr() != *self.bound.addr() || udp_repr.dst_port != self.bound.port() {
+        if udp_repr.dst_port != self.bound.port() {
             return None;
         }
 
-        let Some(remote) = *self.inner.remote_endpoint.lock() else {
-            return Some(0);
+        let connection = *self.inner.connection.lock();
+
+        let local_addr = connection
+            .and_then(|connection| connection.local_addr)
+            .unwrap_or(*self.bound.addr());
+        // The score of matching the local address must exceed any score of matching the remote
+        // endpoint below.
+        let mut score = if local_addr.is_unspecified() {
+            0
+        } else if local_addr == ip_repr.dst_addr() {
+            4
+        } else {
+            return None;
+        };
+
+        let Some(UdpConnection {
+            remote_endpoint: remote,
+            ..
+        }) = connection
+        else {
+            return Some(score);
         };
 
         if remote.addr != ip_repr.src_addr() {
             return None;
         }
+        score += 1;
         // A zero port means that the socket is connected to any port of the remote address.
         if remote.port == 0 {
-            return Some(1);
+            return Some(score);
         }
         if remote.port != udp_repr.src_port {
             return None;
         }
-        Some(2)
+        Some(score + 1)
     }
 
     /// Tries to generate an outgoing packet and dispatches the generated packet.
@@ -146,14 +177,21 @@ impl<E: Ext> UdpSocket<E> {
         observer: E::UdpEventObserver,
     ) -> Result<Self, (BoundUdpPort<E>, smoltcp::socket::udp::BindError)> {
         let local_endpoint = {
-            let mut endpoint = bound.endpoint();
+            let endpoint = bound.endpoint();
 
             // This is the address used to send packets. Source addresses can never be the broadcast
-            // address, even if it is the address that the socket binds to.
-            let interface = bound.iface().common().interface();
-            endpoint.addr = interface.map_broadcast_to_local(endpoint.addr);
+            // address, even if it is the address that the socket binds to. No address is used if
+            // the socket binds to the unspecified address, so the source address must be specified
+            // for each outgoing packet.
+            let addr = (!endpoint.addr.is_unspecified()).then(|| {
+                let interface = bound.iface().common().interface();
+                interface.map_broadcast_to_local(endpoint.addr)
+            });
 
-            endpoint
+            IpListenEndpoint {
+                addr,
+                port: endpoint.port,
+            }
         };
 
         let socket = {
@@ -169,7 +207,7 @@ impl<E: Ext> UdpSocket<E> {
         let inner = UdpSocketInner {
             socket: SpinLock::new(socket),
             need_dispatch: AtomicBool::new(false),
-            remote_endpoint: SpinLock::new(None),
+            connection: SpinLock::new(None),
         };
 
         let socket = Self::new(bound, inner);
@@ -187,38 +225,58 @@ impl<E: Ext> UdpSocket<E> {
     /// After this method returns, only packets from the remote endpoint will be received. Packets
     /// that have already been received are kept.
     ///
+    /// If the socket is bound at the unspecified address, `local_addr` can specify the local
+    /// address. Then only packets to that address will be received, as if the socket were bound
+    /// at that address.
+    ///
     /// Polling the iface is _not_ required after this method succeeds.
-    pub fn connect(&self, remote_endpoint: IpEndpoint) {
-        *self.0.inner.remote_endpoint.lock() = Some(remote_endpoint);
+    pub fn connect(&self, remote_endpoint: IpEndpoint, local_addr: Option<IpAddress>) {
+        debug_assert!(local_addr.is_none() || self.0.bound.addr().is_unspecified());
+
+        *self.0.inner.connection.lock() = Some(UdpConnection {
+            remote_endpoint,
+            local_addr,
+        });
     }
 
     /// Disconnects from the remote endpoint.
     ///
-    /// After this method returns, packets from all remote endpoints will be received again.
+    /// After this method returns, packets from all remote endpoints will be received again, at the
+    /// address that the socket is bound at.
     ///
     /// Polling the iface is _not_ required after this method succeeds.
     pub fn disconnect(&self) {
-        *self.0.inner.remote_endpoint.lock() = None;
+        *self.0.inner.connection.lock() = None;
     }
 
-    /// Sends some data.
+    /// Sends some data to the remote endpoint.
+    ///
+    /// If `source_addr` is `None`, the address that the socket is bound at is used as the source
+    /// address. It must not be `None` if the socket is bound at the unspecified address.
     ///
     /// Polling the iface is _always_ required after this method succeeds.
     pub fn send<F, R>(
         &self,
         size: usize,
-        meta: impl Into<UdpMetadata>,
+        remote_endpoint: IpEndpoint,
+        source_addr: Option<IpAddress>,
         f: F,
     ) -> Result<R, SendError>
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        debug_assert!(source_addr.is_some() || !self.0.bound.addr().is_unspecified());
+
         let mut socket = self.0.inner.socket.lock();
 
         if size > socket.payload_send_capacity() {
             return Err(SendError::TooLarge);
         }
 
+        let meta = UdpMetadata {
+            local_address: source_addr,
+            ..UdpMetadata::from(remote_endpoint)
+        };
         let buffer = socket.send(size, meta)?;
         let result = f(buffer);
 

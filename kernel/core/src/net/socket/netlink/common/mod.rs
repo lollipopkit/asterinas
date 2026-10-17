@@ -126,7 +126,7 @@ where
         // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/netlink/af_netlink.c#L1088-L1095>
         if let SocketAddr::Unspec(_) = socket_addr {
             if let Inner::Bound(bound) = &mut *self.inner.write() {
-                bound.set_remote_endpoint(&NetlinkSocketAddr::new_unspecified());
+                bound.set_remote_endpoint(&NetlinkSocketAddr::new_unspecified())?;
             }
             return Ok(());
         }
