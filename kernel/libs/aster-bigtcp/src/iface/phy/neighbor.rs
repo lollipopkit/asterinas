@@ -639,7 +639,11 @@ mod test {
         // Without replies, the entry is removed and the next packet starts a new resolution.
         assert!(poll(&mut cache, t + RETRANS_TIME_MS * 3).is_empty());
         assert_eq!(cache.next_poll_at_ms(), None);
-        assert!(starts_resolution(&mut cache, PEER_IP, t + RETRANS_TIME_MS * 3));
+        assert!(starts_resolution(
+            &mut cache,
+            PEER_IP,
+            t + RETRANS_TIME_MS * 3
+        ));
     }
 
     #[ktest]
