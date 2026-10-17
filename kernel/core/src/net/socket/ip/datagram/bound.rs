@@ -2,15 +2,18 @@
 
 use aster_bigtcp::{
     errors::udp::{RecvError, SendError},
-    wire::IpEndpoint,
+    wire::{IpAddress, IpEndpoint},
 };
 
 use super::unbound::UnboundDatagram;
 use crate::{
     events::IoEvents,
     net::{
-        iface::{BoundUdpPort, Iface, UdpSocket},
-        socket::util::{RecvFlags, RecvOutput, SendFlags, datagram_common},
+        iface::{Iface, UdpSocket},
+        socket::{
+            ip::common::select_source,
+            util::{RecvFlags, RecvOutput, SendFlags, datagram_common},
+        },
     },
     prelude::*,
     util::{MultiRead, MultiWrite},
@@ -19,10 +22,29 @@ use crate::{
 /// The maximum length of a UDP payload, which is limited by the 16-bit length field.
 const MAX_UDP_PAYLOAD_LEN: usize = u16::MAX as usize;
 
+/// A bound UDP socket.
+///
+/// A socket bound at a specified address has one bigtcp socket. A socket bound at the unspecified
+/// address has one bigtcp socket on each iface, and all the sockets share the same port number.
+//
+// TODO: Linux has one receive queue for each socket, but here each bigtcp socket has its own
+// receive queue. Datagrams that arrive at different ifaces may be received out of order.
 pub(super) struct BoundDatagram {
-    bound_socket: UdpSocket,
+    // INVARIANT: `bound_sockets` is not empty, and the first socket is bound at the local
+    // endpoint.
+    bound_sockets: Vec<UdpSocket>,
     remote_endpoint: Option<IpEndpoint>,
+    /// The source address selected by `connect` if the socket is bound at the unspecified
+    /// address.
+    connected_source: Option<ConnectedSource>,
     locks: BindLocks,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectedSource {
+    addr: IpAddress,
+    /// The index of the bigtcp socket on the iface that owns `addr`.
+    socket_index: usize,
 }
 
 /// Whether the local address and the local port are specified by `bind`.
@@ -36,27 +58,37 @@ pub(super) struct BindLocks {
 }
 
 impl BoundDatagram {
-    pub(super) fn new(bound_socket: UdpSocket, locks: BindLocks) -> Self {
+    pub(super) fn new(bound_sockets: Vec<UdpSocket>, locks: BindLocks) -> Self {
+        debug_assert!(!bound_sockets.is_empty());
         Self {
-            bound_socket,
+            bound_sockets,
             remote_endpoint: None,
+            connected_source: None,
             locks,
         }
+    }
+
+    fn first_socket(&self) -> &UdpSocket {
+        &self.bound_sockets[0]
     }
 
     /// Dissolves the association with the remote endpoint.
     ///
     /// Like Linux, the port is released unless it is specified by `bind`. If the port is
     /// released, this method returns the unbound socket that this socket becomes, which keeps the
-    /// local address only if it is specified by `bind`.
+    /// local address only if it is specified by `bind`. A local address selected by `connect` is
+    /// always reset.
     ///
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L2168-L2193>
     //
     // TODO: Linux keeps the received datagrams after releasing the port, but they are dropped
     // with the bound socket here.
     pub(super) fn disconnect(&mut self) -> Option<UnboundDatagram> {
-        self.bound_socket.disconnect();
+        for bound_socket in self.bound_sockets.iter() {
+            bound_socket.disconnect();
+        }
         self.remote_endpoint = None;
+        self.connected_source = None;
 
         if self.locks.port {
             return None;
@@ -64,16 +96,93 @@ impl BoundDatagram {
         let local_addr = self
             .locks
             .addr
-            .then(|| self.bound_socket.local_endpoint().addr);
+            .then(|| self.first_socket().local_endpoint().addr);
         Some(UnboundDatagram::new_disconnected(local_addr))
     }
 
-    pub(super) fn iface(&self) -> &Arc<Iface> {
-        self.bound_socket.iface()
+    /// Returns the ifaces of the bigtcp sockets.
+    pub(super) fn ifaces(&self) -> impl Iterator<Item = &Arc<Iface>> {
+        self.bound_sockets
+            .iter()
+            .map(|bound_socket| bound_socket.iface())
     }
 
-    pub(super) fn bound_port(&self) -> &BoundUdpPort {
-        self.bound_socket.bound_port()
+    pub(super) fn set_can_reuse(&self, can_reuse: bool) {
+        for bound_socket in self.bound_sockets.iter() {
+            bound_socket.bound_port().set_can_reuse(can_reuse);
+        }
+    }
+
+    /// Returns the bigtcp socket on `iface`.
+    fn socket_on(&self, iface: &Arc<Iface>) -> Result<(usize, &UdpSocket)> {
+        self.bound_sockets
+            .iter()
+            .enumerate()
+            .find(|(_, bound_socket)| bound_socket.iface().index() == iface.index())
+            .ok_or_else(|| {
+                Error::with_message(
+                    Errno::EADDRNOTAVAIL,
+                    "the socket is not bound on the route output iface",
+                )
+            })
+    }
+
+    /// Selects the bigtcp socket and the source address for sending datagrams to `remote`.
+    ///
+    /// If the source address is `None`, the address that the socket is bound at is used.
+    fn select_output(&self, remote: &IpEndpoint) -> Result<(&UdpSocket, Option<IpAddress>)> {
+        if let Some(source) = self.connected_source {
+            return Ok((&self.bound_sockets[source.socket_index], Some(source.addr)));
+        }
+
+        let first_socket = self.first_socket();
+        if !first_socket.local_endpoint().addr.is_unspecified() {
+            return Ok((first_socket, None));
+        }
+
+        // Like Linux, the source address is selected for each datagram by routing if the socket is
+        // bound at the unspecified address.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L1418-L1439>
+        let (iface, source_addr) = select_source(remote.addr)?;
+        let (_, bound_socket) = self.socket_on(&iface)?;
+        Ok((bound_socket, Some(source_addr)))
+    }
+
+    /// Sends a datagram to `remote` and returns the number of bytes sent and the iface to poll.
+    pub(super) fn send(
+        &self,
+        reader: &mut dyn MultiRead,
+        remote: &IpEndpoint,
+        _flags: SendFlags,
+    ) -> Result<(usize, &Arc<Iface>)> {
+        let len = reader.sum_lens();
+        if len > MAX_UDP_PAYLOAD_LEN {
+            return_errno_with_message!(Errno::EMSGSIZE, "the message is too large");
+        }
+
+        let (bound_socket, source_addr) = self.select_output(remote)?;
+
+        // User space cannot be accessed while holding spin locks, so the data are first copied to
+        // a kernel buffer. This also ensures that no packet is sent if the copy fails.
+        let mut data = vec![0u8; len];
+        reader.read(&mut VmWriter::from(data.as_mut_slice()))?;
+
+        let result = bound_socket.send(len, *remote, source_addr, |socket_buffer| {
+            socket_buffer.copy_from_slice(&data)
+        });
+
+        match result {
+            Ok(()) => Ok((len, bound_socket.iface())),
+            Err(SendError::TooLarge) => {
+                return_errno_with_message!(Errno::EMSGSIZE, "the message is too large");
+            }
+            Err(SendError::Unaddressable) => {
+                return_errno_with_message!(Errno::EINVAL, "the destination address is invalid");
+            }
+            Err(SendError::BufferFull) => {
+                return_errno_with_message!(Errno::EAGAIN, "the send buffer is full");
+            }
+        }
     }
 }
 
@@ -81,16 +190,44 @@ impl datagram_common::Bound for BoundDatagram {
     type Endpoint = IpEndpoint;
 
     fn local_endpoint(&self) -> Self::Endpoint {
-        self.bound_socket.local_endpoint()
+        let endpoint = self.first_socket().local_endpoint();
+        match self.connected_source {
+            Some(source) => IpEndpoint::new(source.addr, endpoint.port),
+            None => endpoint,
+        }
     }
 
     fn remote_endpoint(&self) -> Option<&Self::Endpoint> {
         self.remote_endpoint.as_ref()
     }
 
-    fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint) {
-        self.bound_socket.connect(*endpoint);
-        self.remote_endpoint = Some(*endpoint)
+    /// Connects to the remote endpoint.
+    ///
+    /// Like Linux, if the socket is bound at the unspecified address, the source address is
+    /// selected by routing on the first connection and is kept until the socket is disconnected.
+    /// Then the socket only receives datagrams at that address.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/datagram.c#L65-L74>
+    //
+    // TODO: The port is still bound at the unspecified address on all ifaces, so binding another
+    // socket to the same port at a different address still conflicts, which is not the case in
+    // Linux.
+    fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint) -> Result<()> {
+        if self.connected_source.is_none()
+            && self.first_socket().local_endpoint().addr.is_unspecified()
+        {
+            let (iface, addr) = select_source(endpoint.addr)?;
+            let (socket_index, _) = self.socket_on(&iface)?;
+            self.connected_source = Some(ConnectedSource { addr, socket_index });
+        }
+
+        let local_addr = self.connected_source.map(|source| source.addr);
+        for bound_socket in self.bound_sockets.iter() {
+            bound_socket.connect(*endpoint, local_addr);
+        }
+        self.remote_endpoint = Some(*endpoint);
+
+        Ok(())
     }
 
     fn try_recv(
@@ -101,9 +238,9 @@ impl datagram_common::Bound for BoundDatagram {
         // User space cannot be accessed while holding spin locks, so the packet is first copied to
         // a kernel buffer. If copying to user space fails later, the packet is dropped like Linux.
         let user_len = writer.sum_lens();
-        let result = self
-            .bound_socket
-            .recv(flags.receive_behavior(), |packet, udp_metadata| {
+        let mut result = Err(RecvError::Exhausted);
+        for bound_socket in self.bound_sockets.iter() {
+            result = bound_socket.recv(flags.receive_behavior(), |packet, udp_metadata| {
                 let copy_len = packet.len().min(user_len);
                 (
                     packet[..copy_len].to_vec(),
@@ -111,6 +248,10 @@ impl datagram_common::Bound for BoundDatagram {
                     packet.len(),
                 )
             });
+            if !matches!(result, Err(RecvError::Exhausted)) {
+                break;
+            }
+        }
 
         match result {
             Ok((data, endpoint, message_len)) => {
@@ -131,49 +272,29 @@ impl datagram_common::Bound for BoundDatagram {
         &self,
         reader: &mut dyn MultiRead,
         remote: &Self::Endpoint,
-        _flags: SendFlags,
+        flags: SendFlags,
     ) -> Result<usize> {
-        let len = reader.sum_lens();
-        if len > MAX_UDP_PAYLOAD_LEN {
-            return_errno_with_message!(Errno::EMSGSIZE, "the message is too large");
-        }
-
-        // User space cannot be accessed while holding spin locks, so the data are first copied to
-        // a kernel buffer. This also ensures that no packet is sent if the copy fails.
-        let mut data = vec![0u8; len];
-        reader.read(&mut VmWriter::from(data.as_mut_slice()))?;
-
-        let result = self.bound_socket.send(len, *remote, |socket_buffer| {
-            socket_buffer.copy_from_slice(&data)
-        });
-
-        match result {
-            Ok(()) => Ok(len),
-            Err(SendError::TooLarge) => {
-                return_errno_with_message!(Errno::EMSGSIZE, "the message is too large");
-            }
-            Err(SendError::Unaddressable) => {
-                return_errno_with_message!(Errno::EINVAL, "the destination address is invalid");
-            }
-            Err(SendError::BufferFull) => {
-                return_errno_with_message!(Errno::EAGAIN, "the send buffer is full");
-            }
-        }
+        self.send(reader, remote, flags).map(|(len, _)| len)
     }
 
     fn check_io_events(&self) -> IoEvents {
-        self.bound_socket.raw_with(|socket| {
-            let mut events = IoEvents::empty();
+        let mut can_recv = false;
+        let mut can_send = true;
+        for bound_socket in self.bound_sockets.iter() {
+            bound_socket.raw_with(|socket| {
+                can_recv |= socket.can_recv();
+                can_send &= socket.can_send();
+            });
+        }
 
-            if socket.can_recv() {
-                events |= IoEvents::IN;
-            }
-
-            if socket.can_send() {
-                events |= IoEvents::OUT;
-            }
-
-            events
-        })
+        let mut events = IoEvents::empty();
+        if can_recv {
+            events |= IoEvents::IN;
+        }
+        // Datagrams may be sent from any of the sockets.
+        if can_send {
+            events |= IoEvents::OUT;
+        }
+        events
     }
 }

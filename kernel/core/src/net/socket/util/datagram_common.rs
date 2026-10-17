@@ -37,7 +37,7 @@ pub(crate) trait Bound {
         return_errno_with_message!(Errno::EINVAL, "the socket is already bound to an address")
     }
     fn remote_endpoint(&self) -> Option<&Self::Endpoint>;
-    fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint);
+    fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint) -> Result<()>;
 
     fn try_recv(
         &self,
@@ -114,9 +114,7 @@ where
             }
             Inner::Bound(bound_datagram) => bound_datagram,
         };
-        bound_datagram.set_remote_endpoint(remote_endpoint);
-
-        Ok(())
+        bound_datagram.set_remote_endpoint(remote_endpoint)
     }
 
     pub(crate) fn peer_addr(&self) -> Option<&UnboundSocket::Endpoint> {

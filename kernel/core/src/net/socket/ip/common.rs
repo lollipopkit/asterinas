@@ -31,19 +31,6 @@ fn check_bind_privilege(endpoint: &IpEndpoint) -> Result<()> {
     check_port_privilege(endpoint.port)
 }
 
-pub(super) fn resolve_bind_iface_and_config(
-    endpoint: &IpEndpoint,
-    can_reuse: bool,
-) -> Result<(Arc<Iface>, BindPortConfig)> {
-    check_bind_privilege(endpoint)?;
-
-    let iface = route::lookup_local_iface(endpoint.addr)?;
-
-    let bind_port_config = BindPortConfig::new(*endpoint, can_reuse);
-
-    Ok((iface, bind_port_config))
-}
-
 /// Binds a local endpoint to ports on ifaces.
 ///
 /// A specified address is bound on the iface that owns it, which results in one port. An
@@ -165,10 +152,21 @@ impl From<BindError> for Error {
 }
 
 pub(super) fn get_ephemeral_endpoint(remote_endpoint: &IpEndpoint) -> Result<IpEndpoint> {
-    let route_dst = remote_endpoint.addr;
-    let iface = route::lookup_iface(route_dst)?;
+    let (_, source) = select_source(remote_endpoint.addr)?;
+    Ok(IpEndpoint::new(source, 0))
+}
 
-    let source = match route_dst {
+/// Selects the output iface and the source address for sending packets to `dst`.
+///
+/// This is how Linux chooses the source address if the socket is bound at the unspecified
+/// address.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/route.c#L2871-L2877>
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/fib_semantics.c#L2253-L2264>
+pub(super) fn select_source(dst: IpAddress) -> Result<(Arc<Iface>, IpAddress)> {
+    let iface = route::lookup_iface(dst)?;
+
+    let source = match dst {
         IpAddress::Ipv4(_) => iface
             .ipv4_cidr()
             .map(|cidr| IpAddress::Ipv4(cidr.address()))
@@ -189,7 +187,7 @@ pub(super) fn get_ephemeral_endpoint(remote_endpoint: &IpEndpoint) -> Result<IpE
             })?,
     };
 
-    Ok(IpEndpoint::new(source, 0))
+    Ok((iface, source))
 }
 
 /// Maps an unspecified `connect` destination to the loopback address.

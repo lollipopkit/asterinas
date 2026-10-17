@@ -28,8 +28,9 @@ impl datagram_common::Bound for BoundNetlinkUevent {
         Some(&self.remote_addr)
     }
 
-    fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint) {
+    fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint) -> Result<()> {
         self.remote_addr = *endpoint;
+        Ok(())
     }
 
     fn try_send(

@@ -40,6 +40,7 @@ sleep 0.2
 ./udp_broadcast
 ./udp_connected
 ./udp_err
+./udp_wildcard
 ./user_buffer_fault
 ./unix_datagram_err
 ./unix_seqpacket_err

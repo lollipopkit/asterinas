@@ -195,14 +195,11 @@ FN_TEST(udp_disconnect_bound_port)
 }
 END_TEST()
 
-// FIXME: Asterinas does not support binding UDP sockets to `INADDR_ANY` yet.
-#ifndef __asterinas__
 FN_TEST(udp_disconnect_bound_port_any_addr)
 {
 	TEST_DISCONNECT_BOUND_PORT(htonl(INADDR_ANY));
 }
 END_TEST()
-#endif
 
 FN_TEST(udp_disconnect_bound_addr)
 {
@@ -297,8 +294,6 @@ FN_TEST(inet_bind_unspec)
 }
 END_TEST()
 
-// FIXME: Asterinas does not support binding UDP sockets to `INADDR_ANY` yet.
-#ifndef __asterinas__
 FN_TEST(udp_bind_unspec_any_addr)
 {
 	struct sockaddr_in addr = unspec_inet;
@@ -311,7 +306,6 @@ FN_TEST(udp_bind_unspec_any_addr)
 	TEST_SUCC(close(sk));
 }
 END_TEST()
-#endif
 
 FN_TEST(tcp_disconnect_unconnected)
 {
