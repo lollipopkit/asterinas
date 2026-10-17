@@ -27,7 +27,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aster_core::{
     fs::vfs::{sync_all_file_systems, sync_policy::SyncPolicy},
@@ -42,7 +42,8 @@ use ostd::sync::{Mutex, SpinLock, WaitQueue};
 pub(crate) struct Tct {
     id: u64,
     flags: TctFlags,
-    nr_live_processes: AtomicUsize,
+    /// The PIDs of the processes in the TCT that have not exited.
+    processes: SpinLock<BTreeSet<u32>>,
     has_ended: AtomicBool,
     /// The epoch of the commit that has made the data of the TCT durable, or zero if the TCT
     /// has not been committed.
@@ -143,7 +144,7 @@ impl Tct {
         Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             flags,
-            nr_live_processes: AtomicUsize::new(1),
+            processes: SpinLock::new(BTreeSet::new()),
             has_ended: AtomicBool::new(false),
             commit_epoch: AtomicU64::new(0),
             effects: Mutex::new(Effects::default()),
@@ -170,6 +171,7 @@ impl Tct {
             COMMIT_WAIT_QUEUE.wake_all();
             return Err(err);
         }
+        self.processes.lock().insert(process.pid());
         // The TCT keeps running until it is inserted, because `process` is the current process,
         // which cannot exit before this returns, and the TCT cannot be ended before it can be
         // found by its ID. So no commit can start in between.
@@ -202,7 +204,7 @@ impl Tct {
         if self.has_ended.swap(true, Ordering::AcqRel) {
             return_errno_with_message!(Errno::EINVAL, "the TCT has already ended");
         }
-        if self.nr_live_processes.load(Ordering::Relaxed) > 0 {
+        if !self.processes.lock().is_empty() {
             state.nr_running -= 1;
             COMMIT_WAIT_QUEUE.wake_all();
         }
@@ -313,7 +315,12 @@ impl Tct {
 
     /// Returns the number of processes in the TCT that have not exited.
     pub(crate) fn nr_live_processes(&self) -> usize {
-        self.nr_live_processes.load(Ordering::Relaxed)
+        self.processes.lock().len()
+    }
+
+    /// Returns the PIDs of the processes in the TCT that have not exited, in ascending order.
+    pub(crate) fn live_processes(&self) -> Vec<u32> {
+        self.processes.lock().iter().copied().collect()
     }
 
     /// Exports the recorded effects.
@@ -375,7 +382,7 @@ pub(crate) struct TctAuditHooks;
 impl AuditHooks for TctAuditHooks {
     fn on_fork(&self, _parent: &Process, child: &Process) {
         if let Some(tct) = Tct::of(child) {
-            tct.nr_live_processes.fetch_add(1, Ordering::Relaxed);
+            tct.processes.lock().insert(child.pid());
         }
     }
 
@@ -386,9 +393,9 @@ impl AuditHooks for TctAuditHooks {
         // A fork only adds a process to a TCT with a live process, so the TCT only stops
         // running here or in `Tct::end`, which serialize on the commit state.
         let mut state = COMMIT_STATE.lock();
-        if tct.nr_live_processes.fetch_sub(1, Ordering::Relaxed) == 1
-            && !tct.has_ended.load(Ordering::Acquire)
-        {
+        let mut processes = tct.processes.lock();
+        processes.remove(&process.pid());
+        if processes.is_empty() && !tct.has_ended.load(Ordering::Acquire) {
             state.nr_running -= 1;
             COMMIT_WAIT_QUEUE.wake_all();
         }
