@@ -4,7 +4,7 @@ use aster_bigtcp::wire::IpEndpoint;
 use bound::BoundDatagram;
 use unbound::{BindOptions, UnboundDatagram};
 
-use super::{addr::UNSPECIFIED_LOCAL_ENDPOINT, ioctl::ipv4_ioctl};
+use super::{addr::IpAddressFamily, ioctl::ipv4_ioctl};
 use crate::{
     events::IoEvents,
     fs::file::FileCommon,
@@ -89,6 +89,22 @@ impl DatagramSocket {
         Ok(result)
     }
 
+    /// Dissolves the association with the remote endpoint.
+    fn disconnect(&self) {
+        let mut inner = self.inner.write();
+
+        let unbound = match &mut *inner {
+            Inner::Unbound(_) => None,
+            Inner::Bound(bound_datagram) => bound_datagram.disconnect(),
+        };
+        if let Some(unbound) = unbound {
+            *inner = Inner::Unbound(unbound);
+        }
+
+        drop(inner);
+        self.pollee.invalidate();
+    }
+
     fn try_send(
         &self,
         reader: &mut dyn MultiRead,
@@ -146,7 +162,7 @@ impl SocketPrivate for DatagramSocket {
 
 impl Socket for DatagramSocket {
     fn bind(&self, socket_addr: SocketAddr) -> Result<()> {
-        let endpoint = socket_addr.try_into()?;
+        let endpoint = IpAddressFamily::IPv4.to_bind_endpoint(socket_addr)?;
         let can_reuse = self.options.read().socket.reuse_addr();
 
         self.inner
@@ -155,7 +171,14 @@ impl Socket for DatagramSocket {
     }
 
     fn connect(&self, socket_addr: SocketAddr) -> Result<()> {
-        let endpoint = map_unspecified_to_localhost(socket_addr.try_into()?);
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L588-L589>
+        if let SocketAddr::Unspec(_) = socket_addr {
+            self.disconnect();
+            return Ok(());
+        }
+
+        let endpoint =
+            map_unspecified_to_localhost(IpAddressFamily::IPv4.to_endpoint(socket_addr)?);
         let can_broadcast = self.options.read().socket.broadcast();
         if !can_broadcast && is_broadcast_endpoint(&endpoint) {
             return_errno_with_message!(
@@ -168,11 +191,10 @@ impl Socket for DatagramSocket {
     }
 
     fn addr(&self) -> Result<SocketAddr> {
-        let endpoint = self
-            .inner
-            .read()
-            .addr()
-            .unwrap_or(UNSPECIFIED_LOCAL_ENDPOINT);
+        let endpoint = match &*self.inner.read() {
+            Inner::Unbound(unbound_datagram) => unbound_datagram.local_endpoint(),
+            Inner::Bound(bound_datagram) => bound_datagram.local_endpoint(),
+        };
 
         Ok(endpoint.into())
     }
@@ -203,7 +225,7 @@ impl Socket for DatagramSocket {
         } = message_header;
 
         let endpoint = match addr {
-            Some(addr) => Some(addr.try_into()?),
+            Some(addr) => Some(IpAddressFamily::IPv4.to_send_endpoint(addr)?),
             None => None,
         };
 

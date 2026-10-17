@@ -73,6 +73,8 @@ impl UnixDatagramSocket {
 
         *remote_queue_a = Some(socket_b.local_receiver.queue().clone());
         *remote_queue_b = Some(socket_a.local_receiver.queue().clone());
+        socket_a.local_receiver.set_peer(remote_queue_a.as_ref());
+        socket_b.local_receiver.set_peer(remote_queue_b.as_ref());
 
         (Arc::new(socket_a), Arc::new(socket_b))
     }
@@ -120,6 +122,8 @@ impl UnixDatagramSocket {
         };
 
         // A connected socket will automatically be disconnected if the remote has been closed.
+        // Like Linux, the received messages are dropped as well.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2209-L2220>
         if remote.is_none() && res.is_err_and(|err| err.error() == Errno::ECONNREFUSED) {
             let mut remote_queue = self.remote_queue.write();
             // Check to ensure that we are still connected to the same remote.
@@ -128,6 +132,7 @@ impl UnixDatagramSocket {
                 .is_some_and(|remote| Arc::ptr_eq(remote, &queue))
             {
                 *remote_queue = None;
+                self.local_receiver.set_peer(None);
             }
         }
 
@@ -171,13 +176,31 @@ impl Socket for UnixDatagramSocket {
     }
 
     fn connect(&self, socket_addr: SocketAddr) -> Result<()> {
-        let remote_addr = UnixSocketAddr::try_from(socket_addr)?;
+        // An `AF_UNSPEC` address dissolves the association.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L1520-L1567>
+        let new_queue = match socket_addr {
+            SocketAddr::Unspec(_) => None,
+            socket_addr => {
+                let remote_addr = UnixSocketAddr::try_from(socket_addr)?;
+                let connected_addr = remote_addr.connect()?;
+                let queue = MessageQueue::lookup_bound(&connected_addr)?;
+                // Like Linux, a socket cannot connect to a socket connected to another socket.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L1551>
+                if !queue.accepts_from(self.local_receiver.queue()) {
+                    return_errno_with_message!(
+                        Errno::EPERM,
+                        "the target socket is connected to another socket"
+                    );
+                }
+                Some(queue)
+            }
+        };
 
-        let connected_addr = remote_addr.connect()?;
-        let queue = MessageQueue::lookup_bound(&connected_addr)?;
-
+        // The lock serializes peer changes, including automatic disconnections in `do_send`.
+        // TODO: Report `ECONNRESET` to the old peer if it is connected to this socket.
         let mut remote_queue = self.remote_queue.write();
-        *remote_queue = Some(queue);
+        self.local_receiver.set_peer(new_queue.as_ref());
+        *remote_queue = new_queue;
 
         Ok(())
     }

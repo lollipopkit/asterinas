@@ -10,7 +10,11 @@ use super::{
     unix,
     vsock::CSocketAddrVm,
 };
-use crate::{context::current_userspace, net::socket::util::SocketAddr, prelude::*};
+use crate::{
+    context::current_userspace,
+    net::socket::util::{SocketAddr, UnspecSocketAddr},
+    prelude::*,
+};
 
 /// Address family.
 ///
@@ -117,7 +121,8 @@ pub(crate) enum CSocketAddrFamily {
     AF_MCTP = 45,
 }
 
-const ADDR_MAX_LEN: usize = 128;
+/// The size of `struct sockaddr_storage`.
+pub(in crate::util::net) const ADDR_MAX_LEN: usize = 128;
 
 /// Storage that can contain _any_ socket addresses.
 ///
@@ -153,6 +158,12 @@ pub(crate) fn read_socket_addr_from_user(addr: Vaddr, addr_len: usize) -> Result
     current_userspace!().read_bytes(addr, &mut storage.as_mut_bytes()[..addr_len])?;
 
     let result = match CSocketAddrFamily::try_from(storage.sa_family as i32) {
+        Ok(CSocketAddrFamily::AF_UNSPEC) => {
+            // The length is checked by the IPv4 sockets that read the address as an `AF_INET` one.
+            let inet = (addr_len >= size_of::<CSocketAddrInet>())
+                .then(|| CSocketAddrInet::from_first_bytes(storage.as_bytes()).into());
+            SocketAddr::Unspec(UnspecSocketAddr::new(inet))
+        }
         Ok(CSocketAddrFamily::AF_INET) => {
             if addr_len < size_of::<CSocketAddrInet>() {
                 return_errno_with_message!(Errno::EINVAL, "the socket address length is too small");
@@ -276,6 +287,11 @@ pub(crate) fn write_socket_addr_with_max_len(
         SocketAddr::Vsock(addr) => {
             write_c_socket_address_util::<CSocketAddrVm, _>(*addr, dest, max_len as usize)?
         }
+        SocketAddr::Unspec(_) => write_c_socket_address_util::<u16, _>(
+            CSocketAddrFamily::AF_UNSPEC as u16,
+            dest,
+            max_len as usize,
+        )?,
     };
 
     Ok(actual_len as i32)

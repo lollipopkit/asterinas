@@ -325,6 +325,30 @@ impl StreamSocket {
         self.family == IpAddressFamily::IPv6 && !options.ipv6.v6only()
     }
 
+    /// Dissolves the association, which is what `connect(AF_UNSPEC)` does.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L651-L656>
+    fn disconnect(&self) -> Result<()> {
+        let mut state = self.write_updated_state();
+
+        match state.as_mut() {
+            State::Init(init_stream) => {
+                init_stream.disconnect();
+                Ok(())
+            }
+            // TODO: Reset connections and stop listening like `tcp_disconnect` in Linux. This
+            // requires releasing or keeping the bound ports as `tcp_set_state(TCP_CLOSE)` does.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp.c#L3360>
+            State::Connecting(_) | State::Connected(_) | State::Listen(_) => {
+                warn!("disconnecting a connecting, connected, or listening TCP socket");
+                return_errno_with_message!(
+                    Errno::EOPNOTSUPP,
+                    "disconnecting a connecting, connected, or listening TCP socket is not supported"
+                )
+            }
+        }
+    }
+
     fn check_connect(&self) -> Result<()> {
         let mut state = self.write_updated_state();
 
@@ -516,7 +540,7 @@ impl SocketPrivate for StreamSocket {
 
 impl Socket for StreamSocket {
     fn bind(&self, socket_addr: SocketAddr) -> Result<()> {
-        let endpoint = socket_addr.try_into()?;
+        let endpoint = self.family.to_bind_endpoint(socket_addr)?;
 
         let mut state = self.write_updated_state();
         let State::Init(init_stream) = state.as_mut() else {
@@ -533,6 +557,10 @@ impl Socket for StreamSocket {
     }
 
     fn connect(&self, socket_addr: SocketAddr) -> Result<()> {
+        if let SocketAddr::Unspec(_) = socket_addr {
+            return self.disconnect();
+        }
+
         let remote_endpoint = socket_addr.try_into()?;
 
         if let Some(result) = self.start_connect(&remote_endpoint) {

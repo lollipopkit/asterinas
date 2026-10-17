@@ -35,6 +35,17 @@ struct Inner {
     messages: VecDeque<Message>,
     total_length: usize,
     is_shutdown: bool,
+    /// The queue of the peer that the socket is connected to.
+    peer: Option<Weak<MessageQueue>>,
+}
+
+impl Inner {
+    /// Returns whether the socket accepts messages from the socket that owns `source`.
+    fn accepts_from(&self, source: &Arc<MessageQueue>) -> bool {
+        self.peer
+            .as_ref()
+            .is_none_or(|peer| core::ptr::eq(peer.as_ptr(), Arc::as_ptr(source)))
+    }
 }
 
 struct Message {
@@ -63,6 +74,16 @@ impl MessageQueue {
         };
         if inner.is_shutdown {
             return_errno_with_message!(Errno::EPIPE, "the target socket is shut down");
+        }
+        // Like Linux, a socket connected to a peer only accepts messages from that peer. This is
+        // checked with the lock held, so no messages from an old peer can be queued after the
+        // peer changes.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2187>
+        if !inner.accepts_from(&source.queue) {
+            return_errno_with_message!(
+                Errno::EPERM,
+                "the target socket is connected to another socket"
+            );
         }
 
         let len = reader.sum_lens();
@@ -104,6 +125,16 @@ impl MessageQueue {
         self.addr.get().cloned().unwrap_or(UnixSocketAddr::Unnamed)
     }
 
+    /// Returns whether the socket accepts messages from the socket that owns `source`.
+    ///
+    /// A closed socket accepts no messages.
+    pub(super) fn accepts_from(&self, source: &Arc<MessageQueue>) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(|inner| inner.accepts_from(source))
+    }
+
     /// Blocks until the buffer is free and the `try_send` succeeds, or until interrupted.
     pub(super) fn block_send<F, R>(&self, timeout: Option<Duration>, mut try_send: F) -> Result<R>
     where
@@ -140,6 +171,7 @@ impl MessageReceiver {
             messages: VecDeque::new(),
             total_length: 0,
             is_shutdown: false,
+            peer: None,
         };
 
         let queue = MessageQueue {
@@ -215,6 +247,34 @@ impl MessageReceiver {
 
         let output = RecvOutput::new_for_packet(flags, len, message_len);
         Ok((output, ctrl_msgs, src))
+    }
+
+    /// Sets the queue of the peer that the socket is connected to.
+    ///
+    /// Like Linux, the received messages are dropped if the socket is disconnected from its peer
+    /// or connected to another peer.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L1572-L1589>
+    pub(super) fn set_peer(&self, peer: Option<&Arc<MessageQueue>>) {
+        let mut inner = self.queue.inner.lock();
+        let inner = inner.as_mut().unwrap();
+
+        let new_peer = peer.map(Arc::downgrade);
+        let old_peer = core::mem::replace(&mut inner.peer, new_peer);
+        let is_changed = old_peer.is_some_and(|old_peer| {
+            inner
+                .peer
+                .as_ref()
+                .is_none_or(|new_peer| !Weak::ptr_eq(&old_peer, new_peer))
+        });
+        if !is_changed {
+            return;
+        }
+
+        inner.messages.clear();
+        inner.total_length = 0;
+
+        self.queue.pollee.invalidate();
+        self.queue.send_wait_queue.wake_all();
     }
 
     pub(super) fn shutdown(&self) {

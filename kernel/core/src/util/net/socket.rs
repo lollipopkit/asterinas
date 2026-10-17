@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::read_socket_addr_from_user;
+use super::{addr::ADDR_MAX_LEN, read_socket_addr_from_user};
 use crate::{
     net::socket::util::{ControlMessage, RecvFlags, SocketAddr},
     prelude::*,
@@ -99,11 +99,17 @@ pub(crate) struct CUserMsgHdr {
 
 impl CUserMsgHdr {
     pub(crate) fn read_socket_addr_from_user(&self) -> Result<Option<SocketAddr>> {
-        if self.msg_name == 0 {
+        // A null name or a zero length means no address, and a length that is too large is
+        // truncated.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/socket.c#L2573-L2597>
+        if self.msg_name == 0 || self.msg_namelen == 0 {
             return Ok(None);
         }
+        let Ok(namelen) = usize::try_from(self.msg_namelen) else {
+            return_errno_with_message!(Errno::EINVAL, "the socket address length is negative");
+        };
 
-        let socket_addr = read_socket_addr_from_user(self.msg_name, self.msg_namelen as usize)?;
+        let socket_addr = read_socket_addr_from_user(self.msg_name, namelen.min(ADDR_MAX_LEN))?;
         Ok(Some(socket_addr))
     }
 
