@@ -12,7 +12,7 @@ use core::fmt::{self, Write};
 /// An empty set produces nothing.
 ///
 /// Reference: `bitmap_list_string` (`%*pbl`) in
-/// <https://elixir.bootlin.com/linux/v7.2/source/lib/vsprintf.c#L1270-L1297>.
+/// <https://elixir.bootlin.com/linux/v7.2.10/source/lib/vsprintf.c#L1270-L1297>.
 pub(crate) fn write_cpu_list<W: Write + ?Sized>(
     w: &mut W,
     cpus: impl IntoIterator<Item = u32>,
@@ -44,7 +44,7 @@ pub(crate) fn write_cpu_list<W: Write + ?Sized>(
 /// CPUs at or beyond `nr_bits` are ignored.
 ///
 /// Reference: `bitmap_string` (`%*pb`) in
-/// <https://elixir.bootlin.com/linux/v7.2/source/lib/vsprintf.c#L1226-L1267>.
+/// <https://elixir.bootlin.com/linux/v7.2.10/source/lib/vsprintf.c#L1226-L1267>.
 pub(crate) fn write_cpu_mask<W: Write + ?Sized>(
     w: &mut W,
     cpus: impl IntoIterator<Item = u32>,

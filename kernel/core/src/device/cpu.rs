@@ -9,8 +9,8 @@
 //! OSTD brings up every CPU before the kernel starts, and CPUs cannot go offline,
 //! so every CPU is possible, present, enabled, and online.
 //!
-//! Reference: <https://elixir.bootlin.com/linux/v7.2/source/drivers/base/cpu.c>
-//! and <https://elixir.bootlin.com/linux/v7.2/source/drivers/base/topology.c>.
+//! Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/drivers/base/cpu.c>
+//! and <https://elixir.bootlin.com/linux/v7.2.10/source/drivers/base/topology.c>.
 
 use core::fmt::Write;
 
@@ -62,7 +62,7 @@ impl Bus for CpuBus {
 
 type CpuDevice = BusDevice<CpuBus>;
 
-// Reference: <https://elixir.bootlin.com/linux/v7.2/source/drivers/base/cpu.c#L208-L314>.
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/drivers/base/cpu.c#L208-L314>.
 const ROOT_GROUPS: &[AttrGroup<BareDevice>] = &[AttrGroup::unnamed(&[
     Attr::ro("online", show_all_cpus),
     Attr::ro("possible", show_all_cpus),
@@ -99,8 +99,8 @@ const CPU_GROUPS: &[AttrGroup<CpuDevice>] = &[AttrGroup::named("topology", TOPOL
 /// The files depend on the architecture, as in Linux:
 /// only x86 has dies, and LoongArch has no clusters.
 ///
-/// Reference: <https://elixir.bootlin.com/linux/v7.2/source/drivers/base/topology.c#L59-L185>
-/// and <https://elixir.bootlin.com/linux/v7.2/source/include/linux/topology.h#L180-L230>.
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/drivers/base/topology.c#L59-L185>
+/// and <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/topology.h#L180-L230>.
 const TOPOLOGY_ATTRS: &[Attr<CpuDevice>] = &[
     Attr::ro("physical_package_id", |dev, w| {
         show_id(w, topology::get(cpu_of(dev)).package_id)

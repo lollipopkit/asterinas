@@ -837,7 +837,7 @@ impl fmt::Display for CpuInformation {
             writeln!(f, "cache size\t: {} KB", cache_size)?;
         }
 
-        // Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/cpu/proc.c#L23-L28>.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/proc.c#L23-L28>.
         let cpu = CpuId::try_from(self.processor as usize).unwrap();
         let cpu_topology = topology::get(cpu);
         write!(
@@ -902,7 +902,7 @@ impl fmt::Display for CpuInformation {
 
 /// Probes the topology of the current CPU from CPUID.
 ///
-/// Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/cpu/topology_common.c#L115-L193>.
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_common.c#L115-L193>.
 pub(crate) fn probe_topology(_guard: &DisabledPreemptGuard) -> CpuTopology {
     let mut scan = TopologyScan::default();
     let Some(CpuidResult {
@@ -953,7 +953,7 @@ pub(crate) fn probe_topology(_guard: &DisabledPreemptGuard) -> CpuTopology {
 
 /// The x86 topology domains, from the innermost.
 ///
-/// Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/topology.h#L106-L115>.
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/include/asm/topology.h#L106-L115>.
 #[derive(Clone, Copy)]
 enum TopoDomain {
     Smt = 0,
@@ -992,7 +992,7 @@ impl TopologyScan {
 
     /// Parses the first available extended topology leaf.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/cpu/topology_ext.c#L136-L146>.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_ext.c#L136-L146>.
     fn parse_ext_leaves(&mut self) -> bool {
         use TopoDomain::*;
 
@@ -1008,7 +1008,7 @@ impl TopologyScan {
 
     /// Parses the subleaves of an extended topology leaf until an invalid one.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/cpu/topology_ext.c#L45-L134>.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_ext.c#L45-L134>.
     fn parse_ext_leaf(&mut self, leaf: u32, map: &[TopoDomain]) -> bool {
         let mut last_dom = 0;
         let mut subleaf = 0;
@@ -1053,7 +1053,7 @@ impl TopologyScan {
     /// Derives the domains from the core count in leaf 4 and the logical processor count in
     /// leaf 1.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/cpu/topology_common.c#L65-L101>.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_common.c#L65-L101>.
     fn parse_legacy(&mut self, has_ht: bool, nproc_shift: u32) {
         let mut cores = match cpuid(CpuidLeaf::Cache as u32, 0) {
             // EAX bits 04-00: Cache type, 0 meaning none.
@@ -1075,7 +1075,7 @@ impl TopologyScan {
 
     /// Derives the core domain from AMD leaf 0x8000_0008.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/cpu/topology_amd.c#L12-L46>.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_amd.c#L12-L46>.
     fn parse_amd_0x8000_0008(&mut self) -> bool {
         let Some(CpuidResult { ecx, .. }) = cpuid(CpuidLeaf::ExtAddrSizes as u32, 0) else {
             return false;
@@ -1094,7 +1094,7 @@ impl TopologyScan {
 
     /// Derives the APIC ID and the SMT domain from AMD leaf 0x8000_001E.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/cpu/topology_amd.c#L63-L111>.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_amd.c#L63-L111>.
     fn parse_amd_0x8000_001e(&mut self, leaf1_eax: u32) {
         // CPUID 0x8000_0001 ECX bit 22: TOPOEXT.
         let has_topoext =
@@ -1134,7 +1134,7 @@ impl TopologyScan {
 
     /// Returns the IDs that Linux derives from the APIC ID.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/cpu/topology_common.c#L177-L198>.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_common.c#L177-L198>.
     fn topology(&self, cluster_id: Option<u32>) -> CpuTopology {
         let pkg_mask = ((1u64 << self.shifts[TopoDomain::Pkg as usize]) - 1) as u32;
         CpuTopology {
@@ -1150,7 +1150,7 @@ impl TopologyScan {
 
 /// Returns the ID of the L2 cache of the CPU with `apicid`, from Intel leaf 4.
 ///
-/// Reference: <https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/cpu/cacheinfo.c#L413-L472>.
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/cacheinfo.c#L413-L472>.
 fn intel_l2_cache_id(apicid: u32) -> Option<u32> {
     let mut l2_id = None;
     for subleaf in 0.. {
