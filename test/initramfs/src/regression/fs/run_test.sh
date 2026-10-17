@@ -152,6 +152,7 @@ TEST_TMPDIR=/ext2 ./direct_io/direct_io
 
 ./procfs/dentry_cache
 ./procfs/fd
+./procfs/fs_links
 ./procfs/getdents
 ./procfs/mountstats
 ./procfs/pid_mem
