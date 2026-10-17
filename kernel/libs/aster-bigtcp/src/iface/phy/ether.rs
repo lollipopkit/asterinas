@@ -185,6 +185,16 @@ impl<D, E: Ext> EtherIface<D, E> {
                     return None;
                 }
 
+                // Like Linux, learn the address of the sender, since the sender is likely to
+                // receive a reply from us soon. Otherwise, the first reply would be dropped while
+                // we resolve the address ourselves.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L853>
+                if iface_cx.in_same_network(&IpAddress::Ipv4(*source_protocol_addr)) {
+                    self.arp_table
+                        .lock()
+                        .insert(*source_protocol_addr, *source_hardware_addr);
+                }
+
                 Some(ArpRepr::EthernetIpv4 {
                     operation: ArpOperation::Reply,
                     source_hardware_addr: self.ether_addr,
