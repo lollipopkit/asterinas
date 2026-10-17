@@ -73,6 +73,8 @@ impl UnixDatagramSocket {
 
         *remote_queue_a = Some(socket_b.local_receiver.queue().clone());
         *remote_queue_b = Some(socket_a.local_receiver.queue().clone());
+        socket_a.local_receiver.set_peer(remote_queue_a.as_ref());
+        socket_b.local_receiver.set_peer(remote_queue_b.as_ref());
 
         (Arc::new(socket_a), Arc::new(socket_b))
     }
@@ -130,8 +132,7 @@ impl UnixDatagramSocket {
                 .is_some_and(|remote| Arc::ptr_eq(remote, &queue))
             {
                 *remote_queue = None;
-                drop(remote_queue);
-                self.local_receiver.purge();
+                self.local_receiver.set_peer(None);
             }
         }
 
@@ -182,22 +183,24 @@ impl Socket for UnixDatagramSocket {
             socket_addr => {
                 let remote_addr = UnixSocketAddr::try_from(socket_addr)?;
                 let connected_addr = remote_addr.connect()?;
-                Some(MessageQueue::lookup_bound(&connected_addr)?)
+                let queue = MessageQueue::lookup_bound(&connected_addr)?;
+                // Like Linux, a socket cannot connect to a socket connected to another socket.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L1551>
+                if !queue.accepts_from(self.local_receiver.queue()) {
+                    return_errno_with_message!(
+                        Errno::EPERM,
+                        "the target socket is connected to another socket"
+                    );
+                }
+                Some(queue)
             }
         };
 
-        let old_queue = core::mem::replace(&mut *self.remote_queue.write(), new_queue.clone());
-
-        // Like Linux, the received messages are dropped if the peer changes.
-        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L1572-L1589>
+        // The lock serializes peer changes, including automatic disconnections in `do_send`.
         // TODO: Report `ECONNRESET` to the old peer if it is connected to this socket.
-        if old_queue.is_some_and(|old_queue| {
-            new_queue
-                .as_ref()
-                .is_none_or(|new_queue| !Arc::ptr_eq(&old_queue, new_queue))
-        }) {
-            self.local_receiver.purge();
-        }
+        let mut remote_queue = self.remote_queue.write();
+        self.local_receiver.set_peer(new_queue.as_ref());
+        *remote_queue = new_queue;
 
         Ok(())
     }

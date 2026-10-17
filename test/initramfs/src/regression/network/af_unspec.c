@@ -390,6 +390,40 @@ FN_TEST(unix_dgram_disconnect)
 }
 END_TEST()
 
+FN_TEST(unix_dgram_peer_only)
+{
+	struct sockaddr_un addr_a, addr_b, addr_c;
+	socklen_t addrlen_a, addrlen_b, addrlen_c;
+	char buf[2];
+	int sk_a, sk_b, sk_c;
+
+	sk_a = new_abstract_unix_dgram("af_unspec_pa", &addr_a, &addrlen_a);
+	sk_b = new_abstract_unix_dgram("af_unspec_pb", &addr_b, &addrlen_b);
+	sk_c = new_abstract_unix_dgram("af_unspec_pc", &addr_c, &addrlen_c);
+	TEST_SUCC(connect(sk_a, (struct sockaddr *)&addr_b, addrlen_b));
+
+	// A connected socket only accepts messages and connections from its peer.
+	TEST_ERRNO(sendto(sk_c, "a", 1, 0, (struct sockaddr *)&addr_a, addrlen_a),
+		   EPERM);
+	TEST_ERRNO(connect(sk_c, (struct sockaddr *)&addr_a, addrlen_a), EPERM);
+	TEST_RES(sendto(sk_b, "b", 1, 0, (struct sockaddr *)&addr_a, addrlen_a),
+		 _ret == 1);
+	TEST_RES(recv(sk_a, buf, sizeof(buf), MSG_DONTWAIT),
+		 _ret == 1 && buf[0] == 'b');
+
+	// After disconnecting, it accepts messages from others again.
+	TEST_SUCC(connect(sk_a, &unspec_addr, UNSPEC_LEN));
+	TEST_RES(sendto(sk_c, "c", 1, 0, (struct sockaddr *)&addr_a, addrlen_a),
+		 _ret == 1);
+	TEST_RES(recv(sk_a, buf, sizeof(buf), MSG_DONTWAIT),
+		 _ret == 1 && buf[0] == 'c');
+
+	TEST_SUCC(close(sk_a));
+	TEST_SUCC(close(sk_b));
+	TEST_SUCC(close(sk_c));
+}
+END_TEST()
+
 FN_TEST(unix_stream_unspec)
 {
 	int sk;
