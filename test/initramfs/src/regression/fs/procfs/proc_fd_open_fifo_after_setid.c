@@ -37,28 +37,14 @@ FN_TEST(open_fifo_via_proc_fd_after_setid)
 		CHECK(setresgid(-1, 65535, -1));
 		CHECK(setresuid(-1, 65535, -1));
 
-		/*
-		 * FIXME: Asterinas does not support the "dumpable" attribute
-		 * yet. So procfs files are always owned by the user
-		 * corresponding to the thread's effective UID.
-		 *
-		 * When resolving this FIXME, keep in mind that if the
-		 * "dumpable" attribute is not set, the procfs fd entry below
-		 * will be owned by the root user. However, the re-open should
-		 * still succeed because Linux uses special logic to bypass
-		 * the permission check.
-		 */
-#ifdef __asterinas__
-		CHECK(prctl(PR_SET_DUMPABLE, 1));
-		CHECK_WITH(prctl(PR_GET_DUMPABLE), _ret != 1);
-#else
+		// Changing the effective IDs makes the process non-dumpable, so its
+		// procfs files are owned by the root user until it becomes dumpable.
 		CHECK_WITH(prctl(PR_GET_DUMPABLE), _ret != 1);
 		CHECK_WITH(stat("/proc/self/fd", &proc_dir_stat),
 			   proc_dir_stat.st_uid == 0 &&
 				   proc_dir_stat.st_gid == 0);
 		CHECK(prctl(PR_SET_DUMPABLE, 1));
 		CHECK_WITH(prctl(PR_GET_DUMPABLE), _ret == 1);
-#endif
 
 		CHECK_WITH(stat("/proc/self/fd", &proc_dir_stat),
 			   proc_dir_stat.st_uid == 65535 &&

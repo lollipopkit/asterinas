@@ -206,23 +206,34 @@ static int try_open_proc_mem(pid_t target)
 
 static int access_from_sibling(int drop_cap, int switch_user)
 {
-	int pipe_block[2];
+	int pipe_block[2], pipe_ready[2];
 	CHECK(pipe(pipe_block));
+	CHECK(pipe(pipe_ready));
 
 	pid_t target = CHECK(fork());
 	if (target == 0) {
 		CHECK(close(pipe_block[1]));
+		CHECK(close(pipe_ready[0]));
 		if (drop_cap) {
 			// Keep the target capability same with the accessor,
 			// to pass Linux commoncap checks.
 			drop_capability(CAP_SYS_PTRACE);
 		}
+		CHECK(write(pipe_ready[1], "R", 1));
+		CHECK(close(pipe_ready[1]));
 		char ch;
 		CHECK(read(pipe_block[0], &ch, 1));
 		CHECK(close(pipe_block[0]));
 		exit(EXIT_SUCCESS);
 	}
 	CHECK(close(pipe_block[0]));
+	CHECK(close(pipe_ready[1]));
+
+	// Wait until the target has dropped the capability, so that the access
+	// check does not race with it.
+	char ready;
+	CHECK_WITH(read(pipe_ready[0], &ready, 1), _ret == 1);
+	CHECK(close(pipe_ready[0]));
 
 	int pipe_res[2];
 	CHECK(pipe(pipe_res));

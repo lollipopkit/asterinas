@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use aster_rights::{ReadDupOp, ReadOp, ReadWriteOp};
+use aster_rights::{ReadDupOp, ReadOp};
 use aster_util::fixed_str::FixedCStr;
 use ostd::{
     sync::{RoArc, RwMutexReadGuard, Waker},
@@ -31,6 +31,7 @@ use crate::{
 pub(crate) mod alien_access;
 mod builder;
 mod cpu_sync;
+mod credentials_update;
 mod exit;
 pub(crate) mod futex;
 mod personality;
@@ -40,6 +41,7 @@ mod robust_list;
 mod thread_local;
 
 pub(crate) use builder::PosixThreadBuilder;
+pub(crate) use credentials_update::CredentialsUpdate;
 pub(super) use exit::sigkill_other_threads;
 pub(crate) use exit::{do_exit, do_exit_group};
 pub(crate) use personality::Personality;
@@ -363,7 +365,10 @@ pub(crate) trait ContextPthreadAdminApi {
     fn save_and_set_sig_mask(&self, sig_mask: SigMask);
 
     /// Gets the read-write credentials of the current thread.
-    fn credentials_mut(&self) -> Credentials<ReadWriteOp>;
+    ///
+    /// The process stays non-dumpable while the returned value is alive, see
+    /// [`CredentialsUpdate`] for details.
+    fn credentials_mut(&self) -> CredentialsUpdate<'_>;
 }
 
 impl ContextPthreadAdminApi for Context<'_> {
@@ -386,8 +391,11 @@ impl ContextPthreadAdminApi for Context<'_> {
         self.set_sig_mask(sig_mask);
     }
 
-    fn credentials_mut(&self) -> Credentials<ReadWriteOp> {
-        self.posix_thread.credentials.dup().restrict()
+    fn credentials_mut(&self) -> CredentialsUpdate<'_> {
+        CredentialsUpdate::new(
+            self.posix_thread.credentials.dup().restrict(),
+            &self.process,
+        )
     }
 }
 

@@ -4,7 +4,7 @@
 
 use ostd::{arch::cpu::context::UserContext, task::Task, user::UserContextApi};
 
-use super::{Process, Session};
+use super::{Dumpable, Process, Session};
 use crate::{
     fs::{
         thread_info::ThreadFsInfo,
@@ -70,6 +70,7 @@ fn create_init_process(
         oom_score_adj,
         sig_dispositions,
         user_ns,
+        Dumpable::Owner,
     );
 
     let init_task = create_init_task(pid, &init_proc, fs, vmar, executable_path, argv, envp)?;
