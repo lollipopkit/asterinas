@@ -325,26 +325,41 @@ impl<E: Ext> PollContext<'_, E> {
         udp_repr: &UdpRepr,
         udp_payload: PacketSlice<'_>,
     ) -> bool {
-        let mut processed = false;
-        let is_unicast = self.iface.context().is_unicast(ip_repr.dst_addr());
+        let candidates = self
+            .sockets
+            .udp_socket_iter()
+            .filter(|socket| socket.can_process(udp_repr.dst_port));
 
-        for socket in self.sockets.udp_socket_iter() {
-            if !socket.can_process(udp_repr.dst_port) {
-                continue;
+        if !self.iface.context().is_unicast(ip_repr.dst_addr()) {
+            let mut processed = false;
+            for socket in candidates {
+                processed |= socket.process(
+                    self.iface.context_mut(),
+                    ip_repr,
+                    udp_repr,
+                    udp_payload.clone(),
+                );
             }
+            return processed;
+        }
 
-            processed |= socket.process(
-                self.iface.context_mut(),
-                ip_repr,
-                udp_repr,
-                udp_payload.clone(),
-            );
-            if processed && is_unicast {
-                break;
+        // Like Linux, deliver a unicast packet to the socket that matches it best. If multiple
+        // sockets match equally well, the first one wins.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L446>
+        let mut best = None;
+        for socket in candidates {
+            let Some(score) = socket.score(ip_repr, udp_repr) else {
+                continue;
+            };
+            if best.is_none_or(|(_, best_score)| score > best_score) {
+                best = Some((socket, score));
             }
         }
 
-        processed
+        let Some((socket, _)) = best else {
+            return false;
+        };
+        socket.process(self.iface.context_mut(), ip_repr, udp_repr, udp_payload)
     }
 
     fn generate_icmp_unreachable(
