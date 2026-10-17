@@ -60,6 +60,7 @@ fn init() {
 }
 
 fn init_on_each_cpu() {
+    crate::cpu::topology::init_on_each_cpu();
     crate::sched::init_on_each_cpu();
     crate::process::init_on_each_cpu();
     crate::fs::init_on_each_cpu();

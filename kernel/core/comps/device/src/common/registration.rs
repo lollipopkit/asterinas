@@ -18,6 +18,7 @@ use crate::{
         Error, Result, Subsystem, SubsystemKind, SysStr,
         attr::{Attr, TyErasedAttr},
         devnum::{DEFAULT_DEVNODE_MODE, DevNum},
+        group::{AttrGroup, new_group_dir},
         node::{SysTreeEdit, add_link, remove_link},
         registry,
     },
@@ -88,6 +89,7 @@ pub struct DeviceBuilder<H, P, D: 'static> {
     pub(crate) devnum: Option<DevNum>,
     pub(super) dev_type: Option<&'static DeviceType<D>>,
     pub(super) attrs: &'static [Attr<D>],
+    pub(super) groups: &'static [AttrGroup<D>],
 }
 
 impl<H, P, D: 'static> DeviceBuilder<H, P, D> {
@@ -125,6 +127,16 @@ impl<H, P, D: 'static> DeviceBuilder<H, P, D> {
         self
     }
 
+    /// Gives the device attribute groups of its own.
+    ///
+    /// Registration fails with [`Error::InvalidName`] if a group name is invalid,
+    /// or with [`Error::NameConflict`] if a named group clashes with
+    /// an attribute or another entry of the device's directory.
+    pub fn groups(mut self, groups: &'static [AttrGroup<D>]) -> Self {
+        self.groups = groups;
+        self
+    }
+
     pub(crate) fn new(handle: H, name: SysStr, payload: P) -> Self {
         Self {
             handle,
@@ -134,6 +146,7 @@ impl<H, P, D: 'static> DeviceBuilder<H, P, D> {
             devnum: None,
             dev_type: None,
             attrs: &[],
+            groups: &[],
         }
     }
 
@@ -142,6 +155,7 @@ impl<H, P, D: 'static> DeviceBuilder<H, P, D> {
         DeclaredParts {
             dev_type: self.dev_type,
             own_attrs: self.attrs,
+            groups: self.groups,
         }
     }
 }
@@ -186,9 +200,21 @@ fn add_steps(this: &Arc<dyn AnyDevice>) -> Result<()> {
         attrs.push(TyErasedAttr::from_dyn(&DEV_ATTR));
     }
 
-    // 3. Subsystem, device type, and device attributes.
-    attrs.extend(this.attr_groups());
+    // 3. Attribute groups: unnamed ones in the directory, named ones in subdirectories.
+    let mut group_dirs = Vec::new();
+    for group in this.attr_groups() {
+        match group.name {
+            None => attrs.extend(group.attrs),
+            Some(name) => group_dirs.push(new_group_dir(name, group.attrs, Arc::downgrade(this))?),
+        }
+    }
     base.attrs().add(attrs)?;
+    for dir in group_dirs {
+        if base.attrs().contains(dir.name()) {
+            return Err(Error::NameConflict);
+        }
+        base.attach_child(dir)?;
+    }
 
     // 4. Links: `subsystem`, `device`, and the index entry.
     let path = base.tree_path();
@@ -272,7 +298,7 @@ fn teardown(this: &Arc<dyn AnyDevice>) {
         remove_link(base, "subsystem");
     }
 
-    // 3. and 2. Attributes are dropped with the directory.
+    // 3. and 2. Attributes and group directories are dropped with the directory.
     // 1. Detach the directory, and any glue directory left empty.
     if let Some(tree_parent) = base.tree_parent().get() {
         tree_parent.with_edit(|parent| {
@@ -309,8 +335,9 @@ fn teardown(this: &Arc<dyn AnyDevice>) {
 /// - A class device under any other device sits in a glue directory named after its class,
 ///   created inside the parent.
 /// - A class device with no parent sits in a glue directory under `/sys/devices/virtual`.
-/// - A bus device or a bare device sits directly under its parent,
-///   or at the top of `/sys/devices` if it has none.
+/// - A bus device or a bare device sits directly under its parent.
+///   One with no parent sits in its root directory, such as `/sys/devices/system`
+///   for the root device of a system bus, or at the top of `/sys/devices` otherwise.
 fn place(dev: &Arc<dyn AnyDevice>) -> Result<()> {
     let parent = dev.base().parent();
     if let Some(parent) = parent {
@@ -348,7 +375,10 @@ fn place(dev: &Arc<dyn AnyDevice>) -> Result<()> {
             TreeParent::Device(Arc::downgrade(parent))
         }
         (_, None) => {
-            let root = registry::get().devices_root();
+            let root = dev
+                .base()
+                .root_dir()
+                .unwrap_or_else(|| registry::get().devices_root());
             root.attach_child(child)?;
             TreeParent::Dir(Arc::downgrade(root))
         }

@@ -12,7 +12,7 @@ use crate::{
     class::{Class, ClassHandle},
     common::{
         AnyDevice, DeclaredParts, DevNode, DeviceBase, DeviceBuilder, DeviceInternals, Subsystem,
-        SysStr, attr::TyErasedAttr, impl_device_node,
+        SysStr, group::TyErasedAttrGroup, impl_device_node,
     },
 };
 
@@ -107,7 +107,7 @@ impl<C: Class> DeviceInternals for ClassDevice<C> {
         self.declared.type_name()
     }
 
-    fn attr_groups(&self) -> Vec<TyErasedAttr> {
+    fn attr_groups(&self) -> Vec<TyErasedAttrGroup> {
         self.declared.attr_groups(self.class.class().dev_attrs())
     }
 

@@ -8,13 +8,21 @@ use alloc::{
 };
 
 use super::{AnyDevice, DevNode, DeviceBase, DeviceInternals, impl_device_node};
-use crate::common::{Subsystem, SysStr, attr::TyErasedAttr};
+use crate::common::{
+    Subsystem, SysStr,
+    group::{AttrGroup, TyErasedAttrGroup},
+    node::Dir,
+    registry,
+};
 
 /// A device with neither bus nor class, such as a host bridge or a firmware root.
 ///
-/// It has no attributes and is listed in no index; it exists to be the parent of other devices.
+/// It is listed in no index; it exists to be the parent of other devices.
+/// It has no attributes, except for the root device of a system bus,
+/// which carries the bus-wide attributes.
 pub struct BareDevice {
     base: DeviceBase,
+    groups: &'static [AttrGroup<BareDevice>],
 }
 
 impl BareDevice {
@@ -28,20 +36,41 @@ impl BareDevice {
     ///
     /// [`add_device`]: crate::add_device
     pub fn new_root(name: impl Into<SysStr>) -> Arc<Self> {
-        Self::new(name, None)
+        Self::new(name.into(), None, &[], None)
     }
 
     /// Same as [`Self::new_root`], except the device is created under `parent`.
     pub fn with_parent(name: impl Into<SysStr>, parent: Arc<dyn AnyDevice>) -> Arc<Self> {
-        Self::new(name, Some(parent))
+        Self::new(name.into(), Some(parent), &[], None)
     }
 
-    fn new(name: impl Into<SysStr>, parent: Option<Arc<dyn AnyDevice>>) -> Arc<Self> {
+    /// Creates the root device of a system bus, `/sys/devices/system/<name>`,
+    /// carrying the bus-wide attribute groups.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the device model is not initialized or `name` is not a valid `SysTree` node name.
+    pub(crate) fn new_system_root(
+        name: &'static str,
+        groups: &'static [AttrGroup<BareDevice>],
+    ) -> Arc<Self> {
+        let system_root = registry::get().system_root().clone();
+        Self::new(SysStr::from(name), None, groups, Some(system_root))
+    }
+
+    fn new(
+        name: SysStr,
+        parent: Option<Arc<dyn AnyDevice>>,
+        groups: &'static [AttrGroup<BareDevice>],
+        root_dir: Option<Arc<Dir>>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|weak: &Weak<BareDevice>| {
             let weak_self: Weak<dyn AnyDevice> = weak.clone();
-            BareDevice {
-                base: DeviceBase::new(name.into(), parent, None, weak_self),
+            let mut base = DeviceBase::new(name, parent, None, weak_self);
+            if let Some(dir) = root_dir {
+                base = base.with_root_dir(dir);
             }
+            BareDevice { base, groups }
         })
     }
 }
@@ -61,8 +90,11 @@ impl DeviceInternals for BareDevice {
         None
     }
 
-    fn attr_groups(&self) -> Vec<TyErasedAttr> {
-        Vec::new()
+    fn attr_groups(&self) -> Vec<TyErasedAttrGroup> {
+        self.groups
+            .iter()
+            .map(TyErasedAttrGroup::from_typed)
+            .collect()
     }
 
     fn devnode_override(&self) -> Option<DevNode> {

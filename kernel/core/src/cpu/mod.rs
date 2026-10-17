@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+pub(crate) mod cpumask;
+pub(crate) mod topology;
+
 /// A trait that describes the Linux system call convention (ABI) for the user context.
 pub(crate) trait LinuxAbi {
     /// Gets the system call number.

@@ -107,7 +107,7 @@ impl<D: ?Sized> fmt::Debug for Attr<D> {
 
 /// An attribute whose callbacks take `&dyn AnyDevice`.
 #[derive(Clone)]
-pub struct TyErasedAttr {
+pub(crate) struct TyErasedAttr {
     name: &'static str,
     perms: SysPerms,
     show: Option<TyErasedShowFn>,
@@ -192,6 +192,28 @@ impl TyErasedAttr {
         attrs
     }
 
+    /// Returns the name.
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Returns the permissions.
+    pub(crate) fn perms(&self) -> SysPerms {
+        self.perms
+    }
+
+    /// Produces the text of the attribute for `dev`.
+    pub(crate) fn show(&self, dev: &dyn AnyDevice, w: &mut dyn Write) -> Result<()> {
+        let show = self.show.as_ref().ok_or(PERMISSION_DENIED)?;
+        show(dev, w)
+    }
+
+    /// Passes the text written to the attribute for `dev`.
+    pub(crate) fn store(&self, dev: &dyn AnyDevice, value: &str) -> Result<()> {
+        let store = self.store.as_ref().ok_or(PERMISSION_DENIED)?;
+        store(dev, value)
+    }
+
     /// Wraps an attribute that already operates on `&dyn AnyDevice`.
     pub(crate) fn from_dyn(attr: &Attr<dyn AnyDevice>) -> Self {
         Self {
@@ -262,6 +284,11 @@ impl AttrTable {
             inner.ops.insert(SysStr::from(attr.name), attr);
         }
         Ok(())
+    }
+
+    /// Returns whether an attribute named `name` exists.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.inner.read().ops.contains_key(name)
     }
 
     /// Removes attributes by name.
@@ -349,6 +376,8 @@ struct TableInner {
     /// What serves a read or a write of each listed attribute.
     ops: BTreeMap<SysStr, TyErasedAttr>,
 }
+
+const PERMISSION_DENIED: Error = Error::SysTree(aster_systree::Error::PermissionDenied);
 
 type TyErasedShowFn = Arc<dyn Fn(&dyn AnyDevice, &mut dyn Write) -> Result<()> + Send + Sync>;
 type TyErasedStoreFn = Arc<dyn Fn(&dyn AnyDevice, &str) -> Result<()> + Send + Sync>;
