@@ -246,6 +246,7 @@ pub(crate) struct CpuInformation {
     cpu_khz: Option<u32>,
     cache_size: Option<u32>,
     apicid: u32,
+    initial_apicid: u32,
     cpuid_level: u32,
     flags: Vec<&'static str>,
     tlb_size: Option<u32>,
@@ -269,6 +270,7 @@ impl CpuInformation {
             cpu_khz: Some((tsc_freq() / 1000) as u32),
             cache_size: None,
             apicid: 0,
+            initial_apicid: 0,
             cpuid_level: 0,
             flags: Vec::new(),
             tlb_size: None,
@@ -340,7 +342,8 @@ impl CpuInformation {
         self.clflush_size = ((ebx >> 8) & 0xff) * 8;
         self.cache_alignment = self.clflush_size;
         // Bits 31-24: Initial APIC ID.
-        self.apicid = ebx >> 24;
+        self.initial_apicid = ebx >> 24;
+        self.apicid = self.initial_apicid;
     }
 
     fn fill_brand_info(&mut self) {
@@ -402,7 +405,7 @@ impl CpuInformation {
         let mut l2size = 0;
         let mut l3size = 0;
 
-        for subleaf in 0.. {
+        for subleaf in 0..MAX_CACHE_SUBLEAVES {
             let Some(CpuidResult { eax, ebx, ecx, .. }) = cpuid(CpuidLeaf::Cache as u32, subleaf)
             else {
                 break;
@@ -857,7 +860,7 @@ impl fmt::Display for CpuInformation {
             cpu_topology.core_id,
             topology::num_cores_in_package(cpu),
             self.apicid,
-            self.apicid
+            self.initial_apicid
         )?;
 
         write!(
@@ -1157,12 +1160,16 @@ impl TopologyScan {
     }
 }
 
+/// The maximum number of cache subleaves of CPUID leaf 4 to read,
+/// so that malformed CPUID data without a null subleaf cannot hang the scan.
+const MAX_CACHE_SUBLEAVES: u32 = 32;
+
 /// Returns the ID of the L2 cache of the CPU with `apicid`, from Intel leaf 4.
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/cacheinfo.c#L413-L472>.
 fn intel_l2_cache_id(apicid: u32) -> Option<u32> {
     let mut l2_id = None;
-    for subleaf in 0.. {
+    for subleaf in 0..MAX_CACHE_SUBLEAVES {
         let Some(CpuidResult { eax, .. }) = cpuid(CpuidLeaf::Cache as u32, subleaf) else {
             break;
         };
