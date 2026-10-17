@@ -37,6 +37,7 @@ use crate::{
     vm::vmar::Vmar,
 };
 
+mod dumpable;
 mod init_proc;
 mod job_control;
 mod process_group;
@@ -45,6 +46,8 @@ mod terminal;
 mod timer_manager;
 
 use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
+use dumpable::AtomicDumpable;
+pub(crate) use dumpable::{Dumpable, SUID_DUMPABLE};
 pub(crate) use init_proc::spawn_init_process;
 pub(crate) use job_control::JobControl;
 use ostd::{
@@ -160,6 +163,10 @@ pub struct Process {
     ///
     /// See [`crate::security::audit`].
     audit_context: Once<Arc<dyn Any + Send + Sync>>,
+    /// The dumpability, which Linux keeps in `task_exec_state`.
+    dumpable: AtomicDumpable,
+    /// The lock that serializes credential updates of the threads with the dumpability.
+    credentials_update_lock: Mutex<()>,
 }
 
 impl Drop for Process {
@@ -231,6 +238,7 @@ impl Process {
         Some(Task::current()?.as_posix_thread()?.process())
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn new(
         pid: Pid,
         vmar: Arc<Vmar>,
@@ -240,6 +248,7 @@ impl Process {
         oom_score_adj: i16,
         sig_dispositions: Arc<Mutex<SigDispositions>>,
         user_ns: Arc<UserNamespace>,
+        dumpable: Dumpable,
     ) -> Arc<Self> {
         Arc::new_cyclic(|process_ref: &Weak<Process>| {
             // SIGCHID does not interrupt pauser. Child process will
@@ -275,6 +284,8 @@ impl Process {
                 start_time: Jiffies::elapsed(),
                 user_ns: Mutex::new(user_ns),
                 audit_context: Once::new(),
+                dumpable: AtomicDumpable::new(dumpable),
+                credentials_update_lock: Mutex::new(()),
             }
         })
     }
@@ -661,6 +672,27 @@ impl Process {
             // Reference: <https://elixir.bootlin.com/linux/v6.17/source/kernel/signal.c#L969>.
             posix_thread.wake_signalled_waker();
         }
+    }
+
+    /// Returns the dumpability.
+    pub(crate) fn dumpable(&self) -> Dumpable {
+        self.dumpable.load(Ordering::SeqCst)
+    }
+
+    /// Sets the dumpability.
+    pub(crate) fn set_dumpable(&self, dumpable: Dumpable) {
+        let _guard = self.credentials_update_lock.lock();
+        self.dumpable.store(dumpable, Ordering::SeqCst);
+    }
+
+    /// Returns the lock that serializes credential updates with the dumpability.
+    pub(crate) fn credentials_update_lock(&self) -> &Mutex<()> {
+        &self.credentials_update_lock
+    }
+
+    /// Swaps the dumpability while holding [`Self::credentials_update_lock`].
+    pub(crate) fn swap_dumpable_locked(&self, dumpable: Dumpable) -> Dumpable {
+        self.dumpable.swap(dumpable, Ordering::SeqCst)
     }
 
     /// Clears the parent death signal.

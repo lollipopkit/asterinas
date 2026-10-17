@@ -12,10 +12,13 @@ use ostd::{
 
 use super::process_vm::activate_vmar;
 use crate::{
-    fs::vfs::path::{Path, PerMountFlags},
+    fs::{
+        file::Permission,
+        vfs::path::{Path, PerMountFlags},
+    },
     prelude::*,
     process::{
-        ContextUnshareAdminApi, Credentials, Process,
+        ContextUnshareAdminApi, Credentials, Dumpable, Process, SUID_DUMPABLE,
         credentials::{ExecCred, FileCapabilities},
         pid_table,
         posix_thread::{
@@ -64,6 +67,9 @@ pub(crate) fn do_execve(
     let program_to_load = ProgramToLoad::from_executable(executable, &path_resolver, argv, envp)?;
     let elf_path = program_to_load.elf_path().clone();
     let exec_cred = prepare_exec_cred(&elf_path, ctx)?;
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/exec.c#L1335-L1355>
+    let is_readable = |path: &Path| path.inode().check_permission(Permission::MAY_READ).is_ok();
+    let is_nondump_enforced = !is_readable(&elf_path) || !is_readable(&executable_path);
 
     let new_vmar = VmarHandle::new(ProcessVm::new(executable_path.clone()));
     let elf_load_info = program_to_load.load_to_vmar(&new_vmar, &path_resolver)?;
@@ -95,6 +101,7 @@ pub(crate) fn do_execve(
         new_vmar,
         &elf_load_info,
         exec_cred,
+        is_nondump_enforced,
     );
 
     if res.is_ok() {
@@ -199,6 +206,7 @@ fn do_execve_no_return(
     new_vmar: VmarHandle,
     elf_load_info: &ElfLoadInfo,
     exec_cred: ExecCred,
+    is_nondump_enforced: bool,
 ) -> Result<()> {
     let Context {
         process,
@@ -217,6 +225,19 @@ fn do_execve_no_return(
     // This prevents race conditions when checking access permissions while opening
     // `/proc/[pid]/mem` or `/proc/[pid]/maps`.
     let (vmar_guard, old_vmar) = activate_vmar(ctx, new_vmar);
+    // Like Linux, this checks the credentials before they change, and applying the new
+    // credentials makes the process non-dumpable if they change the IDs.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/exec.c#L1247-L1257>
+    let credentials = posix_thread.credentials();
+    let dumpable = if is_nondump_enforced
+        || credentials.euid() != credentials.ruid()
+        || credentials.egid() != credentials.rgid()
+    {
+        SUID_DUMPABLE
+    } else {
+        Dumpable::Owner
+    };
+    process.set_dumpable(dumpable);
     apply_exec_cred(process, &ctx.credentials_mut(), exec_cred)?;
     drop(vmar_guard);
     drop(old_vmar);

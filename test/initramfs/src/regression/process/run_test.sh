@@ -38,6 +38,7 @@ fi
 ./personality/personality
 
 ./prctl/capbset
+./prctl/dumpable
 ./prctl/no_new_privs
 ./prctl/secure_bits
 ./prctl/subreaper

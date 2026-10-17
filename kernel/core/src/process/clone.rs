@@ -11,7 +11,7 @@ use ostd::{
 };
 
 use super::{
-    Credentials, Pid, Process, pid_table,
+    Credentials, Dumpable, Pid, Process, pid_table,
     posix_thread::{AsPosixThread, PosixThreadBuilder},
     rlimit::ResourceLimits,
     signal::{constants::SIGCHLD, sig_disposition::SigDispositions, sig_num::SigNum},
@@ -617,6 +617,10 @@ fn clone_child_process(
             child_oom_score_adj,
             child_sig_dispositions,
             child_user_ns,
+            // Linux shares the dumpability between processes sharing the VM, but copies it
+            // otherwise. We always copy it, which differs only before a `CLONE_VM` child
+            // (e.g., a vfork child) executes a new program.
+            process.dumpable(),
             child_thread_builder,
         )
     };
@@ -844,6 +848,7 @@ fn create_child_process(
     oom_score_adj: i16,
     sig_dispositions: Arc<Mutex<SigDispositions>>,
     user_ns: Arc<UserNamespace>,
+    dumpable: Dumpable,
     thread_builder: PosixThreadBuilder,
 ) -> Arc<Process> {
     let child_proc = Process::new(
@@ -854,6 +859,7 @@ fn create_child_process(
         oom_score_adj,
         sig_dispositions,
         user_ns,
+        dumpable,
     );
 
     let child_task = thread_builder.process(Arc::downgrade(&child_proc)).build();

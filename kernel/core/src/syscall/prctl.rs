@@ -6,6 +6,7 @@ use super::SyscallReturn;
 use crate::{
     prelude::*,
     process::{
+        Dumpable,
         credentials::{SecureBits, capabilities::CapSet},
         posix_thread::{ContextPthreadAdminApi, ThreadName},
         signal::sig_num::SigNum,
@@ -35,14 +36,13 @@ pub(super) fn sys_prctl(
             ctx.user_space().write_val(write_to_addr, &write_val)?;
         }
         PrctlCmd::PR_GET_DUMPABLE => {
-            // TODO: When coredump is supported, return the actual value.
-            return Ok(SyscallReturn::Return(Dumpable::Disable as _));
+            return Ok(SyscallReturn::Return(ctx.process.dumpable() as _));
         }
         PrctlCmd::PR_SET_DUMPABLE(dumpable) => {
-            if dumpable != Dumpable::Disable && dumpable != Dumpable::User {
+            if dumpable != Dumpable::Off && dumpable != Dumpable::Owner {
                 return_errno_with_message!(Errno::EINVAL, "invalid dumpable attribute");
             }
-            // TODO: Implement coredump.
+            ctx.process.set_dumpable(dumpable);
         }
         PrctlCmd::PR_GET_KEEPCAPS => {
             let keep_cap = {
@@ -196,14 +196,6 @@ enum PrctlCmd {
     PR_CAP_AMBIENT(CapAmbientCmd),
 }
 
-#[repr(u64)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromInt)]
-enum Dumpable {
-    Disable = 0, /* No setuid dumping */
-    User = 1,    /* Dump as user of process */
-    Root = 2,    /* Dump as root */
-}
-
 #[derive(Clone, Copy, Debug)]
 enum CapAmbientCmd {
     IsSet(CapSet),
@@ -221,7 +213,14 @@ impl PrctlCmd {
             }
             PR_GET_PDEATHSIG => Ok(PrctlCmd::PR_GET_PDEATHSIG(arg2 as _)),
             PR_GET_DUMPABLE => Ok(PrctlCmd::PR_GET_DUMPABLE),
-            PR_SET_DUMPABLE => Ok(PrctlCmd::PR_SET_DUMPABLE(Dumpable::try_from(arg2)?)),
+            PR_SET_DUMPABLE => Ok(PrctlCmd::PR_SET_DUMPABLE(
+                u8::try_from(arg2)
+                    .ok()
+                    .and_then(|arg2| Dumpable::try_from(arg2).ok())
+                    .ok_or_else(|| {
+                        Error::with_message(Errno::EINVAL, "invalid dumpable attribute")
+                    })?,
+            )),
             PR_GET_KEEPCAPS => Ok(PrctlCmd::PR_GET_KEEPCAPS),
             PR_SET_KEEPCAPS => Ok(PrctlCmd::PR_SET_KEEPCAPS(arg2 as _)),
             PR_SET_NAME => Ok(PrctlCmd::PR_SET_NAME(arg2 as _)),

@@ -13,7 +13,7 @@ pub(super) use self::{
 };
 use crate::{
     fs::{
-        file::InodeMode,
+        file::{InodeMode, InodeType, mkmod},
         vfs::{
             file_system::FileSystem,
             inode::{Extension, Metadata},
@@ -21,7 +21,7 @@ use crate::{
         },
     },
     prelude::*,
-    process::{Gid, Uid, posix_thread::AsPosixThread},
+    process::{Dumpable, Gid, Uid, posix_thread::AsPosixThread},
     thread::Thread,
 };
 
@@ -58,7 +58,8 @@ impl Common {
             return *self.metadata.read();
         };
 
-        let credentials = owner_thread.as_posix_thread().unwrap().credentials();
+        let posix_thread = owner_thread.as_posix_thread().unwrap();
+        let credentials = posix_thread.credentials();
         let mut metadata = self.metadata.write();
         // Cache the dynamic owner into the metadata so that if the thread
         // later exits, subsequent calls fall back to the last known owner
@@ -67,6 +68,21 @@ impl Common {
         // <https://github.com/asterinas/asterinas/pull/3164#discussion_r3212307770>.
         metadata.uid = credentials.euid();
         metadata.gid = credentials.egid();
+
+        // Files of a non-dumpable process are owned by root, except for world-readable and
+        // searchable directories (e.g., `/proc/[pid]`).
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/base.c#L1862-L1910>
+        let is_public_dir = metadata.type_ == InodeType::Dir && metadata.mode == mkmod!(a+rx);
+        if !is_public_dir
+            && posix_thread
+                .weak_process()
+                .upgrade()
+                .is_some_and(|process| process.dumpable() != Dumpable::Owner)
+        {
+            metadata.uid = Uid::new_root();
+            metadata.gid = Gid::new_root();
+        }
+
         *metadata
     }
 
