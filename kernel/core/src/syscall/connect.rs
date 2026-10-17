@@ -3,7 +3,7 @@
 use super::SyscallReturn;
 use crate::{
     fs::file::file_table::{RawFileDesc, get_file_fast},
-    net::socket::util::{SocketAddr, audit_connect, check_connect},
+    net::socket::util::{audit_connect, check_connect},
     prelude::*,
     util::net::read_socket_addr_from_user,
 };
@@ -21,8 +21,7 @@ pub(super) fn sys_connect(
     let file = get_file_fast!(&mut file_table, sockfd.try_into()?);
     let socket = file.as_socket_or_err()?;
 
-    check_connect(socket, Some(&socket_addr))?;
-    let audit_target = SocketAddr::audit_target_if_audited(Some(&socket_addr));
+    let audit_target = check_connect(socket, Some(&socket_addr))?;
     let res = socket.connect(socket_addr);
     // A non-blocking connection is in progress towards the destination.
     if res

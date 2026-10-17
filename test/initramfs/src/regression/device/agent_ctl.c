@@ -805,9 +805,16 @@ FN_TEST(egress)
 	TEST_ERRNO(set_egress_policy("q/a\0", 4), EINVAL);
 	TEST_SUCC(set_egress_policy(policy, sizeof(policy) - 1));
 
-	// A TCT that has not read protected data can send anywhere.
-	id = IN_TCT({ TEST_SUCC(close(TEST_SUCC(udp_connect(3000)))); });
+	// A TCT that has not read protected data can send anywhere, and implicit sends to the
+	// peer are recorded.
+	id = IN_TCT({
+		int sk = TEST_SUCC(udp_connect(3000));
+		TEST_RES(write(sk, "x", 1), _ret == 1);
+		TEST_SUCC(close(sk));
+	});
 	TEST_RES(tct_end(id, &nr_live), _ret == 0);
+	len = TEST_RES(read_effects(id, effects, sizeof(effects)), _ret > 0);
+	TEST_RES(has_effect(effects, len, 'c', "127.0.0.1:3000"), _ret);
 	TEST_SUCC(tct_release(id));
 
 	id = IN_TCT({
@@ -831,6 +838,7 @@ FN_TEST(egress)
 	len = TEST_RES(read_effects(id, effects, sizeof(effects)), _ret > 0);
 	TEST_RES(has_effect(effects, len, 't', EGRESS_DIR "/secret"), _ret);
 	TEST_RES(has_effect(effects, len, 'd', "127.0.0.1:3000"), _ret);
+	TEST_RES(has_effect(effects, len, 'c', "127.0.0.1:2000"), _ret);
 	TEST_SUCC(tct_release(id));
 
 	id = IN_TCT({
