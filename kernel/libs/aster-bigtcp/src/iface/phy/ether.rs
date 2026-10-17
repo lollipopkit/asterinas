@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{collections::btree_map::BTreeMap, sync::Arc};
+use alloc::sync::Arc;
 
 use aster_softirq::BottomHalfDisabled;
 use ostd::sync::SpinLock;
@@ -12,6 +12,7 @@ use smoltcp::{
     },
 };
 
+use super::neighbor::{ArpUpdate, NeighborCache};
 use crate::{
     device::{AnyNetworkDevice, WithDevice, new_interface},
     ext::Ext,
@@ -29,7 +30,7 @@ pub struct EtherIface<D, E: Ext> {
     driver: D,
     common: IfaceCommon<E>,
     ether_addr: EthernetAddress,
-    arp_table: SpinLock<BTreeMap<Ipv4Address, EthernetAddress>, BottomHalfDisabled>,
+    neighbors: SpinLock<NeighborCache, BottomHalfDisabled>,
 }
 
 impl<D: WithDevice, E: Ext> EtherIface<D, E> {
@@ -64,7 +65,7 @@ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
             driver,
             common,
             ether_addr,
-            arp_table: SpinLock::new(BTreeMap::new()),
+            neighbors: SpinLock::new(NeighborCache::new(ether_addr)),
         })
     }
 }
@@ -110,14 +111,9 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
             EthernetProtocol::Ipv6 => Some(PhyProcessResult::Ipv6(packet)),
             EthernetProtocol::Arp => {
                 let (_, arp_repr) = arp::parse(packet)?;
-                let reply = self.process_arp(&arp_repr, iface_cx)?;
-                match self.alloc_tx_buffer(0) {
-                    Ok(buffer) => Self::emit_arp(&reply, buffer).map(PhyProcessResult::Tx),
-                    Err(err) => {
-                        ostd::error!("failed to allocate a network packet: {:?}", err);
-                        None
-                    }
-                }
+                let is_unicast = repr.dst_addr == self.ether_addr;
+                self.process_arp(&arp_repr, is_unicast, iface_cx)
+                    .map(PhyProcessResult::Tx)
             }
             _ => None,
         }
@@ -128,11 +124,52 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
         packet: TxPacketWithDst,
         iface_cx: &mut Context,
     ) -> Option<TxPacket<LinkLayer>> {
-        match self.resolve_ether_or_generate_arp(packet.dst_addr, iface_cx) {
-            Ok(ether_repr) => Some(ether::emit(packet.packet, &ether_repr)),
-            Err(Some(arp_repr)) => Self::emit_arp(&arp_repr, packet.packet.reset_to_fresh()),
-            Err(None) => None,
+        // Resolve the next-hop IP address.
+        let next_hop_ip = match iface_cx.route(&packet.dst_addr, iface_cx.now()) {
+            Some(IpAddress::Ipv4(next_hop_ip)) => next_hop_ip,
+            Some(IpAddress::Ipv6(_)) => {
+                // FIXME: Currently, we drop outbound IPv6 packets because neighbor discovery is not
+                // implemented and we have no way to resolve the next-hop link-layer address.
+                ostd::debug!("IPv6 neighbor discovery is not implemented for Ethernet interfaces");
+                return None;
+            }
+            None => return None,
+        };
+
+        if next_hop_ip.is_broadcast() {
+            let ether_repr = EthernetRepr {
+                src_addr: self.ether_addr,
+                dst_addr: EthernetAddress::BROADCAST,
+                ethertype: EthernetProtocol::Ipv4,
+            };
+            return Some(ether::emit(packet.packet, &ether_repr));
         }
+
+        // Resolve the next-hop Ethernet address. If it is unknown, the packet is queued until the
+        // address is resolved.
+        let now_ms = iface_cx.now().total_millis() as u64;
+        self.neighbors
+            .lock()
+            .resolve(next_hop_ip, packet.packet, now_ms, || {
+                self.new_arp_request(next_hop_ip, None, iface_cx)
+            })
+    }
+
+    fn poll_timers(&self, iface_cx: &Context) {
+        let now_ms = iface_cx.now().total_millis() as u64;
+        self.neighbors
+            .lock()
+            .poll_timers(now_ms, |next_hop_ip, dst_addr| {
+                self.new_arp_request(next_hop_ip, dst_addr, iface_cx)
+            });
+    }
+
+    fn pop_tx(&self) -> Option<TxPacket<LinkLayer>> {
+        self.neighbors.lock().pop_ready()
+    }
+
+    fn next_poll_at_ms(&self) -> Option<u64> {
+        self.neighbors.lock().next_poll_at_ms()
     }
 
     fn alloc_tx_buffer(&self, payload_len: usize) -> Result<FreshTxPacket, ostd::Error> {
@@ -140,139 +177,140 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
     }
 }
 
-impl<D, E: Ext> EtherIface<D, E> {
-    fn process_arp(&self, arp_repr: &ArpRepr, iface_cx: &mut Context) -> Option<ArpRepr> {
-        match arp_repr {
-            ArpRepr::EthernetIpv4 {
-                operation: ArpOperation::Reply,
-                source_hardware_addr,
-                source_protocol_addr,
-                ..
-            } => {
-                // Ignore the ARP packet if the source addresses are not unicast or not local.
-                if !source_hardware_addr.is_unicast()
-                    || !iface_cx.in_same_network(&IpAddress::Ipv4(*source_protocol_addr))
-                {
-                    return None;
-                }
-
-                self.learn_arp(*source_protocol_addr, *source_hardware_addr);
-                None
-            }
-            ArpRepr::EthernetIpv4 {
-                operation: ArpOperation::Request,
-                source_hardware_addr,
-                source_protocol_addr,
-                target_protocol_addr,
-                ..
-            } => {
-                // Ignore the ARP packet if the source addresses are not unicast.
-                if !source_hardware_addr.is_unicast() || !source_protocol_addr.x_is_unicast() {
-                    return None;
-                }
-
-                // Ignore the ARP packet if we do not own the target address.
-                if iface_cx
-                    .ipv4_addr()
-                    .is_none_or(|addr| addr != *target_protocol_addr)
-                {
-                    return None;
-                }
-
-                // Like Linux, learn the address of the sender, since the sender is likely to
-                // receive a reply from us soon. Otherwise, the first reply would be dropped while
-                // we resolve the address ourselves.
-                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L853>
-                if iface_cx.in_same_network(&IpAddress::Ipv4(*source_protocol_addr)) {
-                    self.learn_arp(*source_protocol_addr, *source_hardware_addr);
-                }
-
-                Some(ArpRepr::EthernetIpv4 {
-                    operation: ArpOperation::Reply,
-                    source_hardware_addr: self.ether_addr,
-                    source_protocol_addr: *target_protocol_addr,
-                    target_hardware_addr: *source_hardware_addr,
-                    target_protocol_addr: *source_protocol_addr,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    /// Inserts or updates the mapping between an IP address and an Ethernet address.
+impl<D: WithDevice, E: Ext> EtherIface<D, E> {
+    /// Processes an ARP packet and returns the reply to send, if any.
     ///
-    /// Like Linux, which refuses to allocate new neighbor entries above `gc_thresh3` (1024 by
-    /// default), a new mapping is not inserted if the table is full, so that peers cannot
-    /// exhaust the memory.
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L183>
+    /// `is_unicast` indicates whether the Ethernet frame was sent to our Ethernet address.
     ///
-    /// TODO: Remove the mapping if it expires.
-    fn learn_arp(&self, ip_addr: Ipv4Address, ether_addr: EthernetAddress) {
-        const MAX_NR_ENTRIES: usize = 1024;
-
-        let mut arp_table = self.arp_table.lock();
-        if arp_table.len() < MAX_NR_ENTRIES || arp_table.contains_key(&ip_addr) {
-            arp_table.insert(ip_addr, ether_addr);
-        }
-    }
-
-    fn resolve_ether_or_generate_arp(
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L702>
+    fn process_arp(
         &self,
-        dst_addr: IpAddress,
+        arp_repr: &ArpRepr,
+        is_unicast: bool,
         iface_cx: &mut Context,
-    ) -> Result<EthernetRepr, Option<ArpRepr>> {
-        // Resolve the next-hop IP address.
-        let next_hop_ip = match iface_cx.route(&dst_addr, iface_cx.now()) {
-            Some(IpAddress::Ipv4(next_hop_ip)) => next_hop_ip,
-            Some(IpAddress::Ipv6(_)) => {
-                // FIXME: Currently, we drop outbound IPv6 packets because neighbor discovery is not
-                // implemented and we have no way to resolve the next-hop link-layer address.
-                ostd::debug!("IPv6 neighbor discovery is not implemented for Ethernet interfaces");
-                return Err(None);
+    ) -> Option<TxPacket<LinkLayer>> {
+        let ArpRepr::EthernetIpv4 {
+            operation,
+            source_hardware_addr,
+            source_protocol_addr,
+            target_hardware_addr,
+            target_protocol_addr,
+        } = arp_repr
+        else {
+            return None;
+        };
+
+        // Ignore the ARP packet if the source addresses are not unicast.
+        if !source_hardware_addr.is_unicast() || !source_protocol_addr.x_is_unicast() {
+            return None;
+        }
+
+        let now_ms = iface_cx.now().total_millis() as u64;
+        let is_local = iface_cx.in_same_network(&IpAddress::Ipv4(*source_protocol_addr));
+
+        if *operation == ArpOperation::Request
+            && iface_cx
+                .ipv4_addr()
+                .is_some_and(|addr| addr == *target_protocol_addr)
+        {
+            // Like Linux, learn the address of the sender, since the sender is likely to
+            // receive a reply from us soon. Otherwise, the first reply would be dropped while
+            // we resolve the address ourselves. A request does not confirm that the sender is
+            // reachable, though.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L853>
+            if is_local {
+                let update = ArpUpdate {
+                    confirms: false,
+                    force_override: true,
+                    may_create: true,
+                };
+                self.neighbors.lock().update(
+                    *source_protocol_addr,
+                    *source_hardware_addr,
+                    update,
+                    now_ms,
+                );
             }
-            None => return Err(None),
-        };
 
-        // Resolve the next-hop Ethernet address.
-        let next_hop_ether = if next_hop_ip.is_broadcast() {
-            EthernetAddress::BROADCAST
-        } else if let Some(next_hop_ether) = self.arp_table.lock().get(&next_hop_ip) {
-            *next_hop_ether
-        } else {
-            // If the next-hop Ethernet address cannot be resolved, we drop the original packet and
-            // send an ARP packet instead. The upper layer should be responsible for detecting the
-            // packet loss and retrying later to see if the Ethernet address is ready.
-            return Err(Some(ArpRepr::EthernetIpv4 {
-                operation: ArpOperation::Request,
+            let reply = ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Reply,
                 source_hardware_addr: self.ether_addr,
-                source_protocol_addr: iface_cx.ipv4_addr().unwrap_or(Ipv4Address::UNSPECIFIED),
-                target_hardware_addr: EthernetAddress::BROADCAST,
-                target_protocol_addr: next_hop_ip,
-            }));
-        };
+                source_protocol_addr: *target_protocol_addr,
+                target_hardware_addr: *source_hardware_addr,
+                target_protocol_addr: *source_protocol_addr,
+            };
+            return self.alloc_and_emit_arp(&reply, *source_hardware_addr);
+        }
 
-        Ok(EthernetRepr {
-            src_addr: self.ether_addr,
-            dst_addr: next_hop_ether,
-            ethertype: EthernetProtocol::Ipv4,
-        })
-    }
+        // Ignore the ARP packet if the sender is not local.
+        if !is_local {
+            return None;
+        }
 
-    fn emit_arp(arp_repr: &ArpRepr, packet: FreshTxPacket) -> Option<TxPacket<LinkLayer>> {
-        let ether_repr = match arp_repr {
-            ArpRepr::EthernetIpv4 {
-                source_hardware_addr,
-                target_hardware_addr,
-                ..
-            } => EthernetRepr {
-                src_addr: *source_hardware_addr,
-                dst_addr: *target_hardware_addr,
-                ethertype: EthernetProtocol::Arp,
-            },
+        // Like Linux, update the entry of the sender. Only unicast replies confirm that the
+        // sender is reachable. Gratuitous ARP packets can override the address at any time.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L892>
+        let is_reply = match operation {
+            ArpOperation::Request => false,
+            ArpOperation::Reply => true,
             _ => return None,
         };
+        let is_garp = source_protocol_addr == target_protocol_addr
+            && (!is_reply || source_hardware_addr == target_hardware_addr);
+        let update = ArpUpdate {
+            confirms: is_reply && is_unicast,
+            force_override: is_garp,
+            // Like Linux, which does not accept unsolicited ARP replies by default (see
+            // `arp_accept`), only existing entries, including those being resolved, are updated.
+            may_create: false,
+        };
+        self.neighbors
+            .lock()
+            .update(*source_protocol_addr, *source_hardware_addr, update, now_ms);
 
-        let packet = packet.to_builder_at_layer::<TransportLayer>().build();
+        None
+    }
+
+    /// Generates an ARP request, which is sent to `dst_addr` or broadcast if it is `None`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L376>
+    fn new_arp_request(
+        &self,
+        target_protocol_addr: Ipv4Address,
+        dst_addr: Option<EthernetAddress>,
+        iface_cx: &Context,
+    ) -> Option<TxPacket<LinkLayer>> {
+        let arp_repr = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr: self.ether_addr,
+            source_protocol_addr: iface_cx.ipv4_addr().unwrap_or(Ipv4Address::UNSPECIFIED),
+            // Like Linux, the target hardware address is zeroed since it is unknown.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L640>
+            target_hardware_addr: EthernetAddress([0; 6]),
+            target_protocol_addr,
+        };
+        self.alloc_and_emit_arp(&arp_repr, dst_addr.unwrap_or(EthernetAddress::BROADCAST))
+    }
+
+    fn alloc_and_emit_arp(
+        &self,
+        arp_repr: &ArpRepr,
+        dst_addr: EthernetAddress,
+    ) -> Option<TxPacket<LinkLayer>> {
+        let buffer = match D::Device::alloc_tx_buffer(0) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                ostd::error!("failed to allocate a network packet: {:?}", err);
+                return None;
+            }
+        };
+
+        let ether_repr = EthernetRepr {
+            src_addr: self.ether_addr,
+            dst_addr,
+            ethertype: EthernetProtocol::Arp,
+        };
+        let packet = buffer.to_builder_at_layer::<TransportLayer>().build();
         let packet = arp::emit(packet, arp_repr);
         Some(ether::emit(packet, &ether_repr))
     }

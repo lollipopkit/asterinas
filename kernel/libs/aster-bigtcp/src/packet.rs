@@ -270,6 +270,13 @@ impl<L> TxPacket<L> {
         self.0.data_range.end - self.0.data_range.start
     }
 
+    /// Returns the number of bytes allocated for the packet, including unused head room.
+    ///
+    /// This is the amount of memory that the packet consumes, similar to `skb->truesize` in Linux.
+    pub fn alloc_len(&self) -> usize {
+        self.0.alloc_range.len()
+    }
+
     /// Returns a writer that can prepend a header at `header_len` bytes before the `L` layer.
     ///
     /// # Panics

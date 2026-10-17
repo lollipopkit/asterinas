@@ -52,6 +52,7 @@ impl datagram_common::Bound for BoundDatagram {
     }
 
     fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint) {
+        self.bound_socket.connect(*endpoint);
         self.remote_endpoint = Some(*endpoint)
     }
 
