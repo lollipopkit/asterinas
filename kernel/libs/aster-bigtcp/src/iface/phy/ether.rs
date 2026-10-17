@@ -156,13 +156,7 @@ impl<D, E: Ext> EtherIface<D, E> {
                     return None;
                 }
 
-                // Insert the mapping between the Ethernet address and the IP address.
-                //
-                // TODO: Remove the mapping if it expires.
-                self.arp_table
-                    .lock()
-                    .insert(*source_protocol_addr, *source_hardware_addr);
-
+                self.learn_arp(*source_protocol_addr, *source_hardware_addr);
                 None
             }
             ArpRepr::EthernetIpv4 {
@@ -185,6 +179,14 @@ impl<D, E: Ext> EtherIface<D, E> {
                     return None;
                 }
 
+                // Like Linux, learn the address of the sender, since the sender is likely to
+                // receive a reply from us soon. Otherwise, the first reply would be dropped while
+                // we resolve the address ourselves.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L853>
+                if iface_cx.in_same_network(&IpAddress::Ipv4(*source_protocol_addr)) {
+                    self.learn_arp(*source_protocol_addr, *source_hardware_addr);
+                }
+
                 Some(ArpRepr::EthernetIpv4 {
                     operation: ArpOperation::Reply,
                     source_hardware_addr: self.ether_addr,
@@ -194,6 +196,23 @@ impl<D, E: Ext> EtherIface<D, E> {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// Inserts or updates the mapping between an IP address and an Ethernet address.
+    ///
+    /// Like Linux, which refuses to allocate new neighbor entries above `gc_thresh3` (1024 by
+    /// default), a new mapping is not inserted if the table is full, so that peers cannot
+    /// exhaust the memory.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/arp.c#L183>
+    ///
+    /// TODO: Remove the mapping if it expires.
+    fn learn_arp(&self, ip_addr: Ipv4Address, ether_addr: EthernetAddress) {
+        const MAX_NR_ENTRIES: usize = 1024;
+
+        let mut arp_table = self.arp_table.lock();
+        if arp_table.len() < MAX_NR_ENTRIES || arp_table.contains_key(&ip_addr) {
+            arp_table.insert(ip_addr, ether_addr);
         }
     }
 
