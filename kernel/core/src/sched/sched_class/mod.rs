@@ -350,7 +350,7 @@ impl ClassScheduler {
     /// least two more threads, like the periodic load balancing in Linux.
     ///
     /// This runs on every tick and checks the load every `num_cpus` ticks on an idle CPU, and
-    /// [`BUSY_FACTOR`] times less often on a busy CPU, like the CPU-level scheduling domain in
+    /// `BUSY_FACTOR` times less often on a busy CPU, like the CPU-level scheduling domain in
     /// Linux.
     ///
     /// TODO: Balance real-time threads, which Linux pushes to and pulls from CPUs running
