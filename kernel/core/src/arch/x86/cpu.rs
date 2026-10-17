@@ -903,7 +903,7 @@ impl fmt::Display for CpuInformation {
 /// Probes the topology of the current CPU from CPUID.
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_common.c#L115-L193>.
-pub(crate) fn probe_topology(_guard: &DisabledPreemptGuard) -> CpuTopology {
+pub(crate) fn probe_topology(guard: &DisabledPreemptGuard) -> CpuTopology {
     let mut scan = TopologyScan::default();
     let Some(CpuidResult {
         eax: leaf1_eax,
@@ -912,7 +912,8 @@ pub(crate) fn probe_topology(_guard: &DisabledPreemptGuard) -> CpuTopology {
         ..
     }) = cpuid(CpuidLeaf::Feature as u32, 0)
     else {
-        return scan.topology(None);
+        // Without the APIC ID, every CPU is a core of its own, like `fake_topology` in Linux.
+        return CpuTopology::of_lone_core(guard.current_cpu());
     };
     // Bits 31-24: Initial APIC ID. Bits 23-16: Maximum number of addressable IDs for logical
     // processors in this physical package.

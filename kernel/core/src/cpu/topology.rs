@@ -34,7 +34,6 @@ impl CpuTopology {
     /// a core of its own in package 0.
     ///
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/drivers/base/arch_topology.c#L961-L978>.
-    #[cfg(not(target_arch = "x86_64"))]
     pub(crate) fn of_lone_core(cpu: CpuId) -> Self {
         Self {
             package_id: 0,
