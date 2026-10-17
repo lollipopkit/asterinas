@@ -200,6 +200,13 @@ impl InitStream {
         )
     }
 
+    /// Dissolves the association, which only considers the last `connect()` to be done.
+    ///
+    /// Like Linux, the socket error (if any) is still reported later.
+    pub(super) fn disconnect(&mut self) {
+        self.is_connect_done = true;
+    }
+
     pub(super) fn finish_last_connect(&mut self) -> Result<()> {
         if self.is_connect_done {
             return Ok(());

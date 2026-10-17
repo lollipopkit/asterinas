@@ -56,10 +56,8 @@ impl TryFrom<SocketAddr> for NetlinkSocketAddr {
     fn try_from(value: SocketAddr) -> Result<Self> {
         match value {
             SocketAddr::Netlink(addr) => Ok(addr),
-            _ => return_errno_with_message!(
-                Errno::EAFNOSUPPORT,
-                "the address is in an unsupported address family"
-            ),
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/netlink/af_netlink.c#L1003-L1004>
+            _ => return_errno_with_message!(Errno::EINVAL, "the address is not a netlink address"),
         }
     }
 }

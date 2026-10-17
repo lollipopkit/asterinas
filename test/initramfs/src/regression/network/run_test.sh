@@ -16,6 +16,7 @@ sleep 0.2
 sleep 0.2
 ./unix_client
 
+./af_unspec
 ./broadcast_complex
 ./listen_backlog
 ./msg_dontwait

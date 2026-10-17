@@ -5,6 +5,7 @@ use aster_bigtcp::{
     wire::IpEndpoint,
 };
 
+use super::unbound::UnboundDatagram;
 use crate::{
     events::IoEvents,
     net::{
@@ -21,14 +22,50 @@ const MAX_UDP_PAYLOAD_LEN: usize = u16::MAX as usize;
 pub(super) struct BoundDatagram {
     bound_socket: UdpSocket,
     remote_endpoint: Option<IpEndpoint>,
+    locks: BindLocks,
+}
+
+/// Whether the local address and the local port are specified by `bind`.
+///
+/// These correspond to `SOCK_BINDADDR_LOCK` and `SOCK_BINDPORT_LOCK` in Linux, which decide what
+/// is kept after `connect(AF_UNSPEC)`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct BindLocks {
+    pub(super) addr: bool,
+    pub(super) port: bool,
 }
 
 impl BoundDatagram {
-    pub(super) fn new(bound_socket: UdpSocket) -> Self {
+    pub(super) fn new(bound_socket: UdpSocket, locks: BindLocks) -> Self {
         Self {
             bound_socket,
             remote_endpoint: None,
+            locks,
         }
+    }
+
+    /// Dissolves the association with the remote endpoint.
+    ///
+    /// Like Linux, the port is released unless it is specified by `bind`. If the port is
+    /// released, this method returns the unbound socket that this socket becomes, which keeps the
+    /// local address only if it is specified by `bind`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L2168-L2193>
+    //
+    // TODO: Linux keeps the received datagrams after releasing the port, but they are dropped
+    // with the bound socket here.
+    pub(super) fn disconnect(&mut self) -> Option<UnboundDatagram> {
+        self.bound_socket.disconnect();
+        self.remote_endpoint = None;
+
+        if self.locks.port {
+            return None;
+        }
+        let local_addr = self
+            .locks
+            .addr
+            .then(|| self.bound_socket.local_endpoint().addr);
+        Some(UnboundDatagram::new_disconnected(local_addr))
     }
 
     pub(super) fn iface(&self) -> &Arc<Iface> {

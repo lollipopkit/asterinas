@@ -217,6 +217,18 @@ impl MessageReceiver {
         Ok((output, ctrl_msgs, src))
     }
 
+    /// Drops all the received messages.
+    pub(super) fn purge(&self) {
+        let mut inner = self.queue.inner.lock();
+        let inner = inner.as_mut().unwrap();
+
+        inner.messages.clear();
+        inner.total_length = 0;
+
+        self.queue.pollee.invalidate();
+        self.queue.send_wait_queue.wake_all();
+    }
+
     pub(super) fn shutdown(&self) {
         let mut inner = self.queue.inner.lock();
         let inner = inner.as_mut().unwrap();

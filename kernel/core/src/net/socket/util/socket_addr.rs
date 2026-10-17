@@ -19,6 +19,32 @@ pub(crate) enum SocketAddr {
     IPv6(Ipv6Address, PortNum),
     Netlink(NetlinkSocketAddr),
     Vsock(VsockSocketAddr),
+    Unspec(UnspecSocketAddr),
+}
+
+/// A socket address in the `AF_UNSPEC` family.
+///
+/// `connect` with such an address dissolves the association of a socket with its peer. IPv4
+/// sockets also treat it as an `AF_INET` address in `bind` and `sendmsg`.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct UnspecSocketAddr {
+    /// The IPv4 address and port, if the address is long enough to be read as an `AF_INET` one.
+    inet: Option<(Ipv4Address, PortNum)>,
+}
+
+impl UnspecSocketAddr {
+    pub(crate) const fn new(inet: Option<(Ipv4Address, PortNum)>) -> Self {
+        Self { inet }
+    }
+
+    /// Returns the IPv4 address and port that the address represents as an `AF_INET` one.
+    ///
+    /// Fails with `EINVAL` if the address is shorter than an `AF_INET` one.
+    pub(crate) fn inet(&self) -> Result<(Ipv4Address, PortNum)> {
+        self.inet.ok_or_else(|| {
+            Error::with_message(Errno::EINVAL, "the socket address length is too small")
+        })
+    }
 }
 
 impl SocketAddr {
@@ -36,6 +62,11 @@ impl SocketAddr {
                 Some(format!("unix:@{}", String::from_utf8_lossy(name)))
             }
             Self::Vsock(addr) => Some(format!("vsock:{}:{}", addr.cid, addr.port)),
+            // IPv4 sockets send data to the `AF_INET` address that an `AF_UNSPEC` one represents.
+            Self::Unspec(UnspecSocketAddr {
+                inet: Some((addr, port)),
+            }) => Some(format!("{addr}:{port}")),
+            Self::Unspec(UnspecSocketAddr { inet: None }) => None,
             // Unnamed Unix sockets and netlink sockets do not reach other parties.
             Self::Unix(UnixSocketAddr::Unnamed) | Self::Netlink(_) => None,
         }

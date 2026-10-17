@@ -119,13 +119,6 @@ where
         Ok(())
     }
 
-    pub(crate) fn addr(&self) -> Option<UnboundSocket::Endpoint> {
-        match self {
-            Inner::Unbound(_) => None,
-            Inner::Bound(bound_datagram) => Some(bound_datagram.local_endpoint()),
-        }
-    }
-
     pub(crate) fn peer_addr(&self) -> Option<&UnboundSocket::Endpoint> {
         match self {
             Inner::Unbound(_) => None,

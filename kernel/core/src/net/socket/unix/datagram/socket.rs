@@ -120,6 +120,8 @@ impl UnixDatagramSocket {
         };
 
         // A connected socket will automatically be disconnected if the remote has been closed.
+        // Like Linux, the received messages are dropped as well.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2209-L2220>
         if remote.is_none() && res.is_err_and(|err| err.error() == Errno::ECONNREFUSED) {
             let mut remote_queue = self.remote_queue.write();
             // Check to ensure that we are still connected to the same remote.
@@ -128,6 +130,8 @@ impl UnixDatagramSocket {
                 .is_some_and(|remote| Arc::ptr_eq(remote, &queue))
             {
                 *remote_queue = None;
+                drop(remote_queue);
+                self.local_receiver.purge();
             }
         }
 
@@ -171,13 +175,29 @@ impl Socket for UnixDatagramSocket {
     }
 
     fn connect(&self, socket_addr: SocketAddr) -> Result<()> {
-        let remote_addr = UnixSocketAddr::try_from(socket_addr)?;
+        // An `AF_UNSPEC` address dissolves the association.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L1520-L1567>
+        let new_queue = match socket_addr {
+            SocketAddr::Unspec(_) => None,
+            socket_addr => {
+                let remote_addr = UnixSocketAddr::try_from(socket_addr)?;
+                let connected_addr = remote_addr.connect()?;
+                Some(MessageQueue::lookup_bound(&connected_addr)?)
+            }
+        };
 
-        let connected_addr = remote_addr.connect()?;
-        let queue = MessageQueue::lookup_bound(&connected_addr)?;
+        let old_queue = core::mem::replace(&mut *self.remote_queue.write(), new_queue.clone());
 
-        let mut remote_queue = self.remote_queue.write();
-        *remote_queue = Some(queue);
+        // Like Linux, the received messages are dropped if the peer changes.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L1572-L1589>
+        // TODO: Report `ECONNRESET` to the old peer if it is connected to this socket.
+        if old_queue.is_some_and(|old_queue| {
+            new_queue
+                .as_ref()
+                .is_none_or(|new_queue| !Arc::ptr_eq(&old_queue, new_queue))
+        }) {
+            self.local_receiver.purge();
+        }
 
         Ok(())
     }

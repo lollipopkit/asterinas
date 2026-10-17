@@ -192,6 +192,15 @@ impl<E: Ext> UdpSocket<E> {
         *self.0.inner.remote_endpoint.lock() = Some(remote_endpoint);
     }
 
+    /// Disconnects from the remote endpoint.
+    ///
+    /// After this method returns, packets from all remote endpoints will be received again.
+    ///
+    /// Polling the iface is _not_ required after this method succeeds.
+    pub fn disconnect(&self) {
+        *self.0.inner.remote_endpoint.lock() = None;
+    }
+
     /// Sends some data.
     ///
     /// Polling the iface is _always_ required after this method succeeds.

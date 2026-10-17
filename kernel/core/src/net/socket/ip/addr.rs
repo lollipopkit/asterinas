@@ -57,6 +57,57 @@ impl IpAddressFamily {
         }
     }
 
+    /// Converts a socket address to an endpoint of this address family.
+    ///
+    /// Fails with `EAFNOSUPPORT` if the address is not in this address family.
+    pub(super) fn to_endpoint(self, socket_addr: SocketAddr) -> Result<IpEndpoint> {
+        let endpoint = IpEndpoint::try_from(socket_addr)?;
+        if IpAddressFamily::from(endpoint.addr) != self {
+            return_errno_with_message!(
+                Errno::EAFNOSUPPORT,
+                "the protocol family does not match the address family"
+            );
+        }
+        Ok(endpoint)
+    }
+
+    /// Converts the socket address of `bind` to an endpoint of this address family.
+    ///
+    /// Like Linux, an IPv4 socket also binds to an `AF_UNSPEC` address as an `AF_INET` one, but
+    /// only if the IPv4 address is `INADDR_ANY`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L489-L497>
+    pub(super) fn to_bind_endpoint(self, socket_addr: SocketAddr) -> Result<IpEndpoint> {
+        match (self, socket_addr) {
+            (IpAddressFamily::IPv4, SocketAddr::Unspec(addr)) => {
+                let (addr, port) = addr.inet()?;
+                if !addr.is_unspecified() {
+                    return_errno_with_message!(
+                        Errno::EAFNOSUPPORT,
+                        "an AF_UNSPEC address to bind must be INADDR_ANY"
+                    );
+                }
+                Ok(IpEndpoint::new(addr.into(), port))
+            }
+            (_, socket_addr) => self.to_endpoint(socket_addr),
+        }
+    }
+
+    /// Converts the destination socket address of `sendmsg` to an endpoint of this address family.
+    ///
+    /// Like Linux, an IPv4 socket also sends data to an `AF_UNSPEC` address as an `AF_INET` one.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L1293-L1299>
+    pub(super) fn to_send_endpoint(self, socket_addr: SocketAddr) -> Result<IpEndpoint> {
+        match (self, socket_addr) {
+            (IpAddressFamily::IPv4, SocketAddr::Unspec(addr)) => {
+                let (addr, port) = addr.inet()?;
+                Ok(IpEndpoint::new(addr.into(), port))
+            }
+            (_, socket_addr) => self.to_endpoint(socket_addr),
+        }
+    }
+
     /// Converts an endpoint to a socket address of this address family.
     ///
     /// For an IPv6 socket, an IPv4 endpoint is converted to an IPv4-mapped IPv6 address. Such an
