@@ -14,7 +14,7 @@ use super::{
 use crate::{
     bus::BusDevice,
     class::ClassDevice,
-    common::{Attr, DevNum, Error},
+    common::{Attr, AttrGroup, DevNum, Error},
 };
 
 /// A driver's attributes come and go, and the published attribute set is rebuilt each time.
@@ -146,4 +146,112 @@ fn invalid_attribute_names_are_rejected() {
         assert!(utils::lookup("/devices/virtual/toyblk/invalid-attr").is_none());
         assert!(utils::lookup("/class/toyblk/invalid-attr").is_none());
     }
+}
+
+/// A named group is a subdirectory whose files reach the device,
+/// and it dies with the device even while someone still holds the directory.
+#[ktest]
+fn named_groups_are_subdirectories() {
+    // 1. Add a device with an unnamed and a named group.
+    const GROUPS: &[AttrGroup<BusDevice<ToyBus>>] = &[
+        AttrGroup::unnamed(&[Attr::ro("flat", |_dev, w| {
+            writeln!(w, "flat")?;
+            Ok(())
+        })]),
+        AttrGroup::named(
+            "grp",
+            &[Attr::ro("model_in_grp", |dev, w| {
+                writeln!(w, "{}", dev.model)?;
+                Ok(())
+            })],
+        ),
+    ];
+    let (_, bus) = toy::register_toy_subsystems();
+    let dev = BusDevice::builder(
+        &bus,
+        "grp0",
+        ToyDev {
+            vendor: 10,
+            model: 42,
+        },
+    )
+    .groups(GROUPS)
+    .build();
+    crate::add_device(&dev).unwrap();
+
+    // 2. Check where the files are and what they show.
+    assert!(
+        utils::attr_names("/devices/grp0")
+            .iter()
+            .any(|n| n == "flat")
+    );
+    assert!(
+        !utils::attr_names("/devices/grp0")
+            .iter()
+            .any(|n| n == "model_in_grp")
+    );
+    assert_eq!(
+        utils::read_attr("/devices/grp0/grp", "model_in_grp"),
+        "42\n"
+    );
+
+    // 3. Remove the device and check that the held directory reports it as dead.
+    let grp = utils::lookup("/devices/grp0/grp")
+        .unwrap()
+        .cast_to_node()
+        .unwrap();
+    crate::remove_device(&dev).unwrap();
+    assert!(utils::lookup("/devices/grp0").is_none());
+    assert!(matches!(
+        grp.show_attr("model_in_grp"),
+        Err(aster_systree::Error::IsDead)
+    ));
+}
+
+/// A named group must have a valid name not already used in the device's directory,
+/// and a failed registration leaves nothing behind.
+#[ktest]
+fn a_named_group_may_not_clash() {
+    const CLASH_ATTR: &[AttrGroup<BusDevice<ToyBus>>] = &[AttrGroup::named("vendor", &[])];
+    const CLASH_GROUP: &[AttrGroup<BusDevice<ToyBus>>] =
+        &[AttrGroup::named("twin", &[]), AttrGroup::named("twin", &[])];
+    const CLASH_LINK: &[AttrGroup<BusDevice<ToyBus>>] = &[AttrGroup::named("subsystem", &[])];
+    const CLASH_IN_GROUP: &[AttrGroup<BusDevice<ToyBus>>] = &[AttrGroup::named(
+        "dup",
+        &[
+            Attr::ro("same", |_dev, _w| Ok(())),
+            Attr::ro("same", |_dev, _w| Ok(())),
+        ],
+    )];
+    let (_, bus) = toy::register_toy_subsystems();
+
+    for groups in [CLASH_ATTR, CLASH_GROUP, CLASH_LINK, CLASH_IN_GROUP] {
+        let dev = BusDevice::builder(
+            &bus,
+            "clash0",
+            ToyDev {
+                vendor: 10,
+                model: 1,
+            },
+        )
+        .groups(groups)
+        .build();
+        assert!(matches!(crate::add_device(&dev), Err(Error::NameConflict)));
+        assert!(utils::lookup("/devices/clash0").is_none());
+        assert!(utils::lookup("/bus/toy/devices/clash0").is_none());
+    }
+
+    const INVALID_NAME: &[AttrGroup<BusDevice<ToyBus>>] = &[AttrGroup::named("bad/name", &[])];
+    let dev = BusDevice::builder(
+        &bus,
+        "clash0",
+        ToyDev {
+            vendor: 10,
+            model: 1,
+        },
+    )
+    .groups(INVALID_NAME)
+    .build();
+    assert!(matches!(crate::add_device(&dev), Err(Error::InvalidName)));
+    assert!(utils::lookup("/devices/clash0").is_none());
 }

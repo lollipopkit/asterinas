@@ -4,9 +4,10 @@
 //!
 //! - `registry`: initialization.
 //! - `registration`: device registration.
-//! - `attributes`: device attributes.
+//! - `attributes`: device attributes and attribute groups.
 //! - `observers`: class observers.
 //! - `names`: device name validation.
+//! - `system`: system buses and their root devices.
 //!
 //! `toy` and `utils` provide shared test helpers.
 
@@ -15,5 +16,6 @@ mod names;
 mod observers;
 mod registration;
 mod registry;
+mod system;
 mod toy;
 mod utils;

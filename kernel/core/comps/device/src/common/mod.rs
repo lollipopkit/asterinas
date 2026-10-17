@@ -14,6 +14,8 @@
 //!
 //! Use [`Attr`] to define sysfs attributes and [`DeviceType`] to share attributes
 //! and a device-node policy among devices of the same device type.
+//! Use [`AttrGroup`] to put attributes in a subdirectory of the device,
+//! such as `topology` under a CPU device.
 //! A [`DevNum`] identifies a character or block device and requests a `/dev` node during
 //! registration.
 //! [`DevNode`] lets a device type or class override the node's path or permissions.
@@ -27,6 +29,7 @@ pub(crate) mod attr;
 mod bare_device;
 mod devnum;
 mod error;
+pub(crate) mod group;
 mod internals;
 pub(crate) mod node;
 pub(crate) mod registration;
@@ -35,6 +38,7 @@ pub(crate) mod subsystem;
 
 use alloc::{
     sync::{Arc, Weak},
+    vec,
     vec::Vec,
 };
 
@@ -43,6 +47,7 @@ use aster_systree::SysBranchNode;
 pub(crate) use self::internals::{DeviceBase, DeviceInternals};
 use self::{
     attr::TyErasedAttr,
+    group::TyErasedAttrGroup,
     node::{Dir, SysTreeEdit},
 };
 pub use self::{
@@ -50,6 +55,7 @@ pub use self::{
     bare_device::BareDevice,
     devnum::{DEFAULT_DEVNODE_MODE, DevKind, DevNum},
     error::{Error, Result},
+    group::AttrGroup,
     registration::DeviceBuilder,
     subsystem::{Subsystem, SubsystemKind},
 };
@@ -129,6 +135,7 @@ pub struct DevNode {
 pub(crate) struct DeclaredParts<D: 'static> {
     dev_type: Option<&'static DeviceType<D>>,
     own_attrs: &'static [Attr<D>],
+    groups: &'static [AttrGroup<D>],
 }
 
 impl<D: AnyDevice> DeclaredParts<D> {
@@ -137,15 +144,19 @@ impl<D: AnyDevice> DeclaredParts<D> {
         self.dev_type.map(|t| t.name)
     }
 
-    /// Collects type-erased attributes from the subsystem, the device type, and the device, in that
-    /// order.
-    pub(crate) fn attr_groups(&self, subsystem_attrs: &[Attr<D>]) -> Vec<TyErasedAttr> {
+    /// Collects type-erased attribute groups.
+    ///
+    /// The first group is unnamed and holds the attributes from the subsystem, the device type,
+    /// and the device, in that order; the device's attribute groups follow.
+    pub(crate) fn attr_groups(&self, subsystem_attrs: &[Attr<D>]) -> Vec<TyErasedAttrGroup> {
         let mut attrs = TyErasedAttr::from_typed_slice(subsystem_attrs);
         if let Some(t) = self.dev_type {
             attrs.extend(TyErasedAttr::from_typed_slice(t.attrs));
         }
         attrs.extend(TyErasedAttr::from_typed_slice(self.own_attrs));
-        attrs
+        let mut groups = vec![TyErasedAttrGroup::unnamed(attrs)];
+        groups.extend(self.groups.iter().map(TyErasedAttrGroup::from_typed));
+        groups
     }
 
     /// Returns the device type's `/dev` node override, if it has one.

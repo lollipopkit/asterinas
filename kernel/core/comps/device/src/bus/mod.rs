@@ -13,6 +13,10 @@
 //! For each discovered device, use [`BusDevice::builder`] with the returned handle,
 //! then register the device with [`add_device`].
 //!
+//! A system bus, such as `cpu`, is registered through [`register_system`] instead.
+//! It also gets a root device, `/sys/devices/system/<name>`, that carries the bus-wide attributes
+//! and is the default parent of the bus's devices.
+//!
 //! To write a driver, implement [`Driver<B>`] for the target bus
 //! and register it through [`BusHandle::register_driver`].
 //! [`Driver::on_probe`] initializes a matched device, and
@@ -48,7 +52,7 @@ pub use self::{
     driver::{Driver, DriverHandle},
 };
 use crate::common::{
-    AnyDevice, DeviceInternals, Error, Result, SysStr,
+    AnyDevice, AttrGroup, BareDevice, DeviceInternals, Error, Result, SysStr,
     attr::Attr,
     node::{Dir, DirAttrOps, SysTreeEdit, add_link, remove_link},
     registry,
@@ -81,6 +85,30 @@ pub trait Bus: Sized + Send + Sync + 'static {
 ///
 /// Panics if the bus name is not a valid `SysTree` node name.
 pub fn register<B: Bus>(bus: B) -> Result<Arc<BusHandle<B>>> {
+    register_inner(bus, None)
+}
+
+/// Registers a system bus, creating `/sys/bus/<name>/{devices,drivers}`
+/// and its root device `/sys/devices/system/<name>` with `root_groups`.
+///
+/// Devices built on the returned handle without a parent are placed under the root device.
+/// The root device belongs to no subsystem, so it is not listed under `/sys/bus/<name>/devices`.
+///
+/// # Panics
+///
+/// Panics if the bus name is not a valid `SysTree` node name.
+pub fn register_system<B: Bus>(
+    bus: B,
+    root_groups: &'static [AttrGroup<BareDevice>],
+) -> Result<Arc<BusHandle<B>>> {
+    let root = BareDevice::new_system_root(B::NAME, root_groups);
+    crate::add_device(&root)?;
+    register_inner(bus, Some(root.clone())).inspect_err(|_| {
+        let _ = crate::remove_device(&root);
+    })
+}
+
+fn register_inner<B: Bus>(bus: B, dev_root: Option<Arc<BareDevice>>) -> Result<Arc<BusHandle<B>>> {
     let dir = Dir::with_attrs(
         SysStr::from(B::NAME),
         &[
@@ -98,6 +126,7 @@ pub fn register<B: Bus>(bus: B) -> Result<Arc<BusHandle<B>>> {
         dir: dir.clone(),
         devices_dir,
         drivers_dir,
+        dev_root,
         devices: Mutex::new(Vec::new()),
         drivers: Mutex::new(Vec::new()),
         autoprobe: AtomicBool::new(true),
@@ -117,6 +146,8 @@ pub struct BusHandle<B: Bus> {
     dir: Arc<Dir>,
     devices_dir: Arc<Dir>,
     drivers_dir: Arc<Dir>,
+    /// The root device of a system bus.
+    dev_root: Option<Arc<BareDevice>>,
     devices: Mutex<Vec<Arc<BusDevice<B>>>>,
     drivers: Mutex<Vec<Arc<DriverHandle<B>>>>,
     autoprobe: AtomicBool,
@@ -124,6 +155,11 @@ pub struct BusHandle<B: Bus> {
 }
 
 impl<B: Bus> BusHandle<B> {
+    /// Returns the root device, if this is a system bus.
+    pub fn dev_root(&self) -> Option<&Arc<BareDevice>> {
+        self.dev_root.as_ref()
+    }
+
     /// Registers a driver, creating `/sys/bus/<bus>/drivers/<name>`,
     /// and offers it every unbound device.
     ///

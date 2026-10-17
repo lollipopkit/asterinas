@@ -10,7 +10,7 @@ use ostd::{
 };
 
 use crate::{
-    cpu::LinuxAbi,
+    cpu::{LinuxAbi, topology::CpuTopology},
     vm::{perms::VmPerms, vmar::PageFaultInfo},
 };
 
@@ -170,4 +170,11 @@ impl fmt::Display for CpuInformation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "processor\t: {}", self.processor)
     }
+}
+
+/// Probes the topology of the current CPU.
+//
+// TODO: Probe the real topology from the hardware or the firmware, as Linux does.
+pub(crate) fn probe_topology(guard: &DisabledPreemptGuard) -> CpuTopology {
+    CpuTopology::of_lone_core(guard.current_cpu())
 }

@@ -31,6 +31,7 @@ pub(crate) fn init() {
 pub(crate) struct Registry {
     devices: Arc<Dir>,
     virtual_dir: Arc<Dir>,
+    system: Arc<Dir>,
     bus: Arc<Dir>,
     class: Arc<Dir>,
     dev_char: Arc<Dir>,
@@ -43,6 +44,11 @@ pub(crate) struct Registry {
 impl Registry {
     pub(crate) fn devices_root(&self) -> &Arc<Dir> {
         &self.devices
+    }
+
+    /// Returns `/sys/devices/system`, where the root devices of system buses are placed.
+    pub(crate) fn system_root(&self) -> &Arc<Dir> {
+        &self.system
     }
 
     pub(crate) fn bus_root(&self) -> &Arc<Dir> {
@@ -88,6 +94,7 @@ impl Registry {
     fn new() -> Result<Self> {
         let devices = Dir::new(SysStr::from("devices"));
         let virtual_dir = Dir::new(SysStr::from("virtual"));
+        let system = Dir::new(SysStr::from("system"));
         let bus = Dir::new(SysStr::from("bus"));
         let class = Dir::new(SysStr::from("class"));
         let dev = Dir::new(SysStr::from("dev"));
@@ -95,6 +102,7 @@ impl Registry {
         let dev_block = Dir::new(SysStr::from("block"));
 
         devices.attach_child(virtual_dir.clone())?;
+        devices.attach_child(system.clone())?;
         dev.attach_child(dev_char.clone())?;
         dev.attach_child(dev_block.clone())?;
         let root = aster_systree::primary_tree().root();
@@ -106,6 +114,7 @@ impl Registry {
         Ok(Self {
             devices,
             virtual_dir,
+            system,
             bus,
             class,
             dev_char,

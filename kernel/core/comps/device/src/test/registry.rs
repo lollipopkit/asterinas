@@ -13,6 +13,7 @@ fn roots_exist() {
     for path in [
         "/devices",
         "/devices/virtual",
+        "/devices/system",
         "/bus",
         "/class",
         "/dev/char",

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+mod cpu;
 mod evdev;
 mod fb;
 mod mem;
@@ -54,6 +55,7 @@ pub enum DeviceType {
 
 pub(crate) fn init_in_first_kthread() {
     model::init_in_first_kthread();
+    cpu::init_in_first_kthread();
     registry::init_in_first_kthread();
     mem::init_in_first_kthread();
     misc::init_in_first_kthread();

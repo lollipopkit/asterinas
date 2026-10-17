@@ -40,7 +40,8 @@ impl ProcFileOps for CpuInfoFileOps {
         let mut printer = VmPrinter::new_skip(writer, offset);
 
         for cpu in all_cpus() {
-            let cpu_info = CPU_INFORMATION.get_on_cpu(cpu).get().unwrap().to_string();
+            // An AP may still be initializing; its information is ready soon.
+            let cpu_info = CPU_INFORMATION.get_on_cpu(cpu).wait().to_string();
             writeln!(printer, "{}", cpu_info)?;
         }
 

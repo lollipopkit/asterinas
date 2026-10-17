@@ -341,8 +341,8 @@ struct FreezeGateState {
 /// Lets writes to a file system run only while it is not frozen.
 ///
 /// Every write (an operation that modifies the file system, a write through a file, or a
-/// write fault on a shared file mapping) runs inside [`Self::start_write`], which waits
-/// while the file system is frozen.
+/// write fault on a shared file mapping) runs inside `<dyn FileSystem>::start_write`,
+/// which waits while the file system is frozen.
 ///
 /// Reference: Linux `sb_start_write()`, `freeze_super()` and `thaw_super()`.
 pub(crate) struct FreezeGate {
@@ -480,7 +480,7 @@ impl FreezeGate {
     }
 }
 
-/// A running write to a file system, started by [`start_write`](dyn FileSystem::start_write).
+/// A running write to a file system, started by `<dyn FileSystem>::start_write`.
 pub(crate) struct FsWriteGuard {
     fs: Arc<dyn FileSystem>,
 }

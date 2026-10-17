@@ -17,9 +17,10 @@ use super::{AnyDevice, DevNode, Links, State, TreeParent};
 use crate::{
     common::{
         Error, Result, SysStr,
-        attr::{AttrTable, TyErasedAttr},
+        attr::AttrTable,
         devnum::DevNum,
-        node::{GlueDirs, SysTreeEdit},
+        group::TyErasedAttrGroup,
+        node::{Dir, GlueDirs, SysTreeEdit},
     },
     hooks::DevNodeRequest,
 };
@@ -34,8 +35,12 @@ pub trait DeviceInternals {
     /// Returns the device type name.
     fn type_name(&self) -> Option<&'static str>;
 
-    /// Returns type-erased attributes contributed by the subsystem, the device type, and the device.
-    fn attr_groups(&self) -> Vec<TyErasedAttr>;
+    /// Returns type-erased attribute groups.
+    ///
+    /// Unnamed groups add files to the device's directory, and named groups add subdirectories.
+    /// For bus and class devices, the first group holds the attributes
+    /// contributed by the subsystem, the device type, and the device.
+    fn attr_groups(&self) -> Vec<TyErasedAttrGroup>;
 
     /// Returns the `/dev` node overrides from the device type and the subsystem.
     fn devnode_override(&self) -> Option<DevNode>;
@@ -58,6 +63,8 @@ pub struct DeviceBase {
     attrs: AttrTable,
     /// The device this one is reached through, if any.
     parent: Option<Arc<dyn AnyDevice>>,
+    /// The directory a device without a parent is placed in; `None` means `/sys/devices`.
+    root_dir: Option<Arc<Dir>>,
     devnum: Option<DevNum>,
     state: Mutex<State>,
     /// Glue directories created under this device, one per class of child.
@@ -102,12 +109,20 @@ impl DeviceBase {
             children: RwMutex::new(BTreeMap::new()),
             attrs: AttrTable::new(),
             parent,
+            root_dir: None,
             devnum,
             state: Mutex::new(State::Initialized),
             glue_dirs: GlueDirs::new(),
             links: Mutex::new(Links::default()),
             devnode: Mutex::new(None),
         }
+    }
+
+    /// Places the device, which must have no parent, in `dir` instead of `/sys/devices`.
+    pub(crate) fn with_root_dir(mut self, dir: Arc<Dir>) -> Self {
+        debug_assert!(self.parent.is_none());
+        self.root_dir = Some(dir);
+        self
     }
 
     pub(crate) fn fields(&self) -> &ObjFields<dyn AnyDevice> {
@@ -124,6 +139,10 @@ impl DeviceBase {
 
     pub(super) fn tree_parent(&self) -> &Once<TreeParent> {
         &self.tree_parent
+    }
+
+    pub(super) fn root_dir(&self) -> Option<&Arc<Dir>> {
+        self.root_dir.as_ref()
     }
 
     pub(super) fn devnum(&self) -> Option<DevNum> {

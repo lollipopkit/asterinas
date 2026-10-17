@@ -16,6 +16,7 @@ use crate::{
         AnyDevice, DeclaredParts, DevNode, DeviceBase, DeviceBuilder, DeviceInternals, Result,
         Subsystem, SysStr,
         attr::{Attr, TyErasedAttr},
+        group::TyErasedAttrGroup,
         impl_device_node,
     },
 };
@@ -99,6 +100,7 @@ impl<B: Bus> BusDevice<B> {
 impl<B: Bus> BusDeviceBuilder<B> {
     /// Builds the device.
     ///
+    /// A device without a parent is placed under the root device of its bus, if the bus has one.
     /// The device is not registered until [`add_device`] is called.
     ///
     /// # Panics
@@ -108,10 +110,15 @@ impl<B: Bus> BusDeviceBuilder<B> {
     /// [`add_device`]: crate::add_device
     pub fn build(self) -> Arc<BusDevice<B>> {
         let declared = self.declared_parts();
+        let parent = self.parent.or_else(|| {
+            self.handle
+                .dev_root()
+                .map(|root| root.clone() as Arc<dyn AnyDevice>)
+        });
         Arc::new_cyclic(|weak: &Weak<BusDevice<B>>| {
             let weak_self: Weak<dyn AnyDevice> = weak.clone();
             BusDevice {
-                base: DeviceBase::new(self.name, self.parent, self.devnum, weak_self),
+                base: DeviceBase::new(self.name, parent, self.devnum, weak_self),
                 bus: self.handle,
                 payload: self.payload,
                 declared,
@@ -146,7 +153,7 @@ impl<B: Bus> DeviceInternals for BusDevice<B> {
         self.declared.type_name()
     }
 
-    fn attr_groups(&self) -> Vec<TyErasedAttr> {
+    fn attr_groups(&self) -> Vec<TyErasedAttrGroup> {
         self.declared.attr_groups(self.bus.bus().dev_attrs())
     }
 

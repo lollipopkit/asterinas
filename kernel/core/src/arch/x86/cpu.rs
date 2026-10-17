@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{borrow::ToOwned, collections::btree_set::BTreeSet, string::String, vec::Vec};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::{arch::x86_64::CpuidResult, ffi::CStr, fmt, str};
 
 use ostd::{
@@ -14,15 +14,17 @@ use ostd::{
         },
         tsc_freq,
     },
-    cpu::{PinCurrentCpu, num_cpus},
+    cpu::{CpuId, PinCurrentCpu},
     mm::Vaddr,
-    sync::SpinLock,
     task::DisabledPreemptGuard,
 };
 use x86_64::registers::rflags::RFlags;
 
 use crate::{
-    cpu::LinuxAbi,
+    cpu::{
+        LinuxAbi,
+        topology::{self, CpuTopology},
+    },
     vm::{perms::VmPerms, vmar::PageFaultInfo},
 };
 
@@ -182,6 +184,9 @@ impl TryFrom<&CpuException> for PageFaultInfo {
 enum CpuVendor {
     Intel,
     Amd,
+    Hygon,
+    Centaur,
+    Zhaoxin,
     Unknown,
 }
 
@@ -190,6 +195,9 @@ impl CpuVendor {
         match s {
             "GenuineIntel" => Self::Intel,
             "AuthenticAMD" => Self::Amd,
+            "HygonGenuine" => Self::Hygon,
+            "CentaurHauls" => Self::Centaur,
+            "  Shanghai  " => Self::Zhaoxin,
             _ => Self::Unknown,
         }
     }
@@ -211,10 +219,14 @@ enum CpuidLeaf {
     ExtAddrSizes = 0x80000008,
 }
 
-/// A collection of CPU cores.
-///
-/// Note that hyperthreading can result in multiple logical processors within one core.
-static CPU_CORES: SpinLock<BTreeSet<u32>> = SpinLock::new(BTreeSet::new());
+/// Returns the highest basic CPUID leaf and the vendor identification string.
+fn read_vendor() -> Option<(u32, [[u8; 4]; 3])> {
+    let CpuidResult { eax, ebx, ecx, edx } = cpuid(CpuidLeaf::Base as u32, 0)?;
+    Some((
+        eax,
+        [ebx.to_le_bytes(), edx.to_le_bytes(), ecx.to_le_bytes()],
+    ))
+}
 
 /// CPU information to be shown in `/proc/cpuinfo`.
 ///
@@ -233,8 +245,8 @@ pub(crate) struct CpuInformation {
     stepping: Option<u8>,
     cpu_khz: Option<u32>,
     cache_size: Option<u32>,
-    core_id: u32,
     apicid: u32,
+    initial_apicid: u32,
     cpuid_level: u32,
     flags: Vec<&'static str>,
     tlb_size: Option<u32>,
@@ -257,8 +269,8 @@ impl CpuInformation {
             // constant (i.e., the real CPU frequency can be adjusted due to the workload).
             cpu_khz: Some((tsc_freq() / 1000) as u32),
             cache_size: None,
-            core_id: 0,
             apicid: 0,
+            initial_apicid: 0,
             cpuid_level: 0,
             flags: Vec::new(),
             tlb_size: None,
@@ -268,7 +280,7 @@ impl CpuInformation {
         };
 
         let vendor = result.fill_vendor_info();
-        result.fill_version_info(vendor);
+        result.fill_version_info();
         result.fill_brand_info();
         result.fill_cache_info(vendor);
         result.fill_topology_info();
@@ -279,13 +291,12 @@ impl CpuInformation {
     }
 
     fn fill_vendor_info(&mut self) -> CpuVendor {
-        let Some(CpuidResult { eax, ebx, ecx, edx }) = cpuid(CpuidLeaf::Base as u32, 0) else {
+        let Some((cpuid_level, vendor)) = read_vendor() else {
             return CpuVendor::Unknown;
         };
 
-        self.cpuid_level = eax;
+        self.cpuid_level = cpuid_level;
 
-        let vendor = [ebx.to_le_bytes(), edx.to_le_bytes(), ecx.to_le_bytes()];
         let Ok(vendor_str) = str::from_utf8(vendor.as_flattened()) else {
             return CpuVendor::Unknown;
         };
@@ -294,7 +305,7 @@ impl CpuInformation {
         CpuVendor::parse(vendor_str)
     }
 
-    fn fill_version_info(&mut self, vendor: CpuVendor) {
+    fn fill_version_info(&mut self) {
         let Some(CpuidResult { eax, ebx, .. }) = cpuid(CpuidLeaf::Feature as u32, 0) else {
             return;
         };
@@ -312,14 +323,10 @@ impl CpuInformation {
             base_family
         };
 
-        let has_ext_model = match vendor {
-            // The Intel manual says: "The Extended Model ID needs to be examined only when the
-            // Family ID is 06H or 0FH."
-            CpuVendor::Intel => base_family == 0x6 || base_family == 0xf,
-            // The AMD manual says: "If BaseFamily[3:0] is less than Fh, then ExtFamily is reserved
-            // and Family is equal to BaseFamily[3:0]."
-            CpuVendor::Amd | CpuVendor::Unknown => base_family == 0xf,
-        };
+        // Linux adds the extended model from family 6 on, for every vendor.
+        //
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/lib/cpu.c#L19-L32>
+        let has_ext_model = family >= 0x6;
         let model = if has_ext_model {
             base_model | (ext_model << 4)
         } else {
@@ -335,8 +342,8 @@ impl CpuInformation {
         self.clflush_size = ((ebx >> 8) & 0xff) * 8;
         self.cache_alignment = self.clflush_size;
         // Bits 31-24: Initial APIC ID.
-        self.apicid = ebx >> 24;
-        self.core_id = self.apicid;
+        self.initial_apicid = ebx >> 24;
+        self.apicid = self.initial_apicid;
     }
 
     fn fill_brand_info(&mut self) {
@@ -386,8 +393,10 @@ impl CpuInformation {
 
     fn fill_cache_info(&mut self, vendor: CpuVendor) {
         match vendor {
-            CpuVendor::Intel => self.fill_cache_info_intel(),
-            CpuVendor::Amd | CpuVendor::Unknown => self.fill_cache_info_amd(),
+            CpuVendor::Intel | CpuVendor::Centaur | CpuVendor::Zhaoxin => {
+                self.fill_cache_info_intel()
+            }
+            CpuVendor::Amd | CpuVendor::Hygon | CpuVendor::Unknown => self.fill_cache_info_amd(),
         }
     }
 
@@ -396,7 +405,7 @@ impl CpuInformation {
         let mut l2size = 0;
         let mut l3size = 0;
 
-        for subleaf in 0.. {
+        for subleaf in 0..MAX_CACHE_SUBLEAVES {
             let Some(CpuidResult { eax, ebx, ecx, .. }) = cpuid(CpuidLeaf::Cache as u32, subleaf)
             else {
                 break;
@@ -479,17 +488,12 @@ impl CpuInformation {
     }
 
     fn fill_topology_info(&mut self) {
-        let Some(CpuidResult { eax, edx, .. }) = cpuid(CpuidLeaf::Topology as u32, 0) else {
+        let Some(CpuidResult { edx, .. }) = cpuid(CpuidLeaf::Topology as u32, 0) else {
             return;
         };
 
         // "Bits 31-00: x2APIC ID of the current logical processor."
         self.apicid = edx;
-        // "Bits 04-00: The number of bits that the x2APIC ID must be shifted to the right to
-        // address instances of the next higher-scoped domain."
-        self.core_id = self.apicid >> (eax & 0x1f);
-
-        CPU_CORES.lock().insert(self.core_id);
     }
 
     fn fill_feature_info(&mut self) {
@@ -840,19 +844,23 @@ impl fmt::Display for CpuInformation {
             writeln!(f, "cache size\t: {} KB", cache_size)?;
         }
 
-        // Note that we don't support NUMA now, so we assume that all CPUs are on the same package
-        // (i.e., their physical IDs are all zeros).
-        let siblings = num_cpus();
-        let cpu_cores = CPU_CORES.lock().len();
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/proc.c#L23-L28>.
+        let cpu = CpuId::try_from(self.processor as usize).unwrap();
+        let cpu_topology = topology::get(cpu);
         write!(
             f,
-            "physical id\t: 0\n\
+            "physical id\t: {}\n\
              siblings\t: {}\n\
              core id\t\t: {}\n\
              cpu cores\t: {}\n\
              apicid\t\t: {}\n\
              initial apicid\t: {}\n",
-            siblings, self.core_id, cpu_cores, self.apicid, self.apicid
+            cpu_topology.package_id,
+            topology::package_cpus(cpu).count(),
+            cpu_topology.core_id,
+            topology::num_cores_in_package(cpu),
+            self.apicid,
+            self.initial_apicid
         )?;
 
         write!(
@@ -897,4 +905,290 @@ impl fmt::Display for CpuInformation {
 
         Ok(())
     }
+}
+
+/// Probes the topology of the current CPU from CPUID.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_common.c#L115-L193>.
+pub(crate) fn probe_topology(guard: &DisabledPreemptGuard) -> CpuTopology {
+    let mut scan = TopologyScan::default();
+    let Some(CpuidResult {
+        eax: leaf1_eax,
+        ebx: leaf1_ebx,
+        edx: leaf1_edx,
+        ..
+    }) = cpuid(CpuidLeaf::Feature as u32, 0)
+    else {
+        // Without the APIC ID, every CPU is a core of its own, like `fake_topology` in Linux.
+        return CpuTopology::of_lone_core(guard.current_cpu());
+    };
+    // Bits 31-24: Initial APIC ID. Bits 23-16: Maximum number of addressable IDs for logical
+    // processors in this physical package.
+    scan.apicid = leaf1_ebx >> 24;
+    let nproc_shift = count_order((leaf1_ebx >> 16) & 0xff);
+    // Bit 28: Max APIC IDs reserved field is valid.
+    let has_ht = leaf1_edx & (1 << 28) != 0;
+
+    let vendor = read_vendor()
+        .and_then(|(_, vendor)| {
+            str::from_utf8(vendor.as_flattened())
+                .ok()
+                .map(CpuVendor::parse)
+        })
+        .unwrap_or(CpuVendor::Unknown);
+    match vendor {
+        CpuVendor::Intel => {
+            if !scan.parse_ext_leaves() {
+                scan.parse_legacy(has_ht, nproc_shift);
+            }
+        }
+        CpuVendor::Amd | CpuVendor::Hygon => {
+            // TODO: Make core IDs relative to the node on AMD CPUs before family 0x17
+            // with several nodes per package, as Linux does.
+            if !scan.parse_ext_leaves() && scan.parse_amd_0x8000_0008() {
+                scan.parse_amd_0x8000_001e(leaf1_eax);
+            }
+        }
+        CpuVendor::Centaur | CpuVendor::Zhaoxin => scan.parse_legacy(has_ht, nproc_shift),
+        // Every CPU is a package of its own, as in Linux.
+        CpuVendor::Unknown => {}
+    }
+
+    let cluster_id = match vendor {
+        CpuVendor::Intel | CpuVendor::Centaur | CpuVendor::Zhaoxin => {
+            intel_l2_cache_id(scan.apicid)
+        }
+        CpuVendor::Amd | CpuVendor::Hygon | CpuVendor::Unknown => None,
+    };
+    scan.topology(cluster_id)
+}
+
+/// The x86 topology domains, from the innermost.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/include/asm/topology.h#L106-L115>.
+#[derive(Clone, Copy)]
+enum TopoDomain {
+    Smt = 0,
+    Core,
+    Module,
+    Tile,
+    Die,
+    DieGrp,
+    Pkg,
+}
+
+const NUM_TOPO_DOMAINS: usize = TopoDomain::Pkg as usize + 1;
+
+/// The APIC ID of a CPU and how its bits address the units of each domain.
+///
+/// `shifts[d]` is the number of low APIC ID bits that address the CPUs inside one unit of domain `d`.
+#[derive(Default)]
+struct TopologyScan {
+    apicid: u32,
+    shifts: [u32; NUM_TOPO_DOMAINS],
+    ncpus: [u32; NUM_TOPO_DOMAINS],
+}
+
+impl TopologyScan {
+    /// Sets a domain and propagates it to the outer domains, which a later level may override.
+    fn set_dom(&mut self, dom: usize, shift: u32, ncpus: u32) {
+        self.shifts[dom..].fill(shift);
+        self.ncpus[dom..].fill(ncpus);
+    }
+
+    /// Sets a domain without propagating it.
+    fn update_dom(&mut self, dom: TopoDomain, shift: u32, ncpus: u32) {
+        self.shifts[dom as usize] = shift;
+        self.ncpus[dom as usize] = ncpus;
+    }
+
+    /// Parses the first available extended topology leaf.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_ext.c#L136-L146>.
+    fn parse_ext_leaves(&mut self) -> bool {
+        use TopoDomain::*;
+
+        // Each map is indexed by the level type; type 0 is invalid.
+        const MAP_0X1F: &[TopoDomain] = &[Smt, Smt, Core, Module, Tile, Die, DieGrp];
+        const MAP_0X8000_0026: &[TopoDomain] = &[Smt, Smt, Core, Tile, Die];
+        const MAP_0XB: &[TopoDomain] = &[Smt, Smt, Core];
+
+        self.parse_ext_leaf(0x1f, MAP_0X1F)
+            || self.parse_ext_leaf(0x8000_0026, MAP_0X8000_0026)
+            || self.parse_ext_leaf(0x0b, MAP_0XB)
+    }
+
+    /// Parses the subleaves of an extended topology leaf until an invalid one.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_ext.c#L45-L134>.
+    fn parse_ext_leaf(&mut self, leaf: u32, map: &[TopoDomain]) -> bool {
+        let mut last_dom = 0;
+        let mut subleaf = 0;
+        while let Some(CpuidResult { eax, ebx, ecx, edx }) = cpuid(leaf, subleaf) {
+            // EBX bits 15-00: Number of logical processors at this level.
+            let num_processors = ebx & 0xffff;
+            // ECX bits 15-08: Level type; 0 is invalid.
+            let level_type = ((ecx >> 8) & 0xff) as usize;
+            if num_processors == 0 || level_type == 0 {
+                break;
+            }
+
+            // An unknown type describes a domain right outside the last known one.
+            let dom = if let Some(&dom) = map.get(level_type) {
+                last_dom = dom as usize;
+                last_dom
+            } else {
+                (last_dom + 1).min(TopoDomain::Pkg as usize)
+            };
+            if dom == TopoDomain::Smt as usize {
+                // EDX bits 31-00: x2APIC ID of the current logical processor.
+                self.apicid = edx;
+            }
+            // EAX bits 04-00: The number of bits that the x2APIC ID must be shifted to the right
+            // to address instances of the next higher-scoped domain.
+            self.set_dom(dom, eax & 0x1f, num_processors);
+            subleaf += 1;
+        }
+        if subleaf == 0 {
+            return false;
+        }
+
+        // Some CPUs report SMT shift 0 with several threads per core; they are truly SMT.
+        let smt = TopoDomain::Smt as usize;
+        if self.shifts[smt] == 0 && self.ncpus[smt] > 1 {
+            let ncpus = self.ncpus[smt];
+            self.update_dom(TopoDomain::Smt, count_order(ncpus), ncpus);
+        }
+        true
+    }
+
+    /// Derives the domains from the core count in leaf 4 and the logical processor count in
+    /// leaf 1.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_common.c#L65-L101>.
+    fn parse_legacy(&mut self, has_ht: bool, nproc_shift: u32) {
+        let mut cores = match cpuid(CpuidLeaf::Cache as u32, 0) {
+            // EAX bits 04-00: Cache type, 0 meaning none.
+            // EAX bits 31-26: Maximum number of addressable IDs for processor cores in the
+            // physical package, minus one.
+            Some(CpuidResult { eax, .. }) if eax & 0x1f != 0 => (eax >> 26) + 1,
+            _ => 1,
+        };
+        let mut core_shift = count_order(cores);
+        let mut smt_shift = 0;
+        if has_ht {
+            smt_shift = nproc_shift.saturating_sub(core_shift);
+            core_shift += smt_shift;
+            cores <<= smt_shift;
+        }
+        self.set_dom(TopoDomain::Smt as usize, smt_shift, 1 << smt_shift);
+        self.set_dom(TopoDomain::Core as usize, core_shift, cores);
+    }
+
+    /// Derives the core domain from AMD leaf 0x8000_0008.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_amd.c#L12-L46>.
+    fn parse_amd_0x8000_0008(&mut self) -> bool {
+        let Some(CpuidResult { ecx, .. }) = cpuid(CpuidLeaf::ExtAddrSizes as u32, 0) else {
+            return false;
+        };
+        // ECX bits 07-00: Number of physical threads in the package, minus one.
+        let nthreads = (ecx & 0xff) + 1;
+        // ECX bits 15-12: Number of bits in the APIC ID that indicate the thread ID.
+        let shift = match (ecx >> 12) & 0xf {
+            0 => count_order(nthreads),
+            shift => shift,
+        };
+        self.update_dom(TopoDomain::Smt, 0, 1);
+        self.set_dom(TopoDomain::Core as usize, shift, nthreads);
+        true
+    }
+
+    /// Derives the APIC ID and the SMT domain from AMD leaf 0x8000_001E.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_amd.c#L63-L111>.
+    fn parse_amd_0x8000_001e(&mut self, leaf1_eax: u32) {
+        // CPUID 0x8000_0001 ECX bit 22: TOPOEXT.
+        let has_topoext =
+            cpuid(0x8000_0001, 0).is_some_and(|CpuidResult { ecx, .. }| ecx & (1 << 22) != 0);
+        if !has_topoext {
+            return;
+        }
+        let Some(CpuidResult { eax, ebx, .. }) = cpuid(0x8000_001e, 0) else {
+            return;
+        };
+        // EAX bits 31-00: Extended APIC ID.
+        self.apicid = eax;
+
+        let base_family = (leaf1_eax >> 8) & 0xf;
+        let family = if base_family == 0xf {
+            base_family + ((leaf1_eax >> 20) & 0xff)
+        } else {
+            base_family
+        };
+        if family >= 0x17 {
+            // EBX bits 15-08: Number of threads per core, minus one.
+            let nthreads = ((ebx >> 8) & 0xff) + 1;
+            self.update_dom(TopoDomain::Smt, count_order(nthreads), nthreads);
+        }
+    }
+
+    /// Returns the APIC ID shifted to identify the unit of `dom` that the CPU belongs to.
+    fn unit_id(&self, dom: TopoDomain) -> u32 {
+        match dom {
+            TopoDomain::Smt => self.apicid,
+            _ => self
+                .apicid
+                .checked_shr(self.shifts[dom as usize - 1])
+                .unwrap_or(0),
+        }
+    }
+
+    /// Returns the IDs that Linux derives from the APIC ID.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/topology_common.c#L177-L198>.
+    fn topology(&self, cluster_id: Option<u32>) -> CpuTopology {
+        let pkg_mask = ((1u64 << self.shifts[TopoDomain::Pkg as usize]) - 1) as u32;
+        CpuTopology {
+            package_id: self.unit_id(TopoDomain::Pkg),
+            die_id: self.unit_id(TopoDomain::Die),
+            cluster_id,
+            core_id: (self.apicid & pkg_mask)
+                .checked_shr(self.shifts[TopoDomain::Smt as usize])
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// The maximum number of cache subleaves of CPUID leaf 4 to read,
+/// so that malformed CPUID data without a null subleaf cannot hang the scan.
+const MAX_CACHE_SUBLEAVES: u32 = 32;
+
+/// Returns the ID of the L2 cache of the CPU with `apicid`, from Intel leaf 4.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cpu/cacheinfo.c#L413-L472>.
+fn intel_l2_cache_id(apicid: u32) -> Option<u32> {
+    let mut l2_id = None;
+    for subleaf in 0..MAX_CACHE_SUBLEAVES {
+        let Some(CpuidResult { eax, .. }) = cpuid(CpuidLeaf::Cache as u32, subleaf) else {
+            break;
+        };
+        // Bits 04-00: Cache Type Field. Null - No more caches.
+        if eax & 0x1f == 0 {
+            break;
+        }
+        // Bits 07-05: Cache Level (starts at 1).
+        if (eax >> 5) & 0x7 == 2 {
+            // Bits 25-14: Maximum number of addressable IDs for logical processors sharing this
+            // cache, minus one.
+            let sharing = ((eax >> 14) & 0xfff) + 1;
+            l2_id = Some(apicid & !((1 << count_order(sharing)) - 1));
+        }
+    }
+    l2_id
+}
+
+/// Returns the order of `count` rounded up to a power of two.
+fn count_order(count: u32) -> u32 {
+    count.next_power_of_two().trailing_zeros()
 }

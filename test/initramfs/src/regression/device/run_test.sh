@@ -30,3 +30,4 @@ set -e
 ./hwrng
 ./nvme
 ./random
+./sysfs_cpu
