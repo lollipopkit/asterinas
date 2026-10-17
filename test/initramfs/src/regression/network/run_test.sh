@@ -37,6 +37,7 @@ sleep 0.2
 ./tcp_wildcard
 ./tcp_wrapped_buffer_io
 ./udp_broadcast
+./udp_connected
 ./udp_err
 ./user_buffer_fault
 ./unix_datagram_err

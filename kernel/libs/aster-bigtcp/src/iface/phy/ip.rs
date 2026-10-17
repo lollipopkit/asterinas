@@ -96,6 +96,16 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for IpIface<D, E> {
         Some(packet.packet.pack(0))
     }
 
+    fn poll_timers(&self, _iface_cx: &Context) {}
+
+    fn pop_tx(&self) -> Option<TxPacket<LinkLayer>> {
+        None
+    }
+
+    fn next_poll_at_ms(&self) -> Option<u64> {
+        None
+    }
+
     fn alloc_tx_buffer(&self, payload_len: usize) -> Result<FreshTxPacket, ostd::Error> {
         D::Device::alloc_tx_buffer(payload_len)
     }

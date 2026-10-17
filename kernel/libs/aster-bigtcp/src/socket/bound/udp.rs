@@ -8,7 +8,7 @@ use ostd::sync::SpinLock;
 use smoltcp::{
     iface::Context,
     socket::udp::UdpMetadata,
-    wire::{IpRepr, UdpRepr},
+    wire::{IpEndpoint, IpRepr, UdpRepr},
 };
 
 use super::{
@@ -28,6 +28,8 @@ pub type UdpSocket<E> = Socket<UdpSocketInner, E>;
 pub struct UdpSocketInner {
     socket: SpinLock<Box<RawUdpSocket>, BottomHalfDisabled>,
     need_dispatch: AtomicBool,
+    /// The remote endpoint that the socket is connected to.
+    remote_endpoint: SpinLock<Option<IpEndpoint>, BottomHalfDisabled>,
 }
 
 impl<E: Ext> Inner<E> for UdpSocketInner {
@@ -53,7 +55,7 @@ impl<E: Ext> UdpSocketBg<E> {
         udp_repr: &UdpRepr,
         udp_payload: PacketSlice<'_>,
     ) -> bool {
-        if !self.accepts(ip_repr, udp_repr) {
+        if self.score(ip_repr, udp_repr).is_none() {
             return false;
         }
 
@@ -72,13 +74,37 @@ impl<E: Ext> UdpSocketBg<E> {
         true
     }
 
-    fn accepts(&self, ip_repr: &IpRepr, udp_repr: &UdpRepr) -> bool {
+    /// Returns how well an incoming packet matches the socket, or `None` if the socket does not
+    /// accept the packet.
+    ///
+    /// Like Linux, a connected socket only accepts packets from its remote endpoint, and is
+    /// preferred over unconnected sockets.
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L381>
+    pub(crate) fn score(&self, ip_repr: &IpRepr, udp_repr: &UdpRepr) -> Option<u8> {
         // This must be stricter than `RawUdpSocket::accepts` so that `RawUdpSocket::process` is
-        // guaranteed to work correctly if this method returns true.
+        // guaranteed to work correctly if this method returns `Some(_)`.
         //
         // `RawUdpSocket::accepts` accepts all incoming broadcast and multicast packets, which is not
         // what we want.
-        ip_repr.dst_addr() == *self.bound.addr() && udp_repr.dst_port == self.bound.port()
+        if ip_repr.dst_addr() != *self.bound.addr() || udp_repr.dst_port != self.bound.port() {
+            return None;
+        }
+
+        let Some(remote) = *self.inner.remote_endpoint.lock() else {
+            return Some(0);
+        };
+
+        if remote.addr != ip_repr.src_addr() {
+            return None;
+        }
+        // A zero port means that the socket is connected to any port of the remote address.
+        if remote.port == 0 {
+            return Some(1);
+        }
+        if remote.port != udp_repr.src_port {
+            return None;
+        }
+        Some(2)
     }
 
     /// Tries to generate an outgoing packet and dispatches the generated packet.
@@ -143,6 +169,7 @@ impl<E: Ext> UdpSocket<E> {
         let inner = UdpSocketInner {
             socket: SpinLock::new(socket),
             need_dispatch: AtomicBool::new(false),
+            remote_endpoint: SpinLock::new(None),
         };
 
         let socket = Self::new(bound, inner);
@@ -153,6 +180,16 @@ impl<E: Ext> UdpSocket<E> {
             .register_udp_socket(socket.inner().clone());
 
         Ok(socket)
+    }
+
+    /// Connects to a remote endpoint.
+    ///
+    /// After this method returns, only packets from the remote endpoint will be received. Packets
+    /// that have already been received are kept.
+    ///
+    /// Polling the iface is _not_ required after this method succeeds.
+    pub fn connect(&self, remote_endpoint: IpEndpoint) {
+        *self.0.inner.remote_endpoint.lock() = Some(remote_endpoint);
     }
 
     /// Sends some data.
