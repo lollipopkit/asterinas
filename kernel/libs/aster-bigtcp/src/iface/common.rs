@@ -286,6 +286,8 @@ impl<E: Ext> IfaceCommon<E> {
     }
 
     fn do_poll_and_notify(&self, device: &mut dyn AnyNetworkDevice, phy: &dyn PollPhy) {
+        // The device lock is held, so polls are serialized and the next poll times are scheduled in
+        // the order in which they are computed.
         let next_poll = self.do_poll(device, phy);
         device.notify_poll_end();
         self.sched_poll.schedule_next_poll(next_poll);
