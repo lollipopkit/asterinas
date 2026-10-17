@@ -106,7 +106,8 @@ FN_TEST(other_process_links)
 	snprintf(path, sizeof(path), "/proc/%d/root", child);
 	TEST_ERRNO(read_link(path), ENOENT);
 
-	TEST_RES(waitpid(child, &status, 0), _ret == child && WIFEXITED(status));
+	TEST_RES(waitpid(child, &status, 0),
+		 _ret == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	TEST_SUCC(close(ready_pipe[0]));
 	TEST_SUCC(close(ready_pipe[1]));
 	TEST_SUCC(close(exit_pipe[0]));
