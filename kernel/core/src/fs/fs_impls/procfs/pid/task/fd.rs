@@ -8,7 +8,7 @@ use super::TidDirOps;
 use crate::{
     fs::{
         file::{
-            AccessMode, FileLike, InodeType, chmod,
+            AccessMode, FileLike, InodeType, PerOpenFileOps, StatusFlags, chmod,
             file_table::{FileDesc, RawFileDesc},
             mkmod,
         },
@@ -238,6 +238,8 @@ impl ProcSymOps for FileSymOps {
         let Some(thread) = self.tid_dir_ops.thread() else {
             return_errno_with_message!(Errno::ESRCH, "the thread does not exist");
         };
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/base.c#L1776-L1798>
+        TidDirOps::check_read_access(&thread)?;
         let posix_thread = thread.as_posix_thread().unwrap();
 
         let file_table = posix_thread.file_table().lock();
@@ -299,6 +301,16 @@ impl FdOps for FileInfoOps {
 impl ProcFileOps for FileInfoOps {
     fn owner_thread(&self) -> Option<Arc<Thread>> {
         self.tid_dir_ops.thread()
+    }
+
+    fn open(
+        &self,
+        _access_mode: AccessMode,
+        _status_flags: StatusFlags,
+    ) -> Option<Result<Box<dyn PerOpenFileOps>>> {
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/fd.c#L82-L95>
+        let thread = self.tid_dir_ops.thread()?;
+        TidDirOps::check_read_access(&thread).err().map(Err)
     }
 
     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {

@@ -3,7 +3,7 @@
 use super::TidDirOps;
 use crate::{
     fs::{
-        file::mkmod,
+        file::{AccessMode, PerOpenFileOps, StatusFlags, mkmod},
         procfs::template::{ProcFile, ProcFileOps},
         vfs::inode::Inode,
     },
@@ -24,6 +24,14 @@ impl AuxvFileOps {
 impl ProcFileOps for AuxvFileOps {
     fn owner_thread(&self) -> Option<Arc<Thread>> {
         self.0.thread()
+    }
+
+    fn open(
+        &self,
+        _access_mode: AccessMode,
+        _status_flags: StatusFlags,
+    ) -> Option<Result<Box<dyn PerOpenFileOps>>> {
+        self.0.check_mm_read_access().err().map(Err)
     }
 
     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {

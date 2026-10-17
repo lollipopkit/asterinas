@@ -25,7 +25,14 @@ use crate::{
         vfs::inode::{Inode, RevalidationPolicy},
     },
     prelude::*,
-    process::{Process, pid_table, pid_table::PidEntry, posix_thread::AsPosixThread},
+    process::{
+        Process, UserNamespace,
+        credentials::capabilities::CapSet,
+        pid_table,
+        pid_table::PidEntry,
+        posix_thread::{AsPosixThread, alien_access::AlienAccessMode},
+    },
+    security::lsm::hooks as lsm_hooks,
     thread::{Thread, Tid},
 };
 
@@ -96,6 +103,55 @@ impl TidDirOps {
 
     pub(super) fn thread(&self) -> Option<Arc<Thread>> {
         self.pid_entry.thread()
+    }
+
+    /// Checks whether the current thread may read the state of `thread` that Linux guards
+    /// with `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)`.
+    ///
+    /// Returns `EACCES` if the access is denied.
+    pub(super) fn check_read_access(thread: &Thread) -> Result<()> {
+        thread
+            .as_posix_thread()
+            .unwrap()
+            .check_alien_access_from(
+                current_thread!().as_posix_thread().unwrap(),
+                AlienAccessMode::READ_WITH_FS_CREDS,
+            )
+            .map_err(|_| Error::with_message(Errno::EACCES, "alien access is denied"))
+    }
+
+    /// Checks whether the current thread may open a file that reads the memory of the process,
+    /// like `proc_mem_open(inode, PTRACE_MODE_READ_FSCREDS)` in Linux.
+    ///
+    /// Returns `ESRCH` if the process has exited, or `EACCES` if the access is denied.
+    //
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/base.c#L818-L849>
+    pub(super) fn check_mm_read_access(&self) -> Result<()> {
+        let Some((thread, process)) = self.thread_and_process() else {
+            return_errno_with_message!(Errno::ESRCH, "the process does not exist");
+        };
+        if process.lock_vmar().as_ref().is_none() {
+            return_errno_with_message!(Errno::ESRCH, "the process has exited");
+        }
+        if Self::check_read_access(&thread).is_ok() {
+            return Ok(());
+        }
+
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L1393-L1402>
+        let current = current_thread!();
+        let init_ns = UserNamespace::get_init_singleton();
+        let is_perfmon_capable = [CapSet::PERFMON, CapSet::SYS_ADMIN].into_iter().any(|cap| {
+            lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+                init_ns.as_ref(),
+                current.as_posix_thread().unwrap(),
+                cap,
+            ))
+            .is_ok()
+        });
+        if !is_perfmon_capable {
+            return_errno_with_message!(Errno::EACCES, "alien access is denied");
+        }
+        Ok(())
     }
 
     pub(super) fn thread_and_process(&self) -> Option<(Arc<Thread>, Arc<Process>)> {

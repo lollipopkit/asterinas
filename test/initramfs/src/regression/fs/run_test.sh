@@ -150,6 +150,7 @@ TEST_TMPDIR=/ext2 ./direct_io/direct_io
 ./overlayfs/sparse_copyup_consistency
 ./overlayfs/xino_dino_identity
 
+./procfs/alien_access
 ./procfs/dentry_cache
 ./procfs/fd
 ./procfs/fs_links

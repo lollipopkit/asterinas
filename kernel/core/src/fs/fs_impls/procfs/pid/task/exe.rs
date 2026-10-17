@@ -29,9 +29,11 @@ impl ProcSymOps for ExeSymOps {
     }
 
     fn read_link(&self) -> Result<SymbolicLink> {
-        let Some(process) = self.0.process() else {
+        let Some((thread, process)) = self.0.thread_and_process() else {
             return_errno_with_message!(Errno::ESRCH, "the process does not exist");
         };
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/base.c#L1776-L1798>
+        TidDirOps::check_read_access(&thread)?;
 
         let vmar_guard = process.lock_vmar();
         let Some(vmar) = vmar_guard.as_ref() else {
