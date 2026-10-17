@@ -19,11 +19,23 @@ use crate::{
     vm::{perms::VmPerms, vmar::PageFaultInfo},
 };
 
+/// Checks whether the current thread may bind to `endpoint`.
+///
+/// Port 0 asks for an ephemeral port, which needs no privilege.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L516-L520>
+fn check_bind_privilege(endpoint: &IpEndpoint) -> Result<()> {
+    if endpoint.port == 0 {
+        return Ok(());
+    }
+    check_port_privilege(endpoint.port)
+}
+
 pub(super) fn resolve_bind_iface_and_config(
     endpoint: &IpEndpoint,
     can_reuse: bool,
 ) -> Result<(Arc<Iface>, BindPortConfig)> {
-    check_port_privilege(endpoint.port)?;
+    check_bind_privilege(endpoint)?;
 
     let iface = route::lookup_local_iface(endpoint.addr)?;
 
@@ -52,7 +64,7 @@ pub(super) fn bind_ports<P>(
 where
     P: Deref<Target = BoundPort>,
 {
-    check_port_privilege(endpoint.port)?;
+    check_bind_privilege(endpoint)?;
 
     if !endpoint.addr.is_unspecified() {
         let iface = route::lookup_local_iface(endpoint.addr)?;
