@@ -8,7 +8,7 @@ use crate::{
         vfs::inode::{Inode, SymbolicLink},
     },
     prelude::*,
-    process::posix_thread::{AsPosixThread, alien_access::AlienAccessMode},
+    process::posix_thread::AsPosixThread,
     thread::Thread,
 };
 
@@ -49,14 +49,8 @@ impl ProcSymOps for FsLinkSymOps {
         let Some(thread) = self.dir.thread() else {
             return_errno_with_message!(Errno::ESRCH, "the thread does not exist");
         };
-        let posix_thread = thread.as_posix_thread().unwrap();
         // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/base.c#L1776-L1798>
-        posix_thread
-            .check_alien_access_from(
-                current_thread!().as_posix_thread().unwrap(),
-                AlienAccessMode::READ_WITH_FS_CREDS,
-            )
-            .map_err(|_| Error::with_message(Errno::EACCES, "alien access is denied"))?;
+        TidDirOps::check_read_access(&thread)?;
 
         // Linux drops the FS information of a task when it exits. Reference:
         // <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/base.c#L222-L234>
@@ -64,7 +58,7 @@ impl ProcSymOps for FsLinkSymOps {
             return_errno_with_message!(Errno::ENOENT, "the thread has exited");
         }
 
-        let fs = posix_thread.read_fs();
+        let fs = thread.as_posix_thread().unwrap().read_fs();
         let resolver = fs.resolver().read();
         let path = if self.is_root {
             resolver.root()
