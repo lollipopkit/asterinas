@@ -70,14 +70,15 @@ impl Common {
         metadata.gid = credentials.egid();
 
         // Files of a non-dumpable process are owned by root, except for world-readable and
-        // searchable directories (e.g., `/proc/[pid]`).
+        // searchable directories (e.g., `/proc/[pid]`). A process that is gone is treated as
+        // non-dumpable, so the files never fall back to a less restrictive owner.
         // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/base.c#L1862-L1910>
         let is_public_dir = metadata.type_ == InodeType::Dir && metadata.mode == mkmod!(a+rx);
         if !is_public_dir
             && posix_thread
                 .weak_process()
                 .upgrade()
-                .is_some_and(|process| process.dumpable() != Dumpable::Owner)
+                .is_none_or(|process| process.dumpable() != Dumpable::Owner)
         {
             metadata.uid = Uid::new_root();
             metadata.gid = Gid::new_root();
