@@ -75,6 +75,9 @@ FN_TEST(other_process_links)
 		CHECK_WITH(read(exit_pipe[0], &byte, 1), _ret == 1);
 		_exit(0);
 	}
+	// Close the unused ends, so the reads below fail instead of blocking if the child fails.
+	TEST_SUCC(close(ready_pipe[1]));
+	TEST_SUCC(close(exit_pipe[0]));
 	TEST_RES(read(ready_pipe[0], &byte, 1), _ret == 1);
 
 	snprintf(path, sizeof(path), "/proc/%d/cwd", child);
@@ -109,8 +112,6 @@ FN_TEST(other_process_links)
 	TEST_RES(waitpid(child, &status, 0),
 		 _ret == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	TEST_SUCC(close(ready_pipe[0]));
-	TEST_SUCC(close(ready_pipe[1]));
-	TEST_SUCC(close(exit_pipe[0]));
 	TEST_SUCC(close(exit_pipe[1]));
 }
 END_TEST()
