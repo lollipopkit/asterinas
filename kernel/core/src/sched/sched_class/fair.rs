@@ -275,15 +275,39 @@ impl FairClassRq {
     fn time_slice(&self, cur_weight: u64) -> u64 {
         self.period() * cur_weight / (self.total_weight + cur_weight)
     }
-}
 
-impl SchedClassRq for FairClassRq {
-    fn enqueue(&mut self, entity: Arc<Task>, flags: Option<EnqueueFlags>) {
+    /// Removes the queued thread that would run last among those accepted by `can_migrate`.
+    ///
+    /// Returns the thread and its vruntime relative to this run queue, which
+    /// [`Self::enqueue_migrated`] keeps on the destination run queue.
+    pub(super) fn steal(
+        &mut self,
+        can_migrate: impl Fn(&Task) -> bool,
+    ) -> Option<(Arc<Task>, u64)> {
+        let mut entities = core::mem::take(&mut self.entities).into_vec();
+        let index = (0..entities.len())
+            .filter(|&i| can_migrate(&entities[i].0.0))
+            .max_by_key(|&i| entities[i].0.key());
+        let stolen = index.map(|i| entities.swap_remove(i).0);
+        self.entities = entities.into();
+
+        let FairQueueItem(entity, vruntime) = stolen?;
+        let (old_weight, _weight) = entity.as_thread().unwrap().sched_attr().fair.fetch_weight();
+        self.total_weight -= old_weight;
+        Some((entity, vruntime.saturating_sub(self.min_vruntime)))
+    }
+
+    /// Enqueues a thread taken from another run queue by [`Self::steal`].
+    pub(super) fn enqueue_migrated(&mut self, entity: Arc<Task>, relative_vruntime: u64) {
         let fair_attr = &entity.as_thread().unwrap().sched_attr().fair;
-        let vruntime = match flags {
-            Some(EnqueueFlags::Spawn) => self.min_vruntime + self.vtime_slice(),
-            _ => self.min_vruntime,
-        };
+        fair_attr
+            .vruntime
+            .store(self.min_vruntime + relative_vruntime, Ordering::Relaxed);
+        self.push(entity, self.min_vruntime);
+    }
+
+    fn push(&mut self, entity: Arc<Task>, vruntime: u64) {
+        let fair_attr = &entity.as_thread().unwrap().sched_attr().fair;
         let (_old_weight, weight) = fair_attr.fetch_weight();
 
         let vruntime = fair_attr
@@ -293,6 +317,16 @@ impl SchedClassRq for FairClassRq {
 
         self.total_weight += weight;
         self.entities.push(Reverse(FairQueueItem(entity, vruntime)));
+    }
+}
+
+impl SchedClassRq for FairClassRq {
+    fn enqueue(&mut self, entity: Arc<Task>, flags: Option<EnqueueFlags>) {
+        let vruntime = match flags {
+            Some(EnqueueFlags::Spawn) => self.min_vruntime + self.vtime_slice(),
+            _ => self.min_vruntime,
+        };
+        self.push(entity, vruntime);
     }
 
     fn len(&self) -> usize {

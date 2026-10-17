@@ -9,9 +9,9 @@ use core::{fmt, ops::Bound, sync::atomic::Ordering};
 
 use ostd::{
     arch::read_tsc as sched_clock,
-    cpu::{CpuId, CpuSet, PinCurrentCpu, all_cpus},
+    cpu::{CpuId, CpuSet, PinCurrentCpu, all_cpus, num_cpus},
     irq::disable_local,
-    sync::{LocalIrqDisabled, SpinLock},
+    sync::{LocalIrqDisabled, SpinLock, SpinLockGuard},
     task::{
         AtomicCpuId, Task,
         scheduler::{
@@ -19,8 +19,10 @@ use ostd::{
             info::CommonSchedInfo, inject_scheduler,
         },
     },
+    timer::{self, Jiffies},
     util::id_set::Id,
 };
+use spin::Once;
 
 use super::{
     nice::Nice,
@@ -44,8 +46,11 @@ pub(crate) use self::{
 
 type SchedEntity = (Arc<Task>, Arc<Thread>);
 
+static SCHEDULER: Once<&'static ClassScheduler> = Once::new();
+
 pub(crate) fn init() {
-    let scheduler = Box::leak(Box::new(ClassScheduler::new()));
+    let scheduler: &'static ClassScheduler = Box::leak(Box::new(ClassScheduler::new()));
+    SCHEDULER.call_once(|| scheduler);
 
     // Inject the scheduler into the ostd for actual scheduling work.
     inject_scheduler(scheduler);
@@ -57,6 +62,8 @@ pub(crate) fn init() {
 }
 
 pub(crate) fn init_on_each_cpu() {
+    // Balance before the preemption tick, so that the tick can switch to a pulled thread.
+    timer::register_callback_on_cpu(|| SCHEDULER.get().unwrap().balance());
     enable_preemption_on_cpu();
 }
 
@@ -82,6 +89,8 @@ struct PerCpuClassRqSet {
     fair: fair::FairClassRq,
     idle: idle::IdleClassRq,
     current: Option<(SchedEntity, CurrentRuntime)>,
+    /// The jiffies when this CPU checks the load balance next time.
+    next_balance: u64,
 }
 
 /// Stores the runtime information of the current task.
@@ -273,6 +282,7 @@ impl ClassScheduler {
                 fair: fair::FairClassRq::new(cpu),
                 idle: idle::IdleClassRq::new(),
                 current: None,
+                next_balance: 0,
             })
         };
         ClassScheduler {
@@ -286,9 +296,7 @@ impl ClassScheduler {
     /// A woken thread stays on its last CPU if that CPU is idle. Otherwise, it moves to an idle
     /// CPU if there is one, like `select_idle_sibling` in Linux, so that runnable threads do not
     /// wait behind each other while a CPU idles. A spawned thread goes to the least loaded CPU.
-    ///
-    /// TODO: Balance the load of threads that keep running without sleeping, which this does
-    /// not move.
+    /// Threads that keep running without sleeping are moved by [`Self::balance`].
     ///
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/sched/fair.c#L9027>
     fn select_cpu(&self, thread: &Thread, flags: EnqueueFlags) -> CpuId {
@@ -313,9 +321,10 @@ impl ClassScheduler {
         // Set `selected` as `candidate` if the candidate's load is smaller. The load counts the
         // running thread, so that a busy CPU with an empty queue is not taken for an idle one.
         let test_candidate = |candidate: CpuId| {
-            let PerCpuLoadStats { queue_len, is_idle } =
-                self.rqs[candidate.as_usize()].lock().load_stats();
-            let load = queue_len + u32::from(!is_idle);
+            let load = self.rqs[candidate.as_usize()]
+                .lock()
+                .load_stats()
+                .nr_running();
             if load < minimum_load {
                 minimum_load = load;
                 selected = candidate;
@@ -335,6 +344,95 @@ impl ClassScheduler {
 
         self.last_chosen_cpu.set_anyway(selected);
         selected
+    }
+
+    /// Pulls a queued fair thread to the current CPU from the busiest CPU if that CPU runs at
+    /// least two more threads, like the periodic load balancing in Linux.
+    ///
+    /// This runs on every tick and checks the load every `num_cpus` ticks on an idle CPU, and
+    /// [`BUSY_FACTOR`] times less often on a busy CPU, like the CPU-level scheduling domain in
+    /// Linux.
+    ///
+    /// TODO: Balance real-time threads, which Linux pushes to and pulls from CPUs running
+    /// lower-priority threads.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/sched/fair.c#L14080>
+    fn balance(&self) {
+        /// The factor by which a busy CPU balances less often, like `busy_factor` in Linux.
+        const BUSY_FACTOR: u64 = 16;
+
+        let guard = disable_local();
+        let this_cpu = guard.current_cpu();
+        let now = Jiffies::elapsed().as_u64();
+
+        let this_nr_running = {
+            let mut rq = self.rqs[this_cpu.as_usize()].lock();
+            if now < rq.next_balance {
+                return;
+            }
+            let stats = rq.load_stats();
+            let interval = num_cpus() as u64 * if stats.is_idle { 1 } else { BUSY_FACTOR };
+            rq.next_balance = now + interval;
+            stats.nr_running()
+        };
+
+        let Some(busiest_cpu) = all_cpus()
+            .filter(|&cpu| cpu != this_cpu)
+            .map(|cpu| {
+                (
+                    cpu,
+                    self.rqs[cpu.as_usize()].lock().load_stats().nr_running(),
+                )
+            })
+            .filter(|&(_, nr_running)| nr_running >= this_nr_running + 2)
+            .max_by_key(|&(_, nr_running)| nr_running)
+            .map(|(cpu, _)| cpu)
+        else {
+            return;
+        };
+
+        let (mut busiest_rq, mut this_rq) = self.lock_pair(busiest_cpu, this_cpu);
+        if busiest_rq.load_stats().nr_running() < this_rq.load_stats().nr_running() + 2 {
+            return;
+        }
+        let Some((task, relative_vruntime)) = busiest_rq.fair.steal(|task| {
+            task.as_thread().is_some_and(|thread| {
+                thread
+                    .atomic_cpu_affinity()
+                    .load(Ordering::Relaxed)
+                    .contains(this_cpu)
+            })
+        }) else {
+            return;
+        };
+
+        // Both run queues are locked, so `Scheduler::enqueue` cannot observe the change halfway.
+        task.cpu().set_anyway(this_cpu);
+        task.as_thread()
+            .unwrap()
+            .sched_attr()
+            .set_last_cpu(this_cpu);
+        this_rq.fair.enqueue_migrated(task, relative_vruntime);
+    }
+
+    /// Locks the run queues of two different CPUs in the order of their IDs, returning the
+    /// guards in the order of the arguments.
+    fn lock_pair(
+        &self,
+        a: CpuId,
+        b: CpuId,
+    ) -> (
+        SpinLockGuard<'_, PerCpuClassRqSet, LocalIrqDisabled>,
+        SpinLockGuard<'_, PerCpuClassRqSet, LocalIrqDisabled>,
+    ) {
+        debug_assert_ne!(a, b);
+        if a.as_usize() < b.as_usize() {
+            let a_rq = self.rqs[a.as_usize()].lock();
+            (a_rq, self.rqs[b.as_usize()].lock())
+        } else {
+            let b_rq = self.rqs[b.as_usize()].lock();
+            (self.rqs[a.as_usize()].lock(), b_rq)
+        }
     }
 
     /// Returns a cycling iterator over the CPUs in the [`CpuSet`], starting *after*
@@ -442,6 +540,13 @@ struct PerCpuLoadStats {
     /// running any task at all. The latter case is very unlikely to happen
     /// (almost a bug if it happens) as the idle task should always be runnable.
     is_idle: bool,
+}
+
+impl PerCpuLoadStats {
+    /// Returns the number of runnable threads, including the running one.
+    fn nr_running(&self) -> u32 {
+        self.queue_len + u32::from(!self.is_idle)
+    }
 }
 
 impl SchedulerStats for ClassScheduler {
