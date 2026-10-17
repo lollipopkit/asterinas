@@ -62,6 +62,7 @@ struct agent_ctl_tct_commit {
 
 #define AGENT_CTL_TCT_COMMIT _IOWR(0xA7, 6, struct agent_ctl_tct_commit)
 #define AGENT_CTL_TCT_COMMIT_DONE _IO(0xA7, 7)
+#define AGENT_CTL_TCT_PROCESSES _IOWR(0xA7, 8, struct agent_ctl_tct_effects)
 
 #define NOBODY_UID 65534
 
@@ -683,6 +684,56 @@ FN_TEST(commit_hold)
 
 	alarm_action.sa_handler = SIG_DFL;
 	TEST_SUCC(sigaction(SIGALRM, &alarm_action, NULL));
+}
+END_TEST()
+
+FN_TEST(processes)
+{
+	int pid_pipe[2], hold_pipe[2], status;
+	struct agent_ctl_tct_effects args;
+	uint32_t pids[4];
+	uint64_t id, nr_live;
+	pid_t daemon = 0;
+
+	TEST_SUCC(prctl(PR_SET_CHILD_SUBREAPER, 1));
+	TEST_SUCC(pipe(pid_pipe));
+	TEST_SUCC(pipe(hold_pipe));
+	// The daemon outlives the process that begins the TCT.
+	id = IN_TCT({
+		pid_t pid = TEST_SUCC(fork());
+		if (pid == 0) {
+			char byte;
+			close(hold_pipe[1]);
+			_exit(read(hold_pipe[0], &byte, 1) == 0 ? 0 : 1);
+		}
+		TEST_RES(write(pid_pipe[1], &pid, sizeof(pid)),
+			 _ret == sizeof(pid));
+	});
+	TEST_RES(read(pid_pipe[0], &daemon, sizeof(daemon)),
+		 _ret == sizeof(daemon));
+	TEST_SUCC(close(pid_pipe[0]));
+	TEST_SUCC(close(pid_pipe[1]));
+	TEST_SUCC(close(hold_pipe[0]));
+	TEST_RES(tct_end(id, &nr_live), _ret == 0 && nr_live == 1);
+
+	args = (struct agent_ctl_tct_effects){ .id = id };
+	TEST_ERRNO(ioctl(ctl_fd, AGENT_CTL_TCT_PROCESSES, &args), ERANGE);
+	TEST_RES(args.len, _ret == sizeof(uint32_t));
+	args.buf = (uint64_t)pids;
+	args.len = sizeof(pids);
+	TEST_RES(ioctl(ctl_fd, AGENT_CTL_TCT_PROCESSES, &args),
+		 _ret == 0 && args.len == sizeof(uint32_t) &&
+			 pids[0] == (uint32_t)daemon);
+
+	TEST_SUCC(close(hold_pipe[1]));
+	TEST_RES(waitpid(daemon, &status, 0),
+		 _ret == daemon && WIFEXITED(status) &&
+			 WEXITSTATUS(status) == 0);
+	args.len = sizeof(pids);
+	TEST_RES(ioctl(ctl_fd, AGENT_CTL_TCT_PROCESSES, &args),
+		 _ret == 0 && args.len == 0);
+	TEST_SUCC(tct_release(id));
+	TEST_SUCC(prctl(PR_SET_CHILD_SUBREAPER, 0));
 }
 END_TEST()
 

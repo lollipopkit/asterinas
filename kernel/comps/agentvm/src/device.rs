@@ -14,11 +14,11 @@
 //! the shim opens it with `AGENT_CTL_TCT_COMMIT_DONE` (or closes the file) after the host has
 //! taken the snapshot.
 //!
-//! Controlling a TCT (beginning, ending, reading its effects, committing and releasing it) requires
-//! `CAP_SYS_ADMIN`, and is refused for processes that are already in a TCT, so a tool cannot
-//! leave its TCT or control it from the inside.
+//! Controlling a TCT (beginning, ending, reading its effects or processes, committing and
+//! releasing it) requires `CAP_SYS_ADMIN`, and is refused for processes that are already in a
+//! TCT, so a tool cannot leave its TCT or control it from the inside.
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use aster_core::{
@@ -180,16 +180,28 @@ impl PerOpenFileOps for AgentCtlFile {
             }
             cmd @ TctEffects => {
                 cmd.with_data_ptr(|args_ptr| {
-                    let mut args: TctEffectsArgs = args_ptr.read()?;
+                    let args: TctBufferArgs = args_ptr.read()?;
                     check_controller()?;
-                    let effects = Tct::get(args.id)?.export_effects();
-                    let buf_len = args.len;
-                    args.len = effects.len() as u64;
+                    let tct = Tct::get(args.id)?;
+                    let (args, output) = args.fill(tct.export_effects());
                     args_ptr.write(&args)?;
-                    if buf_len < effects.len() as u64 {
-                        return_errno_with_message!(Errno::ERANGE, "the buffer is too small");
-                    }
-                    args_ptr.vm().write_bytes(args.buf as usize, &effects)?;
+                    args_ptr.vm().write_bytes(args.buf as usize, &output?)?;
+                    Ok(0)
+                })
+            }
+            cmd @ TctProcesses => {
+                cmd.with_data_ptr(|args_ptr| {
+                    let args: TctBufferArgs = args_ptr.read()?;
+                    check_controller()?;
+                    let tct = Tct::get(args.id)?;
+                    let (args, output) = args.fill(
+                        tct.live_processes()
+                            .into_iter()
+                            .flat_map(u32::to_ne_bytes)
+                            .collect(),
+                    );
+                    args_ptr.write(&args)?;
+                    args_ptr.vm().write_bytes(args.buf as usize, &output?)?;
                     Ok(0)
                 })
             }
@@ -296,12 +308,14 @@ struct TctEndArgs {
     nr_live_processes: u64,
 }
 
-/// The argument of `AGENT_CTL_TCT_EFFECTS`.
+/// The argument of `AGENT_CTL_TCT_EFFECTS` and `AGENT_CTL_TCT_PROCESSES`.
 ///
-/// The effects are written to `buf` in the format of [`Tct::export_effects`].
+/// `AGENT_CTL_TCT_EFFECTS` writes the effects to `buf` in the format of [`Tct::export_effects`].
+/// `AGENT_CTL_TCT_PROCESSES` writes the PIDs of the processes in the TCT that have not exited
+/// to `buf`, as native-endian `u32` values in ascending order.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-struct TctEffectsArgs {
+struct TctBufferArgs {
     /// The ID of the TCT (input).
     id: u64,
     /// The user buffer to write the effects to (input).
@@ -312,6 +326,25 @@ struct TctEffectsArgs {
     len: u64,
 }
 
+impl TctBufferArgs {
+    /// Sets `len` to the length of `output`, and returns `output` if it fits in the buffer, or
+    /// `ERANGE` otherwise, in which case nothing is written to the buffer.
+    fn fill(mut self, output: Vec<u8>) -> (Self, Result<Vec<u8>>) {
+        let buf_len = self.len;
+        self.len = output.len() as u64;
+        if buf_len < self.len {
+            return (
+                self,
+                Err(Error::with_message(
+                    Errno::ERANGE,
+                    "the buffer is too small",
+                )),
+            );
+        }
+        (self, Ok(output))
+    }
+}
+
 mod ioctl_defs {
     use super::*;
 
@@ -319,10 +352,11 @@ mod ioctl_defs {
     pub(super) type TctBegin   = ioc!(AGENT_CTL_TCT_BEGIN,   0xA7, 1, InOutData<TctBeginArgs>);
     pub(super) type TctEnd     = ioc!(AGENT_CTL_TCT_END,     0xA7, 2, InOutData<TctEndArgs>);
     pub(super) type TctGet     = ioc!(AGENT_CTL_TCT_GET,     0xA7, 3, OutData<u64>);
-    pub(super) type TctEffects = ioc!(AGENT_CTL_TCT_EFFECTS, 0xA7, 4, InOutData<TctEffectsArgs>);
+    pub(super) type TctEffects = ioc!(AGENT_CTL_TCT_EFFECTS, 0xA7, 4, InOutData<TctBufferArgs>);
     pub(super) type TctRelease = ioc!(AGENT_CTL_TCT_RELEASE, 0xA7, 5, InData<u64>);
     pub(super) type TctCommit  = ioc!(AGENT_CTL_TCT_COMMIT,  0xA7, 6, InOutData<TctCommitArgs>);
     pub(super) type TctCommitDone = ioc!(AGENT_CTL_TCT_COMMIT_DONE, 0xA7, 7, NoData);
+    pub(super) type TctProcesses = ioc!(AGENT_CTL_TCT_PROCESSES, 0xA7, 8, InOutData<TctBufferArgs>);
 }
 
 pub(crate) fn init() -> Result<()> {
