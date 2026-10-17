@@ -64,6 +64,14 @@ struct agent_ctl_tct_commit {
 #define AGENT_CTL_TCT_COMMIT_DONE _IO(0xA7, 7)
 #define AGENT_CTL_TCT_PROCESSES _IOWR(0xA7, 8, struct agent_ctl_tct_effects)
 
+struct agent_ctl_tct_egress_policy {
+	uint64_t buf;
+	uint64_t len;
+};
+
+#define AGENT_CTL_TCT_SET_EGRESS_POLICY \
+	_IOWR(0xA7, 9, struct agent_ctl_tct_egress_policy)
+
 #define NOBODY_UID 65534
 
 static int ctl_fd;
@@ -734,6 +742,124 @@ FN_TEST(processes)
 		 _ret == 0 && args.len == 0);
 	TEST_SUCC(tct_release(id));
 	TEST_SUCC(prctl(PR_SET_CHILD_SUBREAPER, 0));
+}
+END_TEST()
+
+#define EGRESS_DIR "/tmp/agent_ctl_egress"
+
+static int set_egress_policy(const char *policy, size_t len)
+{
+	struct agent_ctl_tct_egress_policy args = { .buf = (uint64_t)policy,
+						    .len = len };
+
+	return ioctl(ctl_fd, AGENT_CTL_TCT_SET_EGRESS_POLICY, &args);
+}
+
+/* Connects a new UDP socket to the loopback `port`, and returns the socket. */
+static int udp_connect(uint16_t port)
+{
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_port = htons(port),
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	int sk = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (sk < 0)
+		return -1;
+	if (connect(sk, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		int err = errno;
+		close(sk);
+		errno = err;
+		return -1;
+	}
+	return sk;
+}
+
+/* Reads the effects of the TCT `id` into `buf`, and returns their length. */
+static ssize_t read_effects(uint64_t id, char *buf, size_t len)
+{
+	struct agent_ctl_tct_effects args = { .id = id,
+					      .buf = (uint64_t)buf,
+					      .len = len };
+
+	if (ioctl(ctl_fd, AGENT_CTL_TCT_EFFECTS, &args) < 0)
+		return -1;
+	return args.len;
+}
+
+FN_TEST(egress)
+{
+	// Each entry ends with a NUL byte; the implicit terminator is not part of the policy.
+	static const char policy[] = "p" EGRESS_DIR "/secret\0"
+				     "a127.0.0.1:20*\0";
+	static char effects[4096];
+	uint64_t id, nr_live;
+	ssize_t len;
+
+	CHECK_WITH(mkdir(EGRESS_DIR, 0755), _ret == 0 || errno == EEXIST);
+	TEST_SUCC(close(TEST_SUCC(
+		open(EGRESS_DIR "/secret", O_CREAT | O_WRONLY, 0600))));
+
+	TEST_ERRNO(set_egress_policy("x", 1), EINVAL);
+	TEST_ERRNO(set_egress_policy("q/a\0", 4), EINVAL);
+	TEST_SUCC(set_egress_policy(policy, sizeof(policy) - 1));
+
+	// A TCT that has not read protected data can send anywhere, and implicit sends to the
+	// peer are recorded.
+	id = IN_TCT({
+		int sk = TEST_SUCC(udp_connect(3000));
+		TEST_RES(write(sk, "x", 1), _ret == 1);
+		TEST_SUCC(close(sk));
+	});
+	TEST_RES(tct_end(id, &nr_live), _ret == 0);
+	len = TEST_RES(read_effects(id, effects, sizeof(effects)), _ret > 0);
+	TEST_RES(has_effect(effects, len, 'c', "127.0.0.1:3000"), _ret);
+	TEST_SUCC(tct_release(id));
+
+	id = IN_TCT({
+		int out = TEST_SUCC(
+			open(EGRESS_DIR "/copy", O_CREAT | O_WRONLY, 0644));
+		int sk = TEST_SUCC(udp_connect(3000));
+
+		// Reading a protected file taints the TCT.
+		TEST_SUCC(close(TEST_SUCC(open(EGRESS_DIR "/secret", O_RDONLY))));
+		TEST_ERRNO(udp_connect(3000), EACCES);
+		TEST_SUCC(close(TEST_SUCC(udp_connect(2000))));
+		// A socket connected before the TCT was tainted cannot send either.
+		TEST_ERRNO(write(sk, "x", 1), EACCES);
+		TEST_SUCC(close(sk));
+
+		// The file opened for writing before is tainted, even after a rename.
+		TEST_SUCC(close(out));
+		TEST_SUCC(rename(EGRESS_DIR "/copy", EGRESS_DIR "/moved"));
+	});
+	TEST_RES(tct_end(id, &nr_live), _ret == 0);
+	len = TEST_RES(read_effects(id, effects, sizeof(effects)), _ret > 0);
+	TEST_RES(has_effect(effects, len, 't', EGRESS_DIR "/secret"), _ret);
+	TEST_RES(has_effect(effects, len, 'd', "127.0.0.1:3000"), _ret);
+	TEST_RES(has_effect(effects, len, 'c', "127.0.0.1:2000"), _ret);
+	TEST_SUCC(tct_release(id));
+
+	id = IN_TCT({
+		TEST_SUCC(close(TEST_SUCC(open(EGRESS_DIR "/moved", O_RDONLY))));
+		TEST_ERRNO(udp_connect(3000), EACCES);
+	});
+	TEST_RES(tct_end(id, &nr_live), _ret == 0);
+	TEST_SUCC(tct_release(id));
+
+	// Without a policy, nothing is denied.
+	TEST_SUCC(set_egress_policy(NULL, 0));
+	id = IN_TCT({
+		TEST_SUCC(close(TEST_SUCC(open(EGRESS_DIR "/secret", O_RDONLY))));
+		TEST_SUCC(close(TEST_SUCC(udp_connect(3000))));
+	});
+	TEST_RES(tct_end(id, &nr_live), _ret == 0);
+	TEST_SUCC(tct_release(id));
+
+	TEST_SUCC(unlink(EGRESS_DIR "/secret"));
+	TEST_SUCC(unlink(EGRESS_DIR "/moved"));
+	TEST_SUCC(rmdir(EGRESS_DIR));
 }
 END_TEST()
 

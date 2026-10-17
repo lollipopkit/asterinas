@@ -19,5 +19,5 @@ pub(crate) use message_header::{ControlMessage, MessageHeader};
 pub(super) use port_privilege::check_port_privilege;
 pub(crate) use recv_output::RecvOutput;
 pub(crate) use shutdown_cmd::SockShutdownCmd;
-pub(crate) use socket_addr::{SocketAddr, audit_connect};
+pub(crate) use socket_addr::{SocketAddr, audit_connect, check_connect};
 pub(crate) use socket_timeout::SocketTimeout;

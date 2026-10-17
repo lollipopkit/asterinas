@@ -4,7 +4,8 @@
 //!
 //! This component implements tool-call transactions (TCTs): `/dev/agent_ctl` lets an agent
 //! shim inside the VM mark the boundaries of tool calls, and the effects of each tool call
-//! are recorded through the audit hooks of the kernel.
+//! are recorded through the audit hooks of the kernel, which also enforce the egress
+//! control of TCTs that have read protected data.
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -16,6 +17,7 @@ extern crate ostd_pod;
 use component::{ComponentInitError, init_component};
 
 mod device;
+mod egress;
 mod tct;
 
 #[init_component(process)]

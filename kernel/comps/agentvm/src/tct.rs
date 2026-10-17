@@ -33,9 +33,11 @@ use aster_core::{
     fs::vfs::{sync_all_file_systems, sync_policy::SyncPolicy},
     prelude::*,
     process::{Process, signal::pause_on_until},
-    security::audit::{AuditEvent, AuditHooks},
+    security::audit::{AuditEvent, AuditHooks, FileId},
 };
 use ostd::sync::{Mutex, SpinLock, WaitQueue};
+
+use crate::egress;
 
 /// A tool-call transaction.
 #[derive(Debug)]
@@ -49,6 +51,17 @@ pub(crate) struct Tct {
     /// has not been committed.
     commit_epoch: AtomicU64,
     effects: Mutex<Effects>,
+    taint: Mutex<Taint>,
+}
+
+/// The taint of a TCT, see [`egress`].
+#[derive(Debug, Default)]
+struct Taint {
+    is_tainted: bool,
+    /// The files that the TCT has opened for writing before it was tainted.
+    written: BTreeSet<FileId>,
+    /// Whether the TCT has opened more files for writing than `written` holds.
+    is_written_incomplete: bool,
 }
 
 bitflags::bitflags! {
@@ -107,6 +120,10 @@ enum Effect {
     Missing = b'm',
     /// A socket address connected or sent to.
     Connect = b'c',
+    /// A file whose reading tainted the TCT.
+    Tainted = b't',
+    /// A socket address that the TCT was denied to connect or send to.
+    Denied = b'd',
 }
 
 impl From<AuditEvent> for Effect {
@@ -148,6 +165,7 @@ impl Tct {
             has_ended: AtomicBool::new(false),
             commit_epoch: AtomicU64::new(0),
             effects: Mutex::new(Effects::default()),
+            taint: Mutex::new(Taint::default()),
         })
     }
 
@@ -342,6 +360,32 @@ impl Tct {
         buf
     }
 
+    /// Taints the TCT because it has read `target`.
+    fn taint(&self, target: &str) {
+        let mut taint = self.taint.lock();
+        if taint.is_tainted {
+            return;
+        }
+        taint.is_tainted = true;
+        egress::taint_files(
+            core::mem::take(&mut taint.written),
+            taint.is_written_incomplete,
+        );
+        drop(taint);
+        self.record(Effect::Tainted, target);
+    }
+
+    fn on_file_written(&self, file: FileId) {
+        let mut taint = self.taint.lock();
+        if taint.is_tainted {
+            egress::taint_files([file], false);
+        } else if taint.written.len() < MAX_NR_EFFECTS {
+            taint.written.insert(file);
+        } else {
+            taint.is_written_incomplete = true;
+        }
+    }
+
     fn record(&self, effect: Effect, target: &str) {
         let entry = (effect, String::from(target));
         let mut effects = self.effects.lock();
@@ -402,8 +446,38 @@ impl AuditHooks for TctAuditHooks {
     }
 
     fn on_event(&self, process: &Process, event: AuditEvent, target: &str) {
-        if let Some(tct) = Tct::of(process) {
-            tct.record(event.into(), target);
+        let Some(tct) = Tct::of(process) else {
+            return;
+        };
+        tct.record(event.into(), target);
+        if matches!(event, AuditEvent::FileRead | AuditEvent::Exec) && egress::is_protected(target)
+        {
+            tct.taint(target);
         }
+    }
+
+    fn on_file_opened(&self, process: &Process, event: AuditEvent, target: &str, file: FileId) {
+        let Some(tct) = Tct::of(process) else {
+            return;
+        };
+        match event {
+            AuditEvent::FileRead if egress::is_tainted_file(file) => tct.taint(target),
+            AuditEvent::FileWritten => tct.on_file_written(file),
+            _ => {}
+        }
+    }
+
+    fn check_event(&self, process: &Process, event: AuditEvent, target: &str) -> Result<()> {
+        let Some(tct) = Tct::of(process) else {
+            return Ok(());
+        };
+        if event != AuditEvent::Connect || !tct.taint.lock().is_tainted || egress::allows(target) {
+            return Ok(());
+        }
+        tct.record(Effect::Denied, target);
+        return_errno_with_message!(
+            Errno::EACCES,
+            "the TCT has read protected data and the target is not allowed"
+        );
     }
 }

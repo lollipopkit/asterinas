@@ -3,7 +3,10 @@
 use core::fmt::Display;
 
 use options::SocketOption;
-use util::{MessageHeader, RecvFlags, RecvOutput, SendFlags, SockShutdownCmd, SocketAddr};
+use util::{
+    MessageHeader, RecvFlags, RecvOutput, SendFlags, SockShutdownCmd, SocketAddr, audit_connect,
+    check_connect,
+};
 
 use crate::{
     fs::{
@@ -258,12 +261,15 @@ impl<T: Socket + 'static> FileLike for T {
     }
 
     fn write(&self, reader: &mut VmReader) -> Result<usize> {
+        let audit_target = check_connect(self, None)?;
         // TODO: Set correct flags
-        self.sendmsg(
+        let sent_bytes = self.sendmsg(
             reader,
             MessageHeader::new(None, Vec::new()),
             SendFlags::empty(),
-        )
+        )?;
+        audit_connect(audit_target);
+        Ok(sent_bytes)
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
