@@ -8,9 +8,10 @@ use ostd::mm::VmIo;
 use super::SyscallReturn;
 use crate::{
     prelude::*,
-    process::{pid_table, posix_thread::AsPosixThread},
+    process::{Process, pid_table, posix_thread::AsPosixThread},
+    thread::{AsThread, Thread},
     time::{
-        clockid_t,
+        CLOCK_RESOLUTION_NSEC, clockid_t,
         clocks::{
             BootTimeClock, MonotonicClock, MonotonicCoarseClock, MonotonicRawClock, RealTimeClock,
             RealTimeCoarseClock,
@@ -31,6 +32,28 @@ pub(super) fn sys_clock_gettime(
     let timespec = timespec_t::from(time_duration);
     ctx.user_space().write_val(timespec_addr, &timespec)?;
 
+    Ok(SyscallReturn::Return(0))
+}
+
+/// Returns the resolution of a clock, which is [`CLOCK_RESOLUTION_NSEC`] for every clock.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/time/posix-timers.c#L1262>
+pub(super) fn sys_clock_getres(
+    clockid: clockid_t,
+    timespec_addr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    if clockid >= 0 {
+        ClockId::try_from(clockid)?;
+    } else {
+        DynamicClockIdInfo::try_from(clockid)?.owner(ctx, false)?;
+    }
+
+    if timespec_addr != 0 {
+        let resolution = Duration::from_nanos(CLOCK_RESOLUTION_NSEC);
+        ctx.user_space()
+            .write_val(timespec_addr, &timespec_t::from(resolution))?;
+    }
     Ok(SyscallReturn::Return(0))
 }
 
@@ -63,9 +86,10 @@ pub(crate) enum ClockId {
 /// - A clock ID is invalid if bits 2, 1, and 0 are all set.
 ///
 /// Ref: <https://github.com/torvalds/linux/blob/master/include/linux/posix-timers_types.h>.
-pub(super) enum DynamicClockIdInfo {
-    Pid(u32, DynamicClockType),
-    Tid(u32, DynamicClockType),
+pub(super) struct DynamicClockIdInfo {
+    id: u32,
+    is_thread: bool,
+    clock_type: DynamicClockType,
     // TODO: Support FD clocks.
 }
 
@@ -81,15 +105,54 @@ impl TryFrom<clockid_t> for DynamicClockIdInfo {
             return_errno_with_message!(Errno::EINVAL, "invalid clock ID");
         }
 
-        let id = !(value >> 3);
-        let cpu_clock_type = DynamicClockType::try_from(CPU_CLOCK_TYPE_MASK & value)?;
-
-        if ID_TYPE_MASK & value > 0 {
-            Ok(DynamicClockIdInfo::Tid(id as u32, cpu_clock_type))
-        } else {
-            Ok(DynamicClockIdInfo::Pid(id as u32, cpu_clock_type))
-        }
+        Ok(Self {
+            id: !(value >> 3) as u32,
+            is_thread: ID_TYPE_MASK & value > 0,
+            clock_type: DynamicClockType::try_from(CPU_CLOCK_TYPE_MASK & value)?,
+        })
     }
+}
+
+impl DynamicClockIdInfo {
+    pub(super) fn clock_type(&self) -> DynamicClockType {
+        self.clock_type
+    }
+
+    /// Finds the process or thread whose CPU time the clock measures.
+    ///
+    /// ID 0 means the current thread or process. A thread clock only measures a thread in the
+    /// current process. `clock_gettime` (`is_gettime`) also accepts the TID of the current
+    /// thread for a process clock.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/time/posix-cpu-timers.c#L57>
+    pub(super) fn owner(&self, ctx: &Context, is_gettime: bool) -> Result<CpuClockOwner> {
+        let pid_table = pid_table::pid_table_mut();
+        let owner = if self.is_thread {
+            if self.id == 0 {
+                Some(CpuClockOwner::Thread(ctx.task.as_thread().unwrap().clone()))
+            } else {
+                pid_table
+                    .get_thread(self.id)
+                    .filter(|thread| {
+                        thread.as_posix_thread().is_some_and(|posix_thread| {
+                            Arc::ptr_eq(&posix_thread.process(), &ctx.process)
+                        })
+                    })
+                    .map(CpuClockOwner::Thread)
+            }
+        } else if self.id == 0 || (is_gettime && self.id == ctx.posix_thread.tid()) {
+            Some(CpuClockOwner::Process(ctx.process.clone()))
+        } else {
+            pid_table.get_process(self.id).map(CpuClockOwner::Process)
+        };
+        owner.ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))
+    }
+}
+
+/// The process or thread whose CPU time a dynamic clock measures.
+pub(super) enum CpuClockOwner {
+    Process(Arc<Process>),
+    Thread(Arc<Thread>),
 }
 
 #[repr(i32)]
@@ -97,7 +160,9 @@ impl TryFrom<clockid_t> for DynamicClockIdInfo {
 pub(super) enum DynamicClockType {
     Profiling = 0,
     Virtual = 1,
-    // TODO: Support scheduling clocks and FD clocks.
+    /// The CPU time measured by the scheduler, which is the profiling time in Asterinas, like
+    /// `CLOCK_PROCESS_CPUTIME_ID` and `CLOCK_THREAD_CPUTIME_ID`.
+    Scheduling = 2,
 }
 
 /// Reads the time of a clock specified by the input clock ID.
@@ -117,29 +182,16 @@ pub(super) fn read_clock(clockid: clockid_t, ctx: &Context) -> Result<Duration> 
             ClockId::CLOCK_THREAD_CPUTIME_ID => Ok(ctx.posix_thread.prof_clock().read_time()),
         }
     } else {
-        let dynamic_clockid_info = DynamicClockIdInfo::try_from(clockid)?;
-        match dynamic_clockid_info {
-            DynamicClockIdInfo::Pid(pid, clock_type) => {
-                let process = pid_table::pid_table_mut()
-                    .get_process(pid)
-                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
-                match clock_type {
-                    DynamicClockType::Profiling => Ok(process.prof_clock().read_time()),
-                    DynamicClockType::Virtual => Ok(process.prof_clock().user_clock().read_time()),
-                }
+        let clockid_info = DynamicClockIdInfo::try_from(clockid)?;
+        let prof_clock = match clockid_info.owner(ctx, true)? {
+            CpuClockOwner::Process(process) => process.prof_clock().clone(),
+            CpuClockOwner::Thread(thread) => thread.as_posix_thread().unwrap().prof_clock().clone(),
+        };
+        match clockid_info.clock_type() {
+            DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                Ok(prof_clock.read_time())
             }
-            DynamicClockIdInfo::Tid(tid, clock_type) => {
-                let thread = pid_table::pid_table_mut()
-                    .get_thread(tid)
-                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
-                let posix_thread = thread.as_posix_thread().unwrap();
-                match clock_type {
-                    DynamicClockType::Profiling => Ok(posix_thread.prof_clock().read_time()),
-                    DynamicClockType::Virtual => {
-                        Ok(posix_thread.prof_clock().user_clock().read_time())
-                    }
-                }
-            }
+            DynamicClockType::Virtual => Ok(prof_clock.user_clock().read_time()),
         }
     }
 }

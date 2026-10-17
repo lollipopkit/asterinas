@@ -27,6 +27,11 @@ const NSEC_PER_USEC: i64 = 1_000;
 const USEC_PER_SEC: i64 = 1_000_000;
 pub(crate) const NSEC_PER_SEC: i64 = 1_000_000_000;
 
+/// The resolution of clocks in nanoseconds, which is one tick since timers expire on ticks and
+/// CPU clocks count ticks, like `TICK_NSEC` in Linux without high-resolution timers.
+pub(crate) const CLOCK_RESOLUTION_NSEC: u64 =
+    (NSEC_PER_SEC as u64).div_ceil(ostd::timer::TIMER_FREQ);
+
 pub(super) fn init() {
     system_time::init();
     clocks::init();

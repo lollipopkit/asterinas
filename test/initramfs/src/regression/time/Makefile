@@ -3,6 +3,7 @@
 SUBDIRS := \
 	alarm \
 	clock_nanosleep \
+	cpu_clock \
 	gettimeofday \
 	itimer \
 	timerfd \

@@ -105,6 +105,24 @@ Unsupported predefined clock IDs:
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/clock_gettime.2.html).
 
+### `clock_getres`
+
+Supported functionality in SCML:
+
+```c
+{{#include clock_getres.scml}}
+```
+
+Unsupported predefined clock IDs:
+* `CLOCK_REALTIME_ALARM`
+* `CLOCK_BOOTTIME_ALARM`
+* `CLOCK_TAI`
+
+Every clock reports the resolution of one timer tick.
+
+For more information,
+see [the man page](https://man7.org/linux/man-pages/man2/clock_getres.2.html).
+
 ### `clock_nanosleep`
 
 Supported functionality in SCML:

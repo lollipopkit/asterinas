@@ -28,7 +28,7 @@ use spin::Once;
 use crate::{
     syscall::ClockId,
     time::{
-        START_TIME, SystemTime,
+        CLOCK_RESOLUTION_NSEC, START_TIME, SystemTime,
         clocks::MonotonicClock,
         timer::{Timeout, TimerGuard},
     },
@@ -140,6 +140,8 @@ impl VdsoData {
         let coeff = clocksource.coeff();
         self.set_clock_mode(DEFAULT_CLOCK_MODE);
         self.set_coeff(coeff);
+
+        self.hrtimer_res = CLOCK_RESOLUTION_NSEC as u32;
 
         let (last_instant, last_cycles) = clocksource.last_record();
         self.update_high_res_instant(last_instant, last_cycles);

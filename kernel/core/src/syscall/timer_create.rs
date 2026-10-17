@@ -4,7 +4,7 @@ use ostd::mm::VmIo;
 
 use super::{
     SyscallReturn,
-    clock_gettime::{DynamicClockIdInfo, DynamicClockType},
+    clock_gettime::{CpuClockOwner, DynamicClockIdInfo, DynamicClockType},
 };
 use crate::{
     prelude::*,
@@ -130,25 +130,24 @@ where
     let timer = if clockid >= 0 {
         return create_timer_for_clock(ClockId::try_from(clockid)?, func, ctx);
     } else {
-        let dynamic_clockid_info = DynamicClockIdInfo::try_from(clockid)?;
-        match dynamic_clockid_info {
-            DynamicClockIdInfo::Pid(pid, clock_type) => {
-                let process = pid_table::pid_table_mut()
-                    .get_process(pid)
-                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
+        let clockid_info = DynamicClockIdInfo::try_from(clockid)?;
+        let clock_type = clockid_info.clock_type();
+        match clockid_info.owner(ctx, false)? {
+            CpuClockOwner::Process(process) => {
                 let process_timer_manager = process.timer_manager();
                 match clock_type {
-                    DynamicClockType::Profiling => process_timer_manager.create_prof_timer(func),
+                    DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                        process_timer_manager.create_prof_timer(func)
+                    }
                     DynamicClockType::Virtual => process_timer_manager.create_virtual_timer(func),
                 }
             }
-            DynamicClockIdInfo::Tid(tid, clock_type) => {
-                let thread = pid_table::pid_table_mut()
-                    .get_thread(tid)
-                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
+            CpuClockOwner::Thread(thread) => {
                 let posix_thread = thread.as_posix_thread().unwrap();
                 match clock_type {
-                    DynamicClockType::Profiling => posix_thread.create_prof_timer(func),
+                    DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                        posix_thread.create_prof_timer(func)
+                    }
                     DynamicClockType::Virtual => posix_thread.create_virtual_timer(func),
                 }
             }
