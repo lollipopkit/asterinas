@@ -184,6 +184,9 @@ impl TryFrom<&CpuException> for PageFaultInfo {
 enum CpuVendor {
     Intel,
     Amd,
+    Hygon,
+    Centaur,
+    Zhaoxin,
     Unknown,
 }
 
@@ -192,6 +195,9 @@ impl CpuVendor {
         match s {
             "GenuineIntel" => Self::Intel,
             "AuthenticAMD" => Self::Amd,
+            "HygonGenuine" => Self::Hygon,
+            "CentaurHauls" => Self::Centaur,
+            "  Shanghai  " => Self::Zhaoxin,
             _ => Self::Unknown,
         }
     }
@@ -272,7 +278,7 @@ impl CpuInformation {
         };
 
         let vendor = result.fill_vendor_info();
-        result.fill_version_info(vendor);
+        result.fill_version_info();
         result.fill_brand_info();
         result.fill_cache_info(vendor);
         result.fill_topology_info();
@@ -297,7 +303,7 @@ impl CpuInformation {
         CpuVendor::parse(vendor_str)
     }
 
-    fn fill_version_info(&mut self, vendor: CpuVendor) {
+    fn fill_version_info(&mut self) {
         let Some(CpuidResult { eax, ebx, .. }) = cpuid(CpuidLeaf::Feature as u32, 0) else {
             return;
         };
@@ -315,14 +321,10 @@ impl CpuInformation {
             base_family
         };
 
-        let has_ext_model = match vendor {
-            // The Intel manual says: "The Extended Model ID needs to be examined only when the
-            // Family ID is 06H or 0FH."
-            CpuVendor::Intel => base_family == 0x6 || base_family == 0xf,
-            // The AMD manual says: "If BaseFamily[3:0] is less than Fh, then ExtFamily is reserved
-            // and Family is equal to BaseFamily[3:0]."
-            CpuVendor::Amd | CpuVendor::Unknown => base_family == 0xf,
-        };
+        // Linux adds the extended model from family 6 on, for every vendor.
+        //
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/lib/cpu.c#L19-L32>
+        let has_ext_model = family >= 0x6;
         let model = if has_ext_model {
             base_model | (ext_model << 4)
         } else {
@@ -388,8 +390,10 @@ impl CpuInformation {
 
     fn fill_cache_info(&mut self, vendor: CpuVendor) {
         match vendor {
-            CpuVendor::Intel => self.fill_cache_info_intel(),
-            CpuVendor::Amd | CpuVendor::Unknown => self.fill_cache_info_amd(),
+            CpuVendor::Intel | CpuVendor::Centaur | CpuVendor::Zhaoxin => {
+                self.fill_cache_info_intel()
+            }
+            CpuVendor::Amd | CpuVendor::Hygon | CpuVendor::Unknown => self.fill_cache_info_amd(),
         }
     }
 
@@ -935,19 +939,23 @@ pub(crate) fn probe_topology(guard: &DisabledPreemptGuard) -> CpuTopology {
                 scan.parse_legacy(has_ht, nproc_shift);
             }
         }
-        CpuVendor::Amd => {
+        CpuVendor::Amd | CpuVendor::Hygon => {
             // TODO: Make core IDs relative to the node on AMD CPUs before family 0x17
             // with several nodes per package, as Linux does.
             if !scan.parse_ext_leaves() && scan.parse_amd_0x8000_0008() {
                 scan.parse_amd_0x8000_001e(leaf1_eax);
             }
         }
+        CpuVendor::Centaur | CpuVendor::Zhaoxin => scan.parse_legacy(has_ht, nproc_shift),
+        // Every CPU is a package of its own, as in Linux.
         CpuVendor::Unknown => {}
     }
 
     let cluster_id = match vendor {
-        CpuVendor::Intel => intel_l2_cache_id(scan.apicid),
-        CpuVendor::Amd | CpuVendor::Unknown => None,
+        CpuVendor::Intel | CpuVendor::Centaur | CpuVendor::Zhaoxin => {
+            intel_l2_cache_id(scan.apicid)
+        }
+        CpuVendor::Amd | CpuVendor::Hygon | CpuVendor::Unknown => None,
     };
     scan.topology(cluster_id)
 }
