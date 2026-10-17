@@ -478,7 +478,7 @@ mod test {
     const REPLY: ArpUpdate = ArpUpdate {
         confirms: true,
         force_override: false,
-        may_create: true,
+        may_create: false,
     };
     const REQUEST: ArpUpdate = ArpUpdate {
         confirms: false,
@@ -515,6 +515,25 @@ mod test {
         core::iter::from_fn(|| cache.pop_ready())
             .map(parse)
             .collect()
+    }
+
+    /// Resolves `ip_addr` to `ether_addr` with a reply to our request, dropping the queued packet.
+    fn learn(cache: &mut NeighborCache, ip_addr: Ipv4Address, ether_addr: EthernetAddress) {
+        cache.resolve(ip_addr, tx_packet(8, 0), 0, || None);
+        cache.update(ip_addr, ether_addr, REPLY, 0);
+        drain_ready(cache);
+        // Recalculate the next timer, which the resolution has armed earlier.
+        cache.poll_timers(RETRANS_TIME_MS, |_, _| panic!("probed"));
+    }
+
+    /// Returns whether sending a packet to `ip_addr` starts a new resolution.
+    fn starts_resolution(cache: &mut NeighborCache, ip_addr: Ipv4Address, now_ms: u64) -> bool {
+        let mut nr_probes = 0;
+        let packet = cache.resolve(ip_addr, tx_packet(8, 0), now_ms, || {
+            nr_probes += 1;
+            None
+        });
+        packet.is_none() && nr_probes == 1
     }
 
     /// Sends a packet and returns the destination Ethernet address if it is sent directly.
@@ -590,17 +609,17 @@ mod test {
         assert!(poll(&mut cache, RETRANS_TIME_MS * 3).is_empty());
         assert_eq!(cache.next_poll_at_ms(), None);
 
-        // The entry is removed with the queued packet, so a late reply creates a new entry but
-        // sends nothing.
+        // The entry is removed with the queued packet, so a late reply is unsolicited and changes
+        // nothing.
         cache.update(PEER_IP, PEER, REPLY, RETRANS_TIME_MS * 4);
         assert!(cache.pop_ready().is_none());
-        assert_eq!(send(&mut cache, RETRANS_TIME_MS * 4), Some(PEER));
+        assert!(starts_resolution(&mut cache, PEER_IP, RETRANS_TIME_MS * 4));
     }
 
     #[ktest]
     fn expire_reprobe_and_fail() {
         let mut cache = NeighborCache::new(LOCAL);
-        cache.update(PEER_IP, PEER, REPLY, 0);
+        learn(&mut cache, PEER_IP, PEER);
         assert_eq!(cache.next_poll_at_ms(), Some(REACHABLE_TIME_MS));
 
         // The entry becomes stale, but it is still used.
@@ -620,19 +639,13 @@ mod test {
         // Without replies, the entry is removed and the next packet starts a new resolution.
         assert!(poll(&mut cache, t + RETRANS_TIME_MS * 3).is_empty());
         assert_eq!(cache.next_poll_at_ms(), None);
-        let mut nr_probes = 0;
-        let packet = cache.resolve(PEER_IP, tx_packet(8, 0), t + RETRANS_TIME_MS * 3, || {
-            nr_probes += 1;
-            None
-        });
-        assert!(packet.is_none());
-        assert_eq!(nr_probes, 1);
+        assert!(starts_resolution(&mut cache, PEER_IP, t + RETRANS_TIME_MS * 3));
     }
 
     #[ktest]
     fn reprobe_and_confirm() {
         let mut cache = NeighborCache::new(LOCAL);
-        cache.update(PEER_IP, PEER, REPLY, 0);
+        learn(&mut cache, PEER_IP, PEER);
         poll(&mut cache, REACHABLE_TIME_MS);
 
         // A request from a stale neighbor with the same address does not confirm it.
@@ -654,7 +667,7 @@ mod test {
     #[ktest]
     fn update_address() {
         let mut cache = NeighborCache::new(LOCAL);
-        cache.update(PEER_IP, PEER, REPLY, 0);
+        learn(&mut cache, PEER_IP, PEER);
 
         // A different address is ignored within the lock time.
         cache.update(PEER_IP, PEER2, REQUEST, LOCKTIME_MS);
@@ -675,11 +688,11 @@ mod test {
         cache.update(PEER_IP, PEER, garp, LOCKTIME_MS + 2);
         assert_eq!(send(&mut cache, LOCKTIME_MS + 2), Some(PEER));
 
-        // Requests do not create new entries.
+        // Requests and unsolicited replies do not create new entries.
         let other_ip = Ipv4Address::new(10, 0, 2, 4);
         cache.update(other_ip, PEER, REQUEST, 0);
-        let packet = cache.resolve(other_ip, tx_packet(8, 0), 0, || None);
-        assert!(packet.is_none());
+        cache.update(other_ip, PEER, REPLY, 0);
+        assert!(starts_resolution(&mut cache, other_ip, 0));
     }
 
     #[ktest]
@@ -687,7 +700,7 @@ mod test {
         let mut cache = NeighborCache::new(LOCAL);
 
         for i in 0..MAX_NR_ENTRIES as u32 {
-            cache.update(Ipv4Address::from_bits(0x0a01_0000 + i), PEER, REPLY, 0);
+            learn(&mut cache, Ipv4Address::from_bits(0x0a01_0000 + i), PEER);
         }
 
         let packet = cache.resolve(PEER_IP, tx_packet(8, 1), 0, || panic!("probed"));

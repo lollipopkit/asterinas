@@ -260,9 +260,9 @@ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
         let update = ArpUpdate {
             confirms: is_reply && is_unicast,
             force_override: is_garp,
-            // Unlike Linux, which does not accept unsolicited ARP replies by default (see
-            // `arp_accept`), new entries are created for replies.
-            may_create: is_reply,
+            // Like Linux, which does not accept unsolicited ARP replies by default (see
+            // `arp_accept`), only existing entries, including those being resolved, are updated.
+            may_create: false,
         };
         self.neighbors
             .lock()
