@@ -5,7 +5,9 @@ use alloc::format;
 use aster_bigtcp::wire::{Ipv4Address, Ipv6Address, PortNum};
 
 use crate::{
-    net::socket::{netlink::NetlinkSocketAddr, unix::UnixSocketAddr, vsock::VsockSocketAddr},
+    net::socket::{
+        Socket, netlink::NetlinkSocketAddr, unix::UnixSocketAddr, vsock::VsockSocketAddr,
+    },
     prelude::*,
     security::audit::{self, AuditEvent},
 };
@@ -49,6 +51,15 @@ impl SocketAddr {
             None
         }
     }
+}
+
+/// Checks whether the current process may send data to `addr`, or to the peer of `socket` if
+/// `addr` is `None`, which is a [`AuditEvent::Connect`] if the process is audited.
+pub(crate) fn check_connect(socket: &dyn Socket, addr: Option<&SocketAddr>) -> Result<()> {
+    audit::check(AuditEvent::Connect, || match addr {
+        Some(addr) => addr.audit_target(),
+        None => socket.peer_addr().ok()?.audit_target(),
+    })
 }
 
 /// Reports an [`AuditEvent::Connect`] to a target from [`SocketAddr::audit_target_if_audited`].

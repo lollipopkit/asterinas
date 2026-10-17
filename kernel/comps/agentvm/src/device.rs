@@ -18,7 +18,7 @@
 //! releasing it) requires `CAP_SYS_ADMIN`, and is refused for processes that are already in a
 //! TCT, so a tool cannot leave its TCT or control it from the inside.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use aster_core::{
@@ -48,7 +48,10 @@ use ostd::{
     task::Task,
 };
 
-use crate::tct::{Tct, TctFlags};
+use crate::{
+    egress::{self, EgressPolicy},
+    tct::{Tct, TctFlags},
+};
 
 /// The major number of misc devices.
 const MISC_MAJOR: u16 = 10;
@@ -255,6 +258,27 @@ impl PerOpenFileOps for AgentCtlFile {
                 Tct::release(id)?;
                 Ok(0)
             }
+            cmd @ TctSetEgressPolicy => {
+                cmd.with_data_ptr(|args_ptr| {
+                    let args: TctEgressPolicyArgs = args_ptr.read()?;
+                    check_controller()?;
+                    let policy = if args.len == 0 {
+                        None
+                    } else {
+                        if args.len > egress::MAX_POLICY_LEN as u64 {
+                            return_errno_with_message!(
+                                Errno::E2BIG,
+                                "the egress policy is too long"
+                            );
+                        }
+                        let mut buf = vec![0; args.len as usize];
+                        args_ptr.vm().read_bytes(args.buf as usize, &mut buf)?;
+                        Some(EgressPolicy::parse(&buf)?)
+                    };
+                    egress::set_policy(policy);
+                    Ok(0)
+                })
+            }
             _ => return_errno_with_message!(Errno::ENOTTY, "the ioctl command is unknown"),
         })
     }
@@ -296,6 +320,17 @@ struct TctCommitArgs {
     reserved: u32,
     /// The epoch of the commit that covers the TCT (output).
     epoch: u64,
+}
+
+/// The argument of `AGENT_CTL_TCT_SET_EGRESS_POLICY`.
+///
+/// `buf` holds the policy in the format of [`EgressPolicy::parse`]. An empty policy disables
+/// egress control.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod)]
+struct TctEgressPolicyArgs {
+    buf: u64,
+    len: u64,
 }
 
 /// The argument of `AGENT_CTL_TCT_END`.
@@ -357,6 +392,8 @@ mod ioctl_defs {
     pub(super) type TctCommit  = ioc!(AGENT_CTL_TCT_COMMIT,  0xA7, 6, InOutData<TctCommitArgs>);
     pub(super) type TctCommitDone = ioc!(AGENT_CTL_TCT_COMMIT_DONE, 0xA7, 7, NoData);
     pub(super) type TctProcesses = ioc!(AGENT_CTL_TCT_PROCESSES, 0xA7, 8, InOutData<TctBufferArgs>);
+    pub(super) type TctSetEgressPolicy =
+        ioc!(AGENT_CTL_TCT_SET_EGRESS_POLICY, 0xA7, 9, InOutData<TctEgressPolicyArgs>);
 }
 
 pub(crate) fn init() -> Result<()> {

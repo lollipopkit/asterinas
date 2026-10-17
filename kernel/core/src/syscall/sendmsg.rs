@@ -7,7 +7,7 @@ use crate::{
     fs::file::file_table::RawFileDesc,
     net::socket::{
         Socket,
-        util::{MessageHeader, SendFlags, SocketAddr, audit_connect},
+        util::{MessageHeader, SendFlags, SocketAddr, audit_connect, check_connect},
     },
     prelude::*,
     util::net::CUserMsgHdr,
@@ -50,6 +50,7 @@ pub(super) fn send_one_message(
 ) -> Result<usize> {
     let (message_header, audit_target) = {
         let addr = c_user_msghdr.read_socket_addr_from_user()?;
+        check_connect(socket, addr.as_ref())?;
         let audit_target = SocketAddr::audit_target_if_audited(addr.as_ref());
         let control_messages = c_user_msghdr.read_control_messages_from_user(user_space)?;
         (MessageHeader::new(addr, control_messages), audit_target)

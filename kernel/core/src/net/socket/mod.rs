@@ -3,7 +3,9 @@
 use core::fmt::Display;
 
 use options::SocketOption;
-use util::{MessageHeader, RecvFlags, RecvOutput, SendFlags, SockShutdownCmd, SocketAddr};
+use util::{
+    MessageHeader, RecvFlags, RecvOutput, SendFlags, SockShutdownCmd, SocketAddr, check_connect,
+};
 
 use crate::{
     fs::{
@@ -258,6 +260,7 @@ impl<T: Socket + 'static> FileLike for T {
     }
 
     fn write(&self, reader: &mut VmReader) -> Result<usize> {
+        check_connect(self, None)?;
         // TODO: Set correct flags
         self.sendmsg(
             reader,

@@ -6,6 +6,9 @@
 //! [`Process::set_audit_context`] and register [`AuditHooks`] to be told about the effects
 //! of that process. A process keeps its audit context for its lifetime, and its children
 //! inherit it on fork. Processes without an audit context are not audited.
+//!
+//! The hooks can also deny some events of audited processes before they happen, see
+//! [`AuditHooks::check_event`].
 
 use spin::Once;
 
@@ -28,6 +31,15 @@ pub enum AuditEvent {
     Connect,
 }
 
+/// The identity of a file, which is stable across renames and links (`st_dev` and `st_ino`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileId {
+    /// The ID of the device that contains the file.
+    pub dev: u64,
+    /// The inode number of the file.
+    pub ino: u64,
+}
+
 /// The hooks that are called for processes with an audit context.
 pub trait AuditHooks: Sync {
     /// Called after `child` is forked from `parent` and has inherited its audit context,
@@ -42,6 +54,19 @@ pub trait AuditHooks: Sync {
     /// `target` is the absolute path in the mount namespace for file events, and a
     /// printable address for [`AuditEvent::Connect`].
     fn on_event(&self, process: &Process, event: AuditEvent, target: &str);
+
+    /// Called after [`Self::on_event`] when `process` opens the file `file` at `target` for
+    /// reading ([`AuditEvent::FileRead`]) or writing ([`AuditEvent::FileWritten`]).
+    fn on_file_opened(&self, _process: &Process, _event: AuditEvent, _target: &str, _file: FileId) {
+    }
+
+    /// Called before `process` causes `event`, which is only done for
+    /// [`AuditEvent::Connect`].
+    ///
+    /// Returning an error prevents the event, and the error is returned to the process.
+    fn check_event(&self, _process: &Process, _event: AuditEvent, _target: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 static HOOKS: Once<&'static dyn AuditHooks> = Once::new();
@@ -86,6 +111,53 @@ pub(crate) fn audit(event: AuditEvent, target: impl FnOnce() -> Option<String>) 
     }
     if let Some(target) = target() {
         hooks.on_event(&process, event, &target);
+    }
+}
+
+/// Reports that the current process opens a file, if it is audited.
+///
+/// `target` and `file` are only called if the event is reported. The event is not reported if
+/// `target` returns `None`.
+pub(crate) fn audit_open(
+    event: AuditEvent,
+    target: impl FnOnce() -> Option<String>,
+    file: impl FnOnce() -> Option<FileId>,
+) {
+    let Some(hooks) = HOOKS.get() else {
+        return;
+    };
+    let Some(process) = Process::current() else {
+        return;
+    };
+    if process.audit_context().is_none() {
+        return;
+    }
+    let Some(target) = target() else {
+        return;
+    };
+    hooks.on_event(&process, event, &target);
+    if let Some(file) = file() {
+        hooks.on_file_opened(&process, event, &target, file);
+    }
+}
+
+/// Checks whether the current process may cause an event, if it is audited.
+///
+/// `target` is only called if the event is checked, and the event is allowed if it returns
+/// `None`.
+pub(crate) fn check(event: AuditEvent, target: impl FnOnce() -> Option<String>) -> Result<()> {
+    let Some(hooks) = HOOKS.get() else {
+        return Ok(());
+    };
+    let Some(process) = Process::current() else {
+        return Ok(());
+    };
+    if process.audit_context().is_none() {
+        return Ok(());
+    }
+    match target() {
+        Some(target) => hooks.check_event(&process, event, &target),
+        None => Ok(()),
     }
 }
 

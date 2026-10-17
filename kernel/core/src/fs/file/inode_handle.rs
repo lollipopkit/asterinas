@@ -30,7 +30,10 @@ use crate::{
         posix_thread::AsPosixThread,
         signal::{PollHandle, Pollable},
     },
-    security::{audit::AuditEvent, lsm::hooks as lsm_hooks},
+    security::{
+        audit::{self, AuditEvent, FileId},
+        lsm::hooks as lsm_hooks,
+    },
     util::ioctl::RawIoctl,
     vm::vmar::FileMmapRequest,
 };
@@ -101,11 +104,22 @@ impl InodeHandle {
 
         // Listing a directory is recorded by `readdir`.
         if !status_flags.contains(StatusFlags::O_PATH) && inode.type_() != InodeType::Dir {
+            let file_id = || {
+                let metadata = inode.metadata().ok()?;
+                Some(FileId {
+                    dev: metadata.container_dev_id.as_encoded_u64(),
+                    ino: metadata.ino,
+                })
+            };
             if access_mode.is_readable() {
-                path.audit(AuditEvent::FileRead);
+                audit::audit_open(AuditEvent::FileRead, || path.abs_path_in_mnt_ns(), file_id);
             }
             if access_mode.is_writable() {
-                path.audit(AuditEvent::FileWritten);
+                audit::audit_open(
+                    AuditEvent::FileWritten,
+                    || path.abs_path_in_mnt_ns(),
+                    file_id,
+                );
             }
         }
 
