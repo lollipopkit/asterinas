@@ -281,30 +281,47 @@ impl ClassScheduler {
         }
     }
 
-    // TODO: Implement a better algorithm and replace the current naive implementation.
+    /// Selects the CPU to enqueue `thread` on.
+    ///
+    /// A woken thread stays on its last CPU if that CPU is idle. Otherwise, it moves to an idle
+    /// CPU if there is one, like `select_idle_sibling` in Linux, so that runnable threads do not
+    /// wait behind each other while a CPU idles. A spawned thread goes to the least loaded CPU.
+    ///
+    /// TODO: Balance the load of threads that keep running without sleeping, which this does
+    /// not move.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/sched/fair.c#L9027>
     fn select_cpu(&self, thread: &Thread, flags: EnqueueFlags) -> CpuId {
-        if let Some(last_cpu) = thread.sched_attr().last_cpu() {
-            return last_cpu;
-        }
-        debug_assert!(flags == EnqueueFlags::Spawn);
-
         let guard = disable_local();
+        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
+
+        if let Some(last_cpu) = thread.sched_attr().last_cpu()
+            && affinity.contains(last_cpu)
+        {
+            if self.rqs[last_cpu.as_usize()].lock().load_stats().is_idle {
+                return last_cpu;
+            }
+            return Self::cycle_after(last_cpu, &affinity)
+                .find(|&cpu| self.rqs[cpu.as_usize()].lock().load_stats().is_idle)
+                .unwrap_or(last_cpu);
+        }
+        debug_assert!(flags == EnqueueFlags::Spawn || thread.sched_attr().last_cpu().is_some());
 
         let mut selected = guard.current_cpu();
         let mut minimum_load = u32::MAX;
 
-        // Set `selected` as `candidate` if the candidate's load is smaller.
+        // Set `selected` as `candidate` if the candidate's load is smaller. The load counts the
+        // running thread, so that a busy CPU with an empty queue is not taken for an idle one.
         let test_candidate = |candidate: CpuId| {
-            let PerCpuLoadStats { queue_len, .. } =
+            let PerCpuLoadStats { queue_len, is_idle } =
                 self.rqs[candidate.as_usize()].lock().load_stats();
-            let load = queue_len;
+            let load = queue_len + u32::from(!is_idle);
             if load < minimum_load {
                 minimum_load = load;
                 selected = candidate;
             }
         };
 
-        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
         match self.last_chosen_cpu.get() {
             Some(cpu) => {
                 // Perform a round-robin selection starting after the last chosen CPU.
