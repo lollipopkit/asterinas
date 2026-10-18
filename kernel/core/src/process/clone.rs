@@ -114,6 +114,8 @@ pub(crate) struct CloneArgs {
     pub stack: Option<NonZeroU64>,
     pub stack_size: Option<NonZeroU64>,
     pub tls: u64,
+    /// Whether to reset the signal handlers of the child (`CLONE_CLEAR_SIGHAND` of `clone3`).
+    pub clear_sighand: bool,
     pub _set_tid: Option<u64>,
     pub _set_tid_size: Option<u64>,
     pub _cgroup: Option<u64>,
@@ -551,7 +553,11 @@ fn clone_child_process(
     let child_fs = clone_fs(&thread_local.borrow_fs(), clone_flags);
 
     // Clone signal dispositions
-    let child_sig_dispositions = clone_sighand(process.sig_dispositions(), clone_flags);
+    let child_sig_dispositions = clone_sighand(
+        process.sig_dispositions(),
+        clone_flags,
+        clone_args.clear_sighand,
+    );
 
     // Clone System V semaphore
     clone_sysvsem(clone_flags)?;
@@ -786,18 +792,23 @@ fn clone_files(parent_file_table: &RwArc<FileTable>, clone_flags: CloneFlags) ->
     }
 }
 
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L1672-L1695>
 fn clone_sighand(
     parent_sig_dispositions: &Mutex<Arc<Mutex<SigDispositions>>>,
     clone_flags: CloneFlags,
+    clear_sighand: bool,
 ) -> Arc<Mutex<SigDispositions>> {
     // If CLONE_SIGHAND is set, the child and parent shares the same signal handlers.
     // Otherwise, the child has a copy of the parent's signal handlers.
     if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
         parent_sig_dispositions.lock().clone()
     } else {
-        let sig_dispositions = parent_sig_dispositions.lock();
-        let sig_dispositions = sig_dispositions.lock();
-        Arc::new(Mutex::new(*sig_dispositions))
+        let mut sig_dispositions = *parent_sig_dispositions.lock().lock();
+        // `CLONE_CLEAR_SIGHAND` resets the handlers that are not `SIG_IGN`, like `execve`.
+        if clear_sighand {
+            sig_dispositions.inherit();
+        }
+        Arc::new(Mutex::new(sig_dispositions))
     }
 }
 

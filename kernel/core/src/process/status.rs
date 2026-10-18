@@ -152,7 +152,10 @@ impl StopStatus {
         // any group stop in progress is kept, like Linux, where no thread can get
         // `JOBCTL_STOP_PENDING`.
         let threads = threads.collect::<Vec<_>>();
-        let count = threads.iter().filter(|(_, participates)| *participates).count();
+        let count = threads
+            .iter()
+            .filter(|(_, participates)| *participates)
+            .count();
         if count == 0 {
             return false;
         }
