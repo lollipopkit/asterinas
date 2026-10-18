@@ -29,7 +29,10 @@ use super::{
 use crate::{
     prelude::*,
     process::{INIT_STACK_SIZE, Process, ProcessVm, ResourceType},
-    vm::page_cache::Vmo,
+    vm::{
+        page_cache::{PageKind, Vmo},
+        stat::{MemStat, mod_mem_stat},
+    },
 };
 
 /// The upper bound for allocations under the `MAP_32BIT` mmap flag.
@@ -134,9 +137,23 @@ impl Vmar {
 pub(crate) enum RssType {
     File = 0,
     Anon = 1,
+    Shmem = 2,
 }
 
-const NUM_RSS_COUNTERS: usize = 2;
+const NUM_RSS_COUNTERS: usize = 3;
+
+impl From<PageKind> for RssType {
+    /// Returns the RSS type of the pages of the kind.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/mm.h#L3378-L3390>
+    fn from(kind: PageKind) -> Self {
+        match kind {
+            PageKind::Anon => Self::Anon,
+            PageKind::Shmem | PageKind::ShmemReserved => Self::Shmem,
+            PageKind::Kernel | PageKind::File | PageKind::Buffer | PageKind::Ramfs => Self::File,
+        }
+    }
+}
 
 pub(super) struct RssDelta<'a> {
     delta: [isize; NUM_RSS_COUNTERS],
@@ -200,6 +217,14 @@ struct VmarInner {
     vm_mappings: IntervalSet<Vaddr, VmMapping>,
     /// The total mapped memory in bytes.
     total_vm: usize,
+    /// The pages of the mappings that are charged to the committed memory.
+    committed_pages: usize,
+}
+
+impl Drop for VmarInner {
+    fn drop(&mut self) {
+        mod_mem_stat(MemStat::Committed, -(self.committed_pages as isize));
+    }
 }
 
 impl VmarInner {
@@ -207,7 +232,34 @@ impl VmarInner {
         Self {
             vm_mappings: IntervalSet::new(),
             total_vm: 0,
+            committed_pages: 0,
         }
+    }
+
+    /// Accounts the mapping that is added to the VMAR.
+    fn account_mapping(&mut self, vm_mapping: &VmMapping) {
+        self.total_vm += vm_mapping.map_size();
+
+        let nr_pages = vm_mapping.nr_committed_pages();
+        self.committed_pages += nr_pages;
+        mod_mem_stat(MemStat::Committed, nr_pages as isize);
+    }
+
+    /// Unaccounts the mapping that is removed from the VMAR.
+    fn unaccount_mapping(&mut self, vm_mapping: &VmMapping) {
+        self.total_vm -= vm_mapping.map_size();
+
+        let nr_pages = vm_mapping.nr_committed_pages();
+        self.committed_pages -= nr_pages;
+        mod_mem_stat(MemStat::Committed, -(nr_pages as isize));
+    }
+
+    /// Removes all mappings without unmapping them from the page table.
+    fn clear(&mut self) {
+        self.vm_mappings.clear();
+        self.total_vm = 0;
+        mod_mem_stat(MemStat::Committed, -(self.committed_pages as isize));
+        self.committed_pages = 0;
     }
 
     /// Returns `Ok` if the calling process may expand its mapped
@@ -257,7 +309,7 @@ impl VmarInner {
         vm_mapping: VmMapping,
         rmap: Option<&mut Rmap>,
     ) {
-        self.total_vm += vm_mapping.map_size();
+        self.account_mapping(&vm_mapping);
 
         if let Some(rmap) = rmap {
             rmap.insert(
@@ -285,7 +337,7 @@ impl VmarInner {
         vm_mapping: VmMapping,
         mut rmap: Option<&mut Rmap>,
     ) {
-        self.total_vm += vm_mapping.map_size();
+        self.account_mapping(&vm_mapping);
         let mut vm_mapping = vm_mapping;
         let addr = vm_mapping.map_to_addr();
 
@@ -327,7 +379,7 @@ impl VmarInner {
     /// Removes a `VmMapping` based on the provided key from the `Vmar`.
     fn remove(&mut self, key: &Vaddr) -> Option<(VmMapping, RmapToRemove)> {
         let vm_mapping = self.vm_mappings.remove(key)?;
-        self.total_vm -= vm_mapping.map_size();
+        self.unaccount_mapping(&vm_mapping);
 
         let rmap_to_remove = RmapToRemove::new(vm_mapping.vmo_for_rmap().cloned());
 

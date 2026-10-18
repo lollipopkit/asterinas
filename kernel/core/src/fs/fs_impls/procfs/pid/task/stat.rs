@@ -218,7 +218,8 @@ impl ProcFileOps for StatFileOps {
             let vsize = vmar_ref.get_mappings_total_size();
             let anon = vmar_ref.get_rss_counter(RssType::Anon);
             let file = vmar_ref.get_rss_counter(RssType::File);
-            let rss = anon + file;
+            let shmem = vmar_ref.get_rss_counter(RssType::Shmem);
+            let rss = anon + file + shmem;
             let process_vm = vmar_ref.process_vm();
             let code_range = process_vm.code_range();
             let data_range = process_vm.data_range();

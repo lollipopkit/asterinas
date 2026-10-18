@@ -112,6 +112,16 @@ impl RamFs {
     fn alloc_id(&self) -> u64 {
         self.inode_allocator.fetch_add(1, Ordering::Relaxed)
     }
+
+    /// Returns whether the file system is ramfs rather than tmpfs.
+    ///
+    /// The file data of ramfs is never reclaimable, while that of tmpfs is
+    /// shmem. The rootfs is a ramfs, like Linux when `root=` is specified.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/init/do_mounts.c#L497-L522>
+    fn is_ramfs(&self) -> bool {
+        matches!(self.name, "ramfs" | "rootfs")
+    }
 }
 
 impl FileSystem for RamFs {
@@ -210,8 +220,13 @@ impl Inner {
         Self::Dir(RwLock::new(DirEntry::new(this, parent)))
     }
 
-    pub(self) fn new_file() -> Self {
-        Self::File(Mutex::new(PageCache::new_anon(0).unwrap()))
+    pub(self) fn new_file(fs: &RamFs) -> Self {
+        let page_cache = if fs.is_ramfs() {
+            PageCache::new_ramfs(0)
+        } else {
+            PageCache::new_anon(0)
+        };
+        Self::File(Mutex::new(page_cache.unwrap()))
     }
 
     pub(self) fn new_symlink(target: &str) -> Self {
@@ -565,7 +580,7 @@ impl RamInode {
         to_be_revalidated: ToBeRevalidated,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
-            inner: Inner::new_file(),
+            inner: Inner::new_file(fs),
             metadata: SpinLock::new(InodeMeta::new(mode, uid, gid)),
             ino: fs.alloc_id(),
             typ: InodeType::File,
@@ -589,7 +604,7 @@ impl RamInode {
         to_be_revalidated: ToBeRevalidated,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
-            inner: Inner::new_file(),
+            inner: Inner::new_file(fs),
             metadata: SpinLock::new(InodeMeta::new_tmpfile(mode, uid, gid)),
             ino: fs.alloc_id(),
             typ: InodeType::File,

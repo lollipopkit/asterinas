@@ -3,17 +3,20 @@
 use core::{
     borrow::Borrow,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
 };
 
 use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
 use ostd::{
     impl_untyped_frame_meta_for,
-    mm::{Frame, FrameAllocOptions, HasPaddr},
+    mm::{Frame, FrameAllocOptions, HasPaddr, UserMappingObserver},
     sync::WaitQueue,
 };
 
-use crate::prelude::*;
+use crate::{
+    prelude::*,
+    vm::stat::{MemStat, mod_mem_stat},
+};
 
 /// The state of a page in the page cache.
 #[repr(u8)]
@@ -66,6 +69,79 @@ impl PageState {
     }
 }
 
+/// The kind of a page in the page cache, which decides how the page is
+/// accounted in the memory statistics.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PageKind {
+    /// Kernel memory that is not accounted as page cache or anonymous memory
+    /// (e.g., the vDSO data).
+    Kernel,
+    /// File data cached from a backend.
+    File,
+    /// Block device metadata cached by a file system, i.e., Linux's buffers.
+    Buffer,
+    /// Memory of tmpfs or memfd files, or shared anonymous memory created
+    /// with `MAP_NORESERVE`.
+    ///
+    /// Each page is charged to the committed memory when it is allocated,
+    /// like Linux's shmem objects with `VM_NORESERVE`.
+    Shmem,
+    /// Shared anonymous memory whose whole size has been charged to the
+    /// committed memory when the memory is created.
+    ShmemReserved,
+    /// Memory of ramfs files, which can never be reclaimed.
+    Ramfs,
+    /// Anonymous memory of private mappings (e.g., the initial stack).
+    Anon,
+}
+
+impl PageKind {
+    /// Returns the counter of the pages of this kind.
+    ///
+    /// Each page of a counted kind is counted from its allocation to its
+    /// free. Pages charged to the committed memory one by one are counted as
+    /// [`MemStat::Shmem`], like Linux's shmem objects with `VM_NORESERVE`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/mm/shmem.c#L169-L219>
+    fn stat(self) -> Option<MemStat> {
+        match self {
+            Self::File => Some(MemStat::File),
+            Self::Buffer => Some(MemStat::Buffer),
+            Self::Shmem => Some(MemStat::Shmem),
+            Self::ShmemReserved => Some(MemStat::ShmemReserved),
+            Self::Ramfs => Some(MemStat::Ramfs),
+            Self::Kernel | Self::Anon => None,
+        }
+    }
+
+    /// Returns whether dirty pages are counted as `NR_FILE_DIRTY`.
+    ///
+    /// Like Linux, only pages that can be written back to storage count.
+    fn counts_dirty(self) -> bool {
+        matches!(self, Self::File | Self::Buffer)
+    }
+
+    /// Adds `delta` pages of this kind to the memory statistics.
+    fn account(self, delta: isize) {
+        if let Some(stat) = self.stat() {
+            mod_mem_stat(stat, delta);
+        }
+    }
+
+    /// Returns the counter of the pages of this kind that are mapped to user
+    /// space.
+    fn mapped_stat(self) -> Option<MemStat> {
+        match self {
+            Self::File | Self::Buffer | Self::Shmem | Self::ShmemReserved | Self::Ramfs => {
+                Some(MemStat::FileMapped)
+            }
+            Self::Anon => Some(MemStat::AnonMapped),
+            Self::Kernel => None,
+        }
+    }
+}
+
 /// A page in the page cache.
 pub(crate) type CachePage = Frame<CachePageMeta>;
 
@@ -88,20 +164,73 @@ pub(crate) struct CachePageMeta {
     /// cleared without the page lock only from the BIO completion callback after
     /// the VMO writeback path has handed off the writeback state.
     is_writing_back: AtomicBool,
+    /// The kind of the page.
+    kind: PageKind,
+    /// The number of user page table entries that map the page.
+    nr_user_mappings: AtomicU32,
     // TODO: Add a reverse mapping from the page to VMO for eviction.
 }
 
-impl Default for CachePageMeta {
-    fn default() -> Self {
+impl CachePageMeta {
+    /// Creates the metadata of a new page and accounts the page.
+    ///
+    /// The page is unaccounted when the metadata is dropped.
+    pub(super) fn new(kind: PageKind, state: PageState) -> Self {
+        debug_assert!(!state.is_dirty());
+        kind.account(1);
         Self {
-            state: AtomicPageState::new(PageState::Uninit),
+            state: AtomicPageState::new(state),
             lock: AtomicBool::new(false),
             is_writing_back: AtomicBool::new(false),
+            kind,
+            nr_user_mappings: AtomicU32::new(0),
+        }
+    }
+
+    /// Sets the state of the page and accounts dirty pages.
+    fn set_state(&self, new_state: PageState) {
+        let old_state = self.state.swap(new_state, Ordering::AcqRel);
+        if self.kind.counts_dirty() && old_state.is_dirty() != new_state.is_dirty() {
+            mod_mem_stat(
+                MemStat::FileDirty,
+                if new_state.is_dirty() { 1 } else { -1 },
+            );
         }
     }
 }
 
-impl_untyped_frame_meta_for!(CachePageMeta);
+impl Drop for CachePageMeta {
+    fn drop(&mut self) {
+        // Truncation may discard dirty pages without writing them back.
+        if self.kind.counts_dirty() && self.state.load(Ordering::Relaxed).is_dirty() {
+            mod_mem_stat(MemStat::FileDirty, -1);
+        }
+        debug_assert!(!self.is_writing_back.load(Ordering::Relaxed));
+        debug_assert_eq!(self.nr_user_mappings.load(Ordering::Relaxed), 0);
+        self.kind.account(-1);
+    }
+}
+
+impl_untyped_frame_meta_for!(CachePageMeta, user_mappings);
+
+impl UserMappingObserver for CachePageMeta {
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/mm/rmap.c#L1334-L1354>
+    fn on_map_to_user(&self) {
+        if self.nr_user_mappings.fetch_add(1, Ordering::Relaxed) == 0
+            && let Some(stat) = self.kind.mapped_stat()
+        {
+            mod_mem_stat(stat, 1);
+        }
+    }
+
+    fn on_unmap_from_user(&self) {
+        if self.nr_user_mappings.fetch_sub(1, Ordering::Relaxed) == 1
+            && let Some(stat) = self.kind.mapped_stat()
+        {
+            mod_mem_stat(stat, -1);
+        }
+    }
+}
 
 /// Convenience operations on a [`CachePage`] handle.
 ///
@@ -144,15 +273,19 @@ pub(crate) trait CachePageExt: Sized {
     /// previously started with [`LockedCachePage::set_writing_back`], either
     /// from its completion callback or while handling submission failure.
     fn clear_writing_back(&self) {
-        self.metadata()
+        if self
+            .metadata()
             .is_writing_back
-            .store(false, Ordering::Release);
+            .swap(false, Ordering::Release)
+        {
+            mod_mem_stat(MemStat::Writeback, -1);
+        }
         self.wait_queue().wake_all();
     }
 
     /// Allocates a new cache page which content and state are uninitialized.
-    fn alloc_uninit() -> Result<CachePage> {
-        let meta = CachePageMeta::default();
+    fn alloc_uninit(kind: PageKind) -> Result<CachePage> {
+        let meta = CachePageMeta::new(kind, PageState::Uninit);
         let page = FrameAllocOptions::new()
             .zeroed(false)
             .alloc_frame_with(meta)?;
@@ -160,11 +293,8 @@ pub(crate) trait CachePageExt: Sized {
     }
 
     /// Allocates a new zeroed cache page with the up-to-date state.
-    fn alloc_zero() -> Result<CachePage> {
-        let meta = CachePageMeta {
-            state: AtomicPageState::new(PageState::UpToDate),
-            ..Default::default()
-        };
+    fn alloc_zero(kind: PageKind) -> Result<CachePage> {
+        let meta = CachePageMeta::new(kind, PageState::UpToDate);
         let page = FrameAllocOptions::new()
             .zeroed(true)
             .alloc_frame_with(meta)?;
@@ -278,10 +408,7 @@ impl<PageRef: Borrow<CachePage>> LockedCachePage<PageRef> {
     /// This indicates that the page's contents are synchronized with disk
     /// and can be safely read.
     pub(crate) fn set_up_to_date(&self) {
-        self.page()
-            .metadata()
-            .state
-            .store(PageState::UpToDate, Ordering::Release);
+        self.page().metadata().set_state(PageState::UpToDate);
     }
 
     /// Marks the page as dirty.
@@ -289,9 +416,7 @@ impl<PageRef: Borrow<CachePage>> LockedCachePage<PageRef> {
     /// This indicates that the page has been modified and needs to be
     /// written back to disk eventually.
     pub(crate) fn set_dirty(&self) {
-        self.metadata()
-            .state
-            .store(PageState::Dirty, Ordering::Release);
+        self.metadata().set_state(PageState::Dirty);
     }
 
     /// Marks the page as evicted.
@@ -299,17 +424,19 @@ impl<PageRef: Borrow<CachePage>> LockedCachePage<PageRef> {
     /// This indicates that the page has been evicted and is no longer
     /// associated with the page cache.
     pub(super) fn set_evicted(&self) {
-        self.metadata()
-            .state
-            .store(PageState::Evicted, Ordering::Release);
+        self.metadata().set_state(PageState::Evicted);
     }
 
     /// Sets the writing back flag of the page, indicating that the page
     /// is in-flight to storage.
     pub(crate) fn set_writing_back(&self) {
-        self.metadata()
+        if !self
+            .metadata()
             .is_writing_back
-            .store(true, Ordering::Release);
+            .swap(true, Ordering::Release)
+        {
+            mod_mem_stat(MemStat::Writeback, 1);
+        }
     }
 
     /// Waits until the page finishes writing back to storage.

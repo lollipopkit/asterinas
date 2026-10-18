@@ -13,7 +13,7 @@ use aster_util::printer::VmPrinter;
 use ostd::{
     io::IoMem,
     mm::{
-        CachePolicy, Frame, FrameAllocOptions, HasSize, PageFlags, PageProperty, UFrame, VmSpace,
+        CachePolicy, HasSize, PageFlags, PageProperty, UFrame, VmSpace,
         io::util::HasVmReaderWriter, tlb::TlbFlushOp, vm_space::VmQueriedItem,
     },
     task::disable_preempt,
@@ -31,6 +31,7 @@ use crate::{
     prelude::*,
     process::LockedHeap,
     vm::{
+        anon_page::{AnonPage, alloc_anon_page},
         page_cache::{CachePage, Vmo, VmoCommitError, VmoMapMode},
         perms::VmPerms,
     },
@@ -87,6 +88,12 @@ pub(crate) struct VmMapping {
     ///
     /// All pages within the same `VmMapping` have the same permissions.
     perms: VmPerms,
+    /// Whether the mapping is created with `MAP_NORESERVE`, i.e., Linux's
+    /// `VM_NORESERVE`.
+    is_noreserve: bool,
+    /// Whether the size of the mapping is charged to the committed memory,
+    /// i.e., Linux's `VM_ACCOUNT`.
+    is_accounted: bool,
 }
 
 impl Debug for VmMapping {
@@ -99,6 +106,8 @@ impl Debug for VmMapping {
             .field("map_mode", &self.map_mode)
             .field("handle_page_faults_around", &self.handle_page_faults_around)
             .field("perms", &self.perms)
+            .field("is_noreserve", &self.is_noreserve)
+            .field("is_accounted", &self.is_accounted)
             .finish()
     }
 }
@@ -129,6 +138,36 @@ impl VmMapping {
             map_mode,
             handle_page_faults_around,
             perms,
+            is_noreserve: false,
+            is_accounted: Self::is_accountable(map_mode, perms, false),
+        }
+    }
+
+    /// Sets whether the new mapping is created with `MAP_NORESERVE`.
+    pub(super) fn with_noreserve(self, is_noreserve: bool) -> Self {
+        Self {
+            is_noreserve,
+            is_accounted: Self::is_accountable(self.map_mode, self.perms, is_noreserve),
+            ..self
+        }
+    }
+
+    /// Returns whether a mapping with the attributes is charged to the
+    /// committed memory, i.e., it is a private writable mapping without
+    /// `MAP_NORESERVE`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/mm/vma.c#L2345-L2363>
+    fn is_accountable(map_mode: MmapMode, perms: VmPerms, is_noreserve: bool) -> bool {
+        !map_mode.is_shared() && perms.contains(VmPerms::WRITE) && !is_noreserve
+    }
+
+    /// Returns the size in pages that the mapping charges to the committed
+    /// memory.
+    pub(super) fn nr_committed_pages(&self) -> usize {
+        if self.is_accounted {
+            self.map_size.get() / PAGE_SIZE
+        } else {
+            0
         }
     }
 
@@ -216,7 +255,7 @@ impl VmMapping {
     pub(crate) fn rss_type(&self) -> RssType {
         match &self.mapped_mem {
             MappedMemory::Anonymous => RssType::Anon,
-            MappedMemory::Vmo(_) => RssType::File,
+            MappedMemory::Vmo(vmo) => RssType::from(vmo.vmo().kind()),
             MappedMemory::Device(_) => MapHandle::DEVICE_RSS_TYPE,
         }
     }
@@ -598,7 +637,7 @@ impl VmMapping {
             MappedMemory::Vmo(vmo) => vmo,
             MappedMemory::Anonymous => {
                 // Anonymous mapping. Allocate a new frame.
-                return Ok((FrameAllocOptions::new().alloc_frame()?.into(), is_readonly));
+                return Ok((alloc_anon_page(true)?.into(), is_readonly));
             }
             MappedMemory::Device(_) => {
                 // Device memory is populated when the memory mapping is created.
@@ -612,7 +651,7 @@ impl VmMapping {
         let page_offset = page_aligned_addr - self.map_to_addr;
         if !self.map_mode.is_shared() && page_offset >= vmo.valid_size() {
             // The page index is outside the VMO. This is only allowed in private mapping.
-            return Ok((FrameAllocOptions::new().alloc_frame()?.into(), is_readonly));
+            return Ok((alloc_anon_page(true)?.into(), is_readonly));
         }
 
         let (page, mode) =
@@ -884,7 +923,17 @@ impl VmMapping {
         cursor.flusher().dispatch_tlb_flush();
         cursor.flusher().sync_tlb_flush();
 
-        Self { perms, ..self }
+        // Like Linux, making a private mapping writable charges it to the
+        // committed memory, but making it read-only does not uncharge it.
+        //
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/mm/mprotect.c#L762-L787>
+        let is_accounted =
+            self.is_accounted || Self::is_accountable(self.map_mode, perms, self.is_noreserve);
+        Self {
+            perms,
+            is_accounted,
+            ..self
+        }
     }
 }
 
@@ -1070,6 +1119,8 @@ fn try_merge(left: &VmMapping, right: &VmMapping) -> Option<VmMapping> {
     let is_type_equal = left.map_mode == right.map_mode
         && left.handle_page_faults_around == right.handle_page_faults_around
         && left.perms == right.perms
+        && left.is_noreserve == right.is_noreserve
+        && left.is_accounted == right.is_accounted
         && match (&left.file, &right.file) {
             (Some(left_file), Some(right_file)) => Arc::ptr_eq(left_file, right_file),
             (None, None) => true,
@@ -1114,8 +1165,8 @@ fn try_merge(left: &VmMapping, right: &VmMapping) -> Option<VmMapping> {
     })
 }
 
-fn duplicate_frame(src: &UFrame) -> Result<Frame<()>> {
-    let new_frame = FrameAllocOptions::new().zeroed(false).alloc_frame()?;
+fn duplicate_frame(src: &UFrame) -> Result<AnonPage> {
+    let new_frame = alloc_anon_page(false)?;
     new_frame.writer().write(&mut src.reader());
     Ok(new_frame)
 }

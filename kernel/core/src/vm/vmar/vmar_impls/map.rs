@@ -68,6 +68,8 @@ pub(crate) struct VmarMapOptions<'a, 'b> {
     /// Whether the mapping needs to handle surrounding pages when handling
     /// page fault.
     handle_page_faults_around: bool,
+    /// Whether the mapping is created with `MAP_NORESERVE`.
+    is_noreserve: bool,
 }
 
 /// An offset within a VMAR where a new mapping will reside.
@@ -117,6 +119,7 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             align: PAGE_SIZE,
             map_mode: MmapMode::Private,
             handle_page_faults_around: false,
+            is_noreserve: false,
         }
     }
 
@@ -207,6 +210,15 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
         self
     }
 
+    /// Sets whether the mapping is created with `MAP_NORESERVE`.
+    ///
+    /// A private writable mapping is charged to the committed memory unless
+    /// this is set. The default value is `false`.
+    pub(crate) fn noreserve(mut self, is_noreserve: bool) -> Self {
+        self.is_noreserve = is_noreserve;
+        self
+    }
+
     /// Sets the mapping to handle surrounding pages when handling page fault.
     pub(crate) fn handle_page_faults_around(mut self) -> Self {
         self.handle_page_faults_around = true;
@@ -264,6 +276,7 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             align,
             map_mode,
             handle_page_faults_around,
+            is_noreserve,
         } = self;
 
         let mut inner = parent.inner.write();
@@ -373,7 +386,8 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             map_mode,
             handle_page_faults_around,
             perms | may_perms,
-        );
+        )
+        .with_noreserve(is_noreserve);
 
         let vmo_for_rmap = vm_mapping.vmo_for_rmap().cloned();
         let mut rmap = vmo_for_rmap.as_ref().map(|vmo| vmo.rmap().lock());

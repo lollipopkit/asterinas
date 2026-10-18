@@ -33,10 +33,11 @@ use crate::{
     prelude::*,
     vm::{
         page_cache::{
-            CachePage, CachePageExt, LockedCachePage, PageCacheBackend, PageRun,
+            CachePage, CachePageExt, LockedCachePage, PageCacheBackend, PageKind, PageRun,
             cache_page::PageState,
         },
-        vmar::Rmap,
+        stat::{MemStat, mod_mem_stat},
+        vmar::{Rmap, RssType},
     },
 };
 
@@ -124,6 +125,8 @@ pub struct Vmo {
     pub(super) backend: Option<Weak<dyn PageCacheBackend>>,
     /// Flags
     pub(super) flags: VmoFlags,
+    /// The kind of the pages in the VMO.
+    pub(super) kind: PageKind,
     /// The virtual pages where the VMO resides.
     pub(super) pages: XArray<CachePage>,
     /// The size of the VMO.
@@ -149,6 +152,7 @@ impl Debug for Vmo {
         f.debug_struct("Vmo")
             .field("has_backend", &self.backend.is_some())
             .field("flags", &self.flags)
+            .field("kind", &self.kind)
             .field("size", &self.size)
             .field("writable_mapping_status", &self.writable_mapping_status)
             .finish_non_exhaustive()
@@ -332,7 +336,7 @@ impl Vmo {
             return Ok(page.clone());
         }
 
-        let new_page = CachePage::alloc_zero()?;
+        let new_page = CachePage::alloc_zero(self.kind)?;
         cursor.store(new_page.clone());
         Ok(new_page)
     }
@@ -518,7 +522,10 @@ impl Vmo {
 
         drop(locked_pages);
 
-        locked_rmap.unmap(page_idx_range.start * PAGE_SIZE..page_idx_range.end * PAGE_SIZE);
+        locked_rmap.unmap(
+            page_idx_range.start * PAGE_SIZE..page_idx_range.end * PAGE_SIZE,
+            RssType::from(self.kind),
+        );
 
         Ok(())
     }
@@ -537,6 +544,20 @@ impl Vmo {
     /// Returns whether this VMO has a backend.
     fn has_backend(&self) -> bool {
         self.backend.is_some()
+    }
+
+    /// Returns the kind of the pages in the VMO.
+    pub(crate) fn kind(&self) -> PageKind {
+        self.kind
+    }
+}
+
+impl Drop for Vmo {
+    fn drop(&mut self) {
+        if self.kind == PageKind::ShmemReserved {
+            // See `VmoOptions::alloc`.
+            mod_mem_stat(MemStat::Committed, -((self.size() / PAGE_SIZE) as isize));
+        }
     }
 }
 
@@ -908,7 +929,7 @@ impl<'a> BackedVmo<'a> {
                 match cursor.load() {
                     Some(page) => page.clone(),
                     None => {
-                        let page = CachePage::alloc_uninit()?;
+                        let page = CachePage::alloc_uninit(self.kind)?;
                         cursor.store(page.clone());
                         page
                     }
@@ -980,7 +1001,7 @@ impl<'a> BackedVmo<'a> {
                 if cursor.load().is_some() {
                     continue;
                 }
-                let Ok(page) = CachePage::alloc_uninit() else {
+                let Ok(page) = CachePage::alloc_uninit(self.kind) else {
                     break;
                 };
                 // The page is not shared yet, so locking it never fails. Others
@@ -1136,7 +1157,10 @@ impl<'a> BackedVmo<'a> {
             return Ok(());
         }
 
-        locked_rmap.unmap(page_idx_range.start * PAGE_SIZE..page_idx_range.end * PAGE_SIZE);
+        locked_rmap.unmap(
+            page_idx_range.start * PAGE_SIZE..page_idx_range.end * PAGE_SIZE,
+            RssType::from(self.kind),
+        );
 
         // As long as the pages are locked and their state is `Evicted`, no one can read from them.
         // Therefore, we can release the reverse-mapping lock now.
@@ -1183,7 +1207,10 @@ impl<'a> BackedVmo<'a> {
             return Ok(());
         }
 
-        locked_rmap.unmap(page_idx_range.start * PAGE_SIZE..page_idx_range.end * PAGE_SIZE);
+        locked_rmap.unmap(
+            page_idx_range.start * PAGE_SIZE..page_idx_range.end * PAGE_SIZE,
+            RssType::from(self.kind),
+        );
 
         drop(locked_rmap);
 
@@ -1217,7 +1244,7 @@ impl<'a> BackedVmo<'a> {
         };
 
         // The page is within the file bounds - need to allocate a cache page.
-        let uninit_page = CachePage::alloc_uninit()?;
+        let uninit_page = CachePage::alloc_uninit(self.kind)?;
         cursor.store(uninit_page.clone());
         drop(locked_pages);
 

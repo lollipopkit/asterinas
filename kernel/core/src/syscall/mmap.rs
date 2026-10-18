@@ -7,7 +7,7 @@ use crate::{
     fs::file::file_table::{RawFileDesc, get_file_fast},
     prelude::*,
     vm::{
-        page_cache::VmoOptions,
+        page_cache::{PageKind, VmoOptions},
         perms::VmPerms,
         vmar::{MmapMode, VMAR_CAP_ADDR, VMAR_LOWEST_ADDR, VmarMapOffset},
     },
@@ -103,6 +103,9 @@ fn do_sys_mmap(
             options = options.map_mode(MmapMode::Shared);
         }
 
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/mm/mmap.c#L546-L558>
+        options = options.noreserve(option.flags().contains(MMapFlags::MAP_NORESERVE));
+
         if option.flags().contains(MMapFlags::MAP_ANONYMOUS) {
             // Linux rejects MAP_SHARED_VALIDATE for anonymous mappings.
             if option.typ() == MMapType::SharedValidate {
@@ -113,10 +116,13 @@ fn do_sys_mmap(
             }
             // Anonymous shared mappings should share the same memory pages.
             if option.typ().is_shared() {
-                let shared_vmo = {
-                    let vmo_options = VmoOptions::new(len);
-                    vmo_options.alloc()?
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/mm/shmem.c#L5867-L5899>
+                let kind = if option.flags().contains(MMapFlags::MAP_NORESERVE) {
+                    PageKind::Shmem
+                } else {
+                    PageKind::ShmemReserved
                 };
+                let shared_vmo = VmoOptions::new(len).kind(kind).alloc()?;
                 options = options.vmo(shared_vmo);
             }
 

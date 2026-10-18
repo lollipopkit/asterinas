@@ -71,10 +71,12 @@ impl Rmap {
 
     /// Iterates over all reverse mappings and unmaps the given offset range.
     ///
+    /// The unmapped pages are subtracted from the RSS counters of `rss_type`.
+    ///
     /// # Panics
     ///
     /// This method may panic if the offset range is not aligned to the page boundary.
-    pub(crate) fn unmap(&mut self, offset: Range<usize>) {
+    pub(crate) fn unmap(&mut self, offset: Range<usize>, rss_type: RssType) {
         debug_assert!(offset.start.is_multiple_of(PAGE_SIZE));
         debug_assert!(offset.end.is_multiple_of(PAGE_SIZE));
 
@@ -100,10 +102,7 @@ impl Rmap {
                     .vm_space()
                     .cursor_mut(&preempt_guard, &addr_range)
                     .unwrap();
-                rss_delta.add(
-                    RssType::File,
-                    -(cursor_mut.unmap(addr_range.len()) as isize),
-                );
+                rss_delta.add(rss_type, -(cursor_mut.unmap(addr_range.len()) as isize));
                 cursor_mut.flusher().dispatch_tlb_flush();
                 cursor_mut.flusher().sync_tlb_flush();
             }

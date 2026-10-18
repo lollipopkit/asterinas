@@ -22,7 +22,7 @@ use crate::{
     prelude::*,
     util::random::getrandom,
     vm::{
-        page_cache::{Vmo, VmoOptions},
+        page_cache::{PageKind, Vmo, VmoOptions},
         perms::VmPerms,
         vmar::{VMAR_CAP_ADDR, Vmar, VmarMapOffset},
     },
@@ -181,7 +181,7 @@ impl InitStack {
         self.set_uninitialized();
 
         let vmo = {
-            let vmo_options = VmoOptions::new(self.max_size);
+            let vmo_options = VmoOptions::new(self.max_size).kind(PageKind::Anon);
             vmo_options.alloc()?
         };
         let vmar_map_options = {

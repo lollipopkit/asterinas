@@ -7,7 +7,7 @@ use aster_util::fixed_point::FixedU64;
 use ostd::mm::VmIo;
 
 use super::SyscallReturn;
-use crate::{prelude::*, process::pid_table, sched::loadavg};
+use crate::{prelude::*, process::pid_table, sched::loadavg, vm::stat};
 
 #[padding_struct]
 #[repr(C)]
@@ -31,6 +31,7 @@ pub(super) fn sys_sysinfo(sysinfo_addr: Vaddr, ctx: &Context) -> Result<SyscallR
     type SysinfoLoadAvg = FixedU64<16>;
 
     let loadavg = loadavg::get_loadavg();
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/mm/show_mem.c#L75-L84>
     let info = SysInfo {
         uptime: read_monotonic_time().as_secs_round_up() as i64,
         loads: [
@@ -40,6 +41,8 @@ pub(super) fn sys_sysinfo(sysinfo_addr: Vaddr, ctx: &Context) -> Result<SyscallR
         ],
         totalram: crate::vm::mem_total() as u64,
         freeram: osdk_frame_allocator::load_total_free_size() as u64,
+        sharedram: (stat::nr_shmem_pages() * PAGE_SIZE) as u64,
+        bufferram: (stat::nr_buffer_pages() * PAGE_SIZE) as u64,
         procs: pid_table::pid_table_mut().process_count() as u16,
         // `mem_unit` will always be 1 byte since Asterinas only supports
         // 64-bit CPU architectures.
