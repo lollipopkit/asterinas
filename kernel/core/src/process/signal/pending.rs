@@ -129,6 +129,12 @@ impl HandlePendingSignal for PosixThread {
 }
 
 fn has_pending_signal(posix_thread: &PosixThread, process: &Process) -> bool {
+    // A pending ptrace trap interrupts the thread like a pending signal.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L159-L175>
+    if posix_thread.ptrace_has_pending_trap() {
+        return true;
+    }
+
     // Fast path: No signals are pending.
     if posix_thread.sig_queues().is_empty() && process.sig_queues().is_empty() {
         return false;

@@ -10,7 +10,7 @@ use crate::{
     prelude::*,
     process::{
         ReapedChildrenStats, Uid, pid_table,
-        posix_thread::{AsPosixThread, ptrace::PtraceWaitStatus},
+        posix_thread::{AsPosixThread, PosixThread, ptrace::PtraceWaitStatus},
         sigchld::ChildSource,
         signal::sig_num::SigNum,
         status::StopWaitStatus,
@@ -163,16 +163,41 @@ enum WaitResult {
 }
 
 /// Checks tracees for exited or ptrace-stopped threads.
+///
+/// The tracees of all threads in the current process are checked.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1697-L1710>
 fn try_wait_tracees(
     child_filter: &ProcessFilter,
     wait_options: WaitOptions,
     ctx: &Context,
 ) -> WaitResult {
-    // Currently, we only support the main thread as the tracer,
-    // so there is no need to check the tracees of other threads.
-    //
+    // Do not hold the lock of tasks while checking tracees to avoid deadlocks
+    // when two processes trace the threads of each other.
+    let tasks = ctx.process.tasks().lock().as_slice().to_vec();
+
+    let mut fallback_result = WaitResult::NoMatch;
+    for task in tasks {
+        let tracer = task.as_posix_thread().unwrap();
+        match try_wait_tracees_of(tracer, child_filter, wait_options, ctx) {
+            WaitResult::Found(status) => return WaitResult::Found(status),
+            WaitResult::MatchedButUnready => fallback_result = WaitResult::MatchedButUnready,
+            WaitResult::NoMatch => {}
+        }
+    }
+
+    fallback_result
+}
+
+/// Checks the tracees of `tracer` for exited or ptrace-stopped threads.
+fn try_wait_tracees_of(
+    tracer: &PosixThread,
+    child_filter: &ProcessFilter,
+    wait_options: WaitOptions,
+    ctx: &Context,
+) -> WaitResult {
     // Lock order: tracer.tracees -> tracee.tracee_status
-    let Some(tracees) = ctx.posix_thread.tracees() else {
+    let Some(tracees) = tracer.tracees() else {
         return WaitResult::NoMatch;
     };
     let tracees = tracees.lock();
@@ -310,9 +335,10 @@ fn try_wait_children(
         }
 
         if let Some(tracer) = child.main_thread().as_posix_thread().unwrap().tracer() {
-            // A child traced by the current thread is handled as a tracee.
+            // A child traced by a thread in the current process is handled as a tracee.
             // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1494-L1507>
-            if !core::ptr::eq(tracer.as_posix_thread().unwrap(), ctx.posix_thread) {
+            let tracer_process = tracer.as_posix_thread().unwrap().weak_process();
+            if !core::ptr::eq(Weak::as_ptr(tracer_process), Arc::as_ptr(&ctx.process)) {
                 fallback_result = WaitResult::MatchedButUnready;
             }
             continue;

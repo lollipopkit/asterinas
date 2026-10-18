@@ -47,7 +47,7 @@ pub(crate) trait SignalContext {
     fn set_arguments(&mut self, sig_num: SigNum, siginfo_addr: usize, ucontext_addr: usize);
 }
 
-/// Handles a pending signal for the current process.
+/// Handles a pending signal (and pending ptrace traps) for the current process.
 pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
     if !deliver_pending_signal(user_ctx, ctx) {
         // No user signal handler runs, so the interrupted syscall is restarted.
@@ -82,7 +82,7 @@ fn restart_syscall(user_ctx: &mut UserContext, orig_syscall_ret: usize) {
     user_ctx.set_instruction_pointer(user_ctx.instruction_pointer() - SYSCALL_INSTR_LEN);
 }
 
-/// Delivers a pending signal.
+/// Takes pending ptrace traps and delivers a pending signal.
 ///
 /// Returns whether a user signal handler is set up (or the thread is exiting),
 /// in which case the interrupted syscall has been handled.
@@ -91,6 +91,10 @@ fn deliver_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> bool {
     // other pending unmasked signals until the next trap. Consider a looped scan.
     //
     // For details, see <https://github.com/asterinas/asterinas/pull/2984/#discussion_r3137275994>.
+
+    // Ptrace traps are taken before dequeuing signals.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2969-L2981>
+    while ctx.posix_thread.ptrace_do_jobctl_trap(ctx, user_ctx) {}
 
     let mut restore_sig_mask = ctx
         .thread_local

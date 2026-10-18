@@ -15,22 +15,35 @@ use crate::{
 };
 
 /// The requests that can continue a stopped tracee.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PtraceContRequest {
-    Continue(Option<SigNum>),
+    Continue,
     #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
-    SingleStep(Option<SigNum>),
-    Syscall(Option<SigNum>),
+    SingleStep,
+    Syscall,
 }
 
-impl PtraceContRequest {
-    pub(super) fn sig_num(&self) -> Option<SigNum> {
-        match self {
-            Self::Continue(Some(sig_num))
-            | Self::SingleStep(Some(sig_num))
-            | Self::Syscall(Some(sig_num)) => Some(*sig_num),
-            _ => None,
-        }
-    }
+/// The ways to start tracing a thread.
+#[derive(Clone, Copy)]
+pub(crate) enum PtraceAttachMode {
+    /// `PTRACE_TRACEME`.
+    TraceMe,
+    /// `PTRACE_ATTACH`.
+    Attach,
+    /// `PTRACE_SEIZE` with the given options.
+    Seize(PtraceOptions),
+}
+
+/// Parses the signal that a tracer delivers when resuming or detaching a tracee.
+///
+/// # Errors
+///
+/// Returns `EIO` if `data` is not a valid signal number.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/ptrace.c#L852-L853>
+pub(super) fn parse_resume_signal(data: usize) -> Result<Option<SigNum>> {
+    SigNum::try_from_raw(data as u64)
+        .map_err(|_| Error::with_message(Errno::EIO, "invalid signal number"))
 }
 
 /// The result of a ptrace-stop.
@@ -47,12 +60,14 @@ pub(crate) enum PtraceStopResult {
 }
 
 /// The signal associated with a ptrace-stop and its later signal delivery.
+///
+/// A group-stop of a tracee that is not seized has no signal (i.e., no `siginfo`).
 #[derive(Default)]
 pub(super) enum StopDeliverySignal {
     /// The signal that has not yet been reported through `wait`.
-    Pending(DequeuedSignal, PtraceWaitStatus),
+    Pending(Option<DequeuedSignal>, PtraceWaitStatus),
     /// The signal that has been reported through `wait`.
-    Consumed(DequeuedSignal),
+    Consumed(Option<DequeuedSignal>),
     /// The signal that is injected by the tracer.
     Injected(DequeuedSignal),
     /// No ptrace-stop signal is recorded.
@@ -62,7 +77,7 @@ pub(super) enum StopDeliverySignal {
 
 impl StopDeliverySignal {
     /// Records the signal associated with a ptrace-stop.
-    pub(super) fn stop(&mut self, signal: DequeuedSignal, wait_status: PtraceWaitStatus) {
+    pub(super) fn stop(&mut self, signal: Option<DequeuedSignal>, wait_status: PtraceWaitStatus) {
         *self = Self::Pending(signal, wait_status);
     }
 
@@ -72,7 +87,8 @@ impl StopDeliverySignal {
         let this = core::mem::replace(self, Self::Empty);
 
         match this {
-            Self::Pending(signal, _) | Self::Injected(signal) => Some(signal),
+            Self::Pending(signal, _) => signal,
+            Self::Injected(signal) => Some(signal),
             Self::Consumed(_) | Self::Empty => None,
         }
     }
@@ -101,28 +117,58 @@ impl StopDeliverySignal {
     }
 
     /// Injects a signal by the tracer.
+    ///
+    /// The signal is discarded if the ptrace-stop has no signal.
     pub(super) fn inject(&mut self, new_signal: Box<dyn Signal>) {
         let this = core::mem::replace(self, Self::Empty);
 
-        let mut signal = match this {
+        let signal = match this {
             Self::Pending(signal, _) | Self::Consumed(signal) => signal,
             Self::Injected(_) | Self::Empty => unreachable!(),
         };
 
-        signal.set_signal(new_signal);
-        *self = Self::Injected(signal);
+        if let Some(mut signal) = signal {
+            signal.set_signal(new_signal);
+            *self = Self::Injected(signal);
+        }
     }
 
     /// Returns the signal associated with a ptrace-stop,
     /// but does not change the state.
     pub(super) fn get(&self) -> Option<&dyn Signal> {
         match self {
-            Self::Pending(signal, _) | Self::Consumed(signal) | Self::Injected(signal) => {
-                Some(signal.signal())
-            }
-            Self::Empty => None,
+            Self::Pending(Some(signal), _)
+            | Self::Consumed(Some(signal))
+            | Self::Injected(signal) => Some(signal.signal()),
+            Self::Pending(None, _) | Self::Consumed(None) | Self::Empty => None,
         }
     }
+}
+
+bitflags! {
+    /// The job control states of a tracee.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/sched/jobctl.h>
+    pub(super) struct JobCtl: u8 {
+        /// A group-stop is pending (`JOBCTL_STOP_PENDING`).
+        const STOP_PENDING = 1 << 0;
+        /// A trap for `PTRACE_INTERRUPT` or group-stops is pending (`JOBCTL_TRAP_STOP`).
+        const TRAP_STOP = 1 << 1;
+        /// A trap for notifying the tracer of job control changes is pending
+        /// (`JOBCTL_TRAP_NOTIFY`).
+        const TRAP_NOTIFY = 1 << 2;
+        /// The tracer is waiting for the tracee to enter a trap (`JOBCTL_TRAPPING`).
+        const TRAPPING = 1 << 3;
+        /// The tracer is listening for events in a `PTRACE_EVENT_STOP` (`JOBCTL_LISTENING`).
+        const LISTENING = 1 << 4;
+    }
+}
+
+impl JobCtl {
+    /// The states that make the tracee trap.
+    pub(super) const PENDING_MASK: Self = Self::STOP_PENDING
+        .union(Self::TRAP_STOP)
+        .union(Self::TRAP_NOTIFY);
 }
 
 bitflags! {
@@ -142,6 +188,10 @@ bitflags! {
         const PTRACE_O_TRACEVFORKDONE = 1 << PtraceEvent::VforkDone(0).code();
         /// Stops the tracee at `exit`.
         const PTRACE_O_TRACEEXIT = 1 << PtraceEvent::Exit(0).code();
+        /// Stops the tracee when a seccomp `SECCOMP_RET_TRACE` rule is triggered.
+        ///
+        /// This option is accepted but has no effect because seccomp is not supported.
+        const PTRACE_O_TRACESECCOMP = 1 << 7;
         /// Send a `SIGKILL` signal to the tracee if the tracer exits.
         const PTRACE_O_EXITKILL = 1 << 20;
     }
@@ -196,12 +246,15 @@ impl PtraceEvent {
 
     /// Creates a `siginfo_t` for the ptrace-stop triggered by this event.
     pub(super) fn siginfo(&self, ctx: &Context) -> siginfo_t {
-        let code = PtraceWaitStatus::from_event(self).0;
+        let code = PtraceWaitStatus::from_event(self).to_si_code();
         let mut siginfo = siginfo_t::new(SIGTRAP, code);
         siginfo.set_pid_uid_by(ctx);
         siginfo
     }
 }
+
+/// The event code of `PTRACE_EVENT_STOP`.
+const PTRACE_EVENT_STOP: i32 = 128;
 
 /// The `si_status` code of a ptrace-stop for `wait` syscalls.
 #[derive(Copy, Clone)]
@@ -214,6 +267,16 @@ impl PtraceWaitStatus {
 
     pub(super) fn from_signal(sig: SigNum) -> Self {
         Self(sig.as_u8() as i32)
+    }
+
+    /// Creates the wait status of a `PTRACE_EVENT_STOP` with the given signal.
+    pub(super) fn from_event_stop(sig: SigNum) -> Self {
+        Self(sig.as_u8() as i32 | (PTRACE_EVENT_STOP << 8))
+    }
+
+    /// Returns the `si_code` of the `siginfo_t` reported by `PTRACE_GETSIGINFO`.
+    pub(super) fn to_si_code(self) -> i32 {
+        self.0
     }
 
     pub(super) fn from_syscall(options: &PtraceOptions) -> Self {
@@ -242,7 +305,7 @@ impl PtraceWaitStatus {
 
 /// Creates a `siginfo_t` for a syscall-stop.
 pub(super) fn syscall_stop_siginfo(options: &PtraceOptions, ctx: &Context) -> siginfo_t {
-    let code = PtraceWaitStatus::from_syscall(options).0;
+    let code = PtraceWaitStatus::from_syscall(options).to_si_code();
     let mut siginfo = siginfo_t::new(SIGTRAP, code);
     siginfo.set_pid_uid_by(ctx);
     siginfo

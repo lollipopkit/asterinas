@@ -68,6 +68,10 @@ pub(crate) fn create_new_user_task(
             crate::init::on_first_process_startup(&ctx);
         }
 
+        // A traced thread does not stop for a group-stop. Instead, it traps into the group-stop
+        // (in `handle_pending_signal`) and runs again once the tracer resumes it.
+        let is_group_stopped = || ctx.process.is_stopped() && !ctx.posix_thread.is_traced();
+
         let handle_signals = |user_ctx: &mut UserContext| {
             handle_pending_signal(user_ctx, &ctx);
 
@@ -78,12 +82,17 @@ pub(crate) fn create_new_user_task(
             // Certain signals, such as SIGKILL, should be handled even if the process is stopped.
             // We need to further investigate Linux behavior regarding which signals should be handled
             // when the thread is stopped.
-            while !current_thread.is_exited() && ctx.process.is_stopped() {
-                let _ = stop_waiter.pause_until_by(
-                    || (!ctx.process.is_stopped()).then_some(()),
-                    // We currently do not support ptrace.
-                    PauseReason::StopBySignal,
-                );
+            while !current_thread.is_exited() {
+                if ctx.posix_thread.ptrace_has_pending_trap() {
+                    // The trap is taken in `handle_pending_signal`.
+                } else if is_group_stopped() {
+                    let _ = stop_waiter.pause_until_by(
+                        || (!is_group_stopped()).then_some(()),
+                        PauseReason::StopBySignal,
+                    );
+                } else {
+                    break;
+                }
                 handle_pending_signal(user_ctx, &ctx);
             }
         };

@@ -91,6 +91,11 @@ Supported functionality in SCML:
 
 Supported requests:
 * `PTRACE_TRACEME`
+* `PTRACE_ATTACH`
+* `PTRACE_SEIZE`
+* `PTRACE_DETACH`
+* `PTRACE_INTERRUPT`
+* `PTRACE_LISTEN`
 * `PTRACE_PEEKTEXT`
 * `PTRACE_PEEKDATA`
 * `PTRACE_PEEKUSER` (x86-64 only)
@@ -108,9 +113,10 @@ Supported requests:
 * `PTRACE_GETSIGINFO`
 
 Limitations:
-* Only the main thread of a process can act as the tracer.
 * `PTRACE_PEEKUSER` and `PTRACE_POKEUSER` only support offsets for general-purpose registers.
-* If a tracee has clone-family options (`PTRACE_O_TRACEFORK`, `PTRACE_O_TRACEVFORK`, `PTRACE_O_TRACEVFORKDONE`, or `PTRACE_O_TRACECLONE`) and then performs a clone-family operation that would trigger a ptrace event, the clone-family operation returns `EOPNOTSUPP`.
+* `PTRACE_O_TRACESECCOMP` is accepted but never reports events,
+  and `PTRACE_O_SUSPEND_SECCOMP` is rejected with `EINVAL`, because seccomp is not supported.
+* A tracer cannot wait for the `CLD_CONTINUED` state of a tracee with `WCONTINUED`.
 
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/ptrace.2.html).
