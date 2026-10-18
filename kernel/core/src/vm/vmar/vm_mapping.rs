@@ -890,6 +890,77 @@ impl VmMapping {
         num_unmapped
     }
 
+    /// Unmaps the mapping from the VM space while keeping the unmapped pages
+    /// that cannot be faulted in again, so that they can be restored by
+    /// [`Self::restore_pages`].
+    ///
+    /// Returns the number of unmapped pages and the kept pages. Pages of
+    /// shared VMO-backed mappings are not kept, because they stay in the VMO.
+    pub(super) fn unmap_keeping_pages(&self, vm_space: &VmSpace) -> (usize, Vec<KeptPage>) {
+        let preempt_guard = disable_preempt();
+        let range = self.range();
+        let mut cursor = vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+
+        let mut kept_pages = Vec::new();
+        if self.vmo_for_rmap().is_none() {
+            while let Some(va) = cursor.find_next(range.end - cursor.virt_addr()) {
+                let page = match cursor.query().unwrap().1.unwrap() {
+                    VmQueriedItem::MappedRam { frame, prop } => KeptPage::Ram {
+                        va,
+                        frame: (*frame).clone(),
+                        prop,
+                    },
+                    VmQueriedItem::MappedIoMem { paddr, prop } => {
+                        let (io_mem, offset) = cursor.find_iomem_by_paddr(paddr).unwrap();
+                        KeptPage::IoMem {
+                            va,
+                            io_mem,
+                            offset,
+                            prop,
+                        }
+                    }
+                };
+                kept_pages.push(page);
+
+                if va + PAGE_SIZE == range.end {
+                    break;
+                }
+                cursor.jump(va + PAGE_SIZE).unwrap();
+            }
+            cursor.jump(range.start).unwrap();
+        }
+
+        let num_unmapped = cursor.unmap(range.len());
+        cursor.flusher().dispatch_tlb_flush();
+        cursor.flusher().sync_tlb_flush();
+
+        (num_unmapped, kept_pages)
+    }
+
+    /// Maps the pages kept by [`Self::unmap_keeping_pages`] again.
+    pub(super) fn restore_pages(&self, vm_space: &VmSpace, kept_pages: Vec<KeptPage>) {
+        let preempt_guard = disable_preempt();
+        let mut cursor = vm_space.cursor_mut(&preempt_guard, &self.range()).unwrap();
+
+        for page in kept_pages {
+            match page {
+                KeptPage::Ram { va, frame, prop } => {
+                    cursor.jump(va).unwrap();
+                    cursor.map(frame, prop);
+                }
+                KeptPage::IoMem {
+                    va,
+                    io_mem,
+                    offset,
+                    prop,
+                } => {
+                    cursor.jump(va).unwrap();
+                    cursor.map_iomem(io_mem, prop, PAGE_SIZE, offset);
+                }
+            }
+        }
+    }
+
     /// Change the perms of the mapping.
     pub(super) fn protect(self, vm_space: &VmSpace, perms: VmPerms) -> Self {
         // For device mappings, they're shared as we have checked that when
@@ -935,6 +1006,21 @@ impl VmMapping {
             ..self
         }
     }
+}
+
+/// A page unmapped by [`VmMapping::unmap_keeping_pages`].
+pub(super) enum KeptPage {
+    Ram {
+        va: Vaddr,
+        frame: UFrame,
+        prop: PageProperty,
+    },
+    IoMem {
+        va: Vaddr,
+        io_mem: IoMem,
+        offset: usize,
+        prop: PageProperty,
+    },
 }
 
 /// Memory mapped by a [`VmMapping`].

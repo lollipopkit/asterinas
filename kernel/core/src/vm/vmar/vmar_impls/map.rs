@@ -2,7 +2,7 @@
 
 use core::num::NonZeroUsize;
 
-use super::{MappedMemory, MappedVmo, RssDelta, VmMapping, Vmar};
+use super::{MappedMemory, MappedVmo, RssDelta, TakenMappings, VmMapping, Vmar};
 use crate::{
     fs::{
         file::{FileLike, MappableObject},
@@ -294,51 +294,8 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
                 }
             })?;
 
-        // Allocates a free region.
-        debug!(
-            "allocate free region, map_size = 0x{:x}, offset = {:x?}, align = 0x{:x}",
-            map_size, offset, align
-        );
-        let map_to_addr = match offset {
-            VmarMapOffset::FixedReplace(map_to_addr) => {
-                let mut rss_delta = RssDelta::new(parent);
-                inner.alloc_free_region_exact_truncate(
-                    parent,
-                    map_to_addr,
-                    map_size,
-                    &mut rss_delta,
-                );
-                map_to_addr
-            }
-            VmarMapOffset::FixedNoReplace(map_to_addr) => {
-                inner.alloc_free_region_exact(map_to_addr, map_size)?;
-                map_to_addr
-            }
-            VmarMapOffset::Hint(map_to_addr) => {
-                if inner.alloc_free_region_exact(map_to_addr, map_size).is_ok() {
-                    map_to_addr
-                } else {
-                    inner.alloc_free_region(map_size, align)?.start
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            VmarMapOffset::Map32Bit(addr_hint) => {
-                use super::{MAP_32BIT_HIGH_LIMIT, VMAR_LOWEST_ADDR};
-
-                if let Some(addr) = addr_hint
-                    && (VMAR_LOWEST_ADDR..MAP_32BIT_HIGH_LIMIT).contains(&addr)
-                    && map_size <= MAP_32BIT_HIGH_LIMIT - addr
-                    && inner.alloc_free_region_exact(addr, map_size).is_ok()
-                {
-                    addr
-                } else {
-                    inner.alloc_free_region_below_2gib(map_size, align)?.start
-                }
-            }
-            VmarMapOffset::Any => inner.alloc_free_region(map_size, align)?.start,
-        };
-
-        // Parse the `Mappable` and prepare the `MappedMemory`.
+        // Parse the `Mappable` and prepare the `MappedMemory`. This must be done before
+        // replacing overlapping mappings, so that a failure leaves them intact.
         let (mapped_mem, device_mappable) = match mappable {
             Some(MappableObject::Vmo(vmo)) => {
                 let path = file.as_ref().map(|file| file.path());
@@ -377,6 +334,60 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             None => (MappedMemory::Anonymous, None),
         };
 
+        // Allocates a free region.
+        let mut rss_delta = RssDelta::new(parent);
+        let mut taken_mappings = TakenMappings::default();
+        debug!(
+            "allocate free region, map_size = 0x{:x}, offset = {:x?}, align = 0x{:x}",
+            map_size, offset, align
+        );
+        let map_to_addr = match offset {
+            VmarMapOffset::FixedReplace(map_to_addr) => {
+                let range = map_to_addr..map_to_addr + map_size;
+                if device_mappable.is_some() {
+                    // Populating device memory may fail, so the overlapping mappings are only
+                    // removed after the new mapping is set up, and they are restored if that
+                    // fails. Linux restores them only if the page tables have not been cleared
+                    // yet, and leaves a gap otherwise, which we avoid by keeping the pages.
+                    taken_mappings = inner.take_mappings(parent, &range, &mut rss_delta);
+                } else {
+                    inner.alloc_free_region_exact_truncate(
+                        parent,
+                        range.start,
+                        range.len(),
+                        &mut rss_delta,
+                    );
+                }
+                map_to_addr
+            }
+            VmarMapOffset::FixedNoReplace(map_to_addr) => {
+                inner.alloc_free_region_exact(map_to_addr, map_size)?;
+                map_to_addr
+            }
+            VmarMapOffset::Hint(map_to_addr) => {
+                if inner.alloc_free_region_exact(map_to_addr, map_size).is_ok() {
+                    map_to_addr
+                } else {
+                    inner.alloc_free_region(map_size, align)?.start
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            VmarMapOffset::Map32Bit(addr_hint) => {
+                use super::{MAP_32BIT_HIGH_LIMIT, VMAR_LOWEST_ADDR};
+
+                if let Some(addr) = addr_hint
+                    && (VMAR_LOWEST_ADDR..MAP_32BIT_HIGH_LIMIT).contains(&addr)
+                    && map_size <= MAP_32BIT_HIGH_LIMIT - addr
+                    && inner.alloc_free_region_exact(addr, map_size).is_ok()
+                {
+                    addr
+                } else {
+                    inner.alloc_free_region_below_2gib(map_size, align)?.start
+                }
+            }
+            VmarMapOffset::Any => inner.alloc_free_region(map_size, align)?.start,
+        };
+
         // Build the mapping.
         let mut vm_mapping = VmMapping::new(
             NonZeroUsize::new(map_size).unwrap(),
@@ -398,22 +409,27 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
         // otherwise another traversal is needed for locating the `VmMapping`.
         // Exchange the operation is ok since we hold the write lock on the
         // VMAR.
-        if let Some(mappable) = device_mappable {
-            let mut rss_delta = RssDelta::new(parent);
-            if let Err(err) =
+        if let Some(mappable) = device_mappable
+            && let Err(err) =
                 vm_mapping.populate_device(parent.vm_space(), mappable, vmo_offset, &mut rss_delta)
-            {
-                // Unmap all populated pages if a failure occurs.
-                rss_delta.add(
-                    MapHandle::DEVICE_RSS_TYPE,
-                    -(vm_mapping.unmap(parent.vm_space()) as isize),
-                );
-                return Err(err);
-            }
+        {
+            // Unmap all populated pages if a failure occurs.
+            rss_delta.add(
+                MapHandle::DEVICE_RSS_TYPE,
+                -(vm_mapping.unmap(parent.vm_space()) as isize),
+            );
+            drop(rmap);
+            inner.restore_taken_mappings(parent, taken_mappings, &mut rss_delta);
+            return Err(err);
         }
 
         // Add the mapping to the VMAR.
         inner.insert_try_merge(parent, vm_mapping, rmap.as_deref_mut());
+
+        // Complete the replacement by dropping the taken mappings. Note that `rmap` must be
+        // dropped before them. See `VmarInner::take_mapping_part`.
+        drop(rmap);
+        drop(taken_mappings);
 
         Ok(map_to_addr)
     }
