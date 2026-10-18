@@ -13,9 +13,8 @@ use crate::{
         posix_thread::{AsPosixThread, PosixThread, ptrace::PtraceWaitStatus},
         sigchld::ChildSource,
         signal::sig_num::SigNum,
-        status::StopWaitStatus,
     },
-    thread::{Thread, Tid},
+    thread::{AsThread, Thread, Tid},
     time::clocks::ProfClock,
 };
 
@@ -33,30 +32,11 @@ bitflags! {
     }
 }
 
-impl WaitOptions {
-    pub(crate) fn check(&self) -> Result<()> {
-        let supported_args = WaitOptions::WNOHANG
-            | WaitOptions::WSTOPPED
-            | WaitOptions::WCONTINUED
-            | WaitOptions::WNOWAIT;
-        if !supported_args.contains(*self) {
-            warn!(
-                "unsupported wait options are found: {:?}",
-                *self - supported_args
-            );
-        }
-
-        Ok(())
-    }
-}
-
 pub(crate) fn do_wait(
     child_filter: ProcessFilter,
     wait_options: WaitOptions,
     ctx: &Context,
 ) -> Result<Option<WaitStatus>> {
-    wait_options.check()?;
-
     let is_nonblocking = if let ProcessFilter::WithPidfd(pid_file) = &child_filter {
         pid_file.is_nonblocking()
     } else {
@@ -125,6 +105,7 @@ pub(crate) enum WaitStatus {
     Continue(Arc<Process>),
     TraceeExit(Arc<Thread>, ExitCode),
     TraceeStop(Arc<Thread>, PtraceWaitStatus),
+    TraceeContinue(Arc<Thread>),
 }
 
 impl WaitStatus {
@@ -145,7 +126,9 @@ impl WaitStatus {
             WaitStatus::Zombie(process)
             | WaitStatus::Stop(process, _)
             | WaitStatus::Continue(process) => ChildSource::Process(process.as_ref()),
-            WaitStatus::TraceeExit(thread, _) | WaitStatus::TraceeStop(thread, _) => {
+            WaitStatus::TraceeExit(thread, _)
+            | WaitStatus::TraceeStop(thread, _)
+            | WaitStatus::TraceeContinue(thread) => {
                 ChildSource::Thread(thread.as_posix_thread().unwrap())
             }
         }
@@ -162,9 +145,10 @@ enum WaitResult {
     NoMatch,
 }
 
-/// Checks tracees for exited or ptrace-stopped threads.
+/// Checks tracees for exited, ptrace-stopped, or continued threads.
 ///
-/// The tracees of all threads in the current process are checked.
+/// The tracees of all threads in the current process are checked, or only those of the current
+/// thread with `__WNOTHREAD`.
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1697-L1710>
 fn try_wait_tracees(
@@ -172,6 +156,10 @@ fn try_wait_tracees(
     wait_options: WaitOptions,
     ctx: &Context,
 ) -> WaitResult {
+    if wait_options.contains(WaitOptions::WNOTHREAD) {
+        return try_wait_tracees_of(ctx.posix_thread, child_filter, None, wait_options, ctx);
+    }
+
     // Do not hold the lock of tasks while checking tracees to avoid deadlocks
     // when two processes trace the threads of each other.
     let tasks = ctx.process.tasks().lock().as_slice().to_vec();
@@ -179,7 +167,7 @@ fn try_wait_tracees(
     let mut fallback_result = WaitResult::NoMatch;
     for task in tasks {
         let tracer = task.as_posix_thread().unwrap();
-        match try_wait_tracees_of(tracer, child_filter, wait_options, ctx) {
+        match try_wait_tracees_of(tracer, child_filter, None, wait_options, ctx) {
             WaitResult::Found(status) => return WaitResult::Found(status),
             WaitResult::MatchedButUnready => fallback_result = WaitResult::MatchedButUnready,
             WaitResult::NoMatch => {}
@@ -189,10 +177,15 @@ fn try_wait_tracees(
     fallback_result
 }
 
-/// Checks the tracees of `tracer` for exited or ptrace-stopped threads.
+/// Checks the tracees of `tracer` for exited, ptrace-stopped, or continued threads.
+///
+/// If `only_tid` is `Some(_)`, only the tracee with the thread ID is checked.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1465-L1566>
 fn try_wait_tracees_of(
     tracer: &PosixThread,
     child_filter: &ProcessFilter,
+    only_tid: Option<Tid>,
     wait_options: WaitOptions,
     ctx: &Context,
 ) -> WaitResult {
@@ -206,6 +199,9 @@ fn try_wait_tracees_of(
 
     for thread in tracees.values() {
         let tracee = thread.as_posix_thread().unwrap();
+        if only_tid.is_some_and(|tid| tid != tracee.tid()) {
+            continue;
+        }
         let Some(process) = tracee.weak_process().upgrade() else {
             continue;
         };
@@ -236,10 +232,15 @@ fn try_wait_tracees_of(
                 // <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/exit.c#L1486-L1487>.
                 //
                 // The ptrace-stop state of an exited tracee cannot change, so only an exit
-                // (or a continuation, as Linux accepts) remains to be waited for.
+                // or a continuation remains to be waited for.
                 // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1536-L1543>
                 if wait_options.intersects(WaitOptions::WEXITED | WaitOptions::WCONTINUED) {
                     fallback_result = WaitResult::MatchedButUnready;
+                }
+                if wait_options.contains(WaitOptions::WCONTINUED)
+                    && process.wait_continued(wait_options)
+                {
+                    return WaitResult::Found(WaitStatus::TraceeContinue(thread.clone()));
                 }
                 continue;
             }
@@ -270,8 +271,16 @@ fn try_wait_tracees_of(
         fallback_result = WaitResult::MatchedButUnready;
 
         // Waiting for ptrace-stops does not require `WaitOptions::WSTOPPED`.
-        if let Some(sig_num) = tracee.wait_ptrace_stopped(wait_options) {
-            return WaitResult::Found(WaitStatus::TraceeStop(thread.clone(), sig_num));
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1349-L1353>
+        if let Some(status) = tracee.wait_ptrace_stopped(wait_options) {
+            return WaitResult::Found(WaitStatus::TraceeStop(thread.clone(), status));
+        }
+
+        // The continuation is per-process and can be consumed by either the tracer or the real
+        // parent, whichever waits for it first.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1560-L1565>
+        if wait_options.contains(WaitOptions::WCONTINUED) && process.wait_continued(wait_options) {
+            return WaitResult::Found(WaitStatus::TraceeContinue(thread.clone()));
         }
     }
 
@@ -315,12 +324,21 @@ fn cleanup_exited_tracee(
     );
 }
 
-/// Checks children for zombie or stopped/continued events.
+/// Checks children for zombie, stopped, or continued processes.
+///
+/// The children of all threads in the current process are checked, or only those of the current
+/// thread with `__WNOTHREAD`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1465-L1566>
 fn try_wait_children(
     child_filter: &ProcessFilter,
     wait_options: WaitOptions,
     ctx: &Context,
 ) -> WaitResult {
+    let is_wnothread = wait_options.contains(WaitOptions::WNOTHREAD);
+    // This is checked before locking the children to keep the lock order.
+    let is_first_alive_thread = is_wnothread && is_first_alive_thread(ctx);
+
     // Acquire the children lock at first to prevent race conditions.
     // We want to ensure that multiple waiting threads
     // do not return the same waited process status.
@@ -328,57 +346,129 @@ fn try_wait_children(
     let children_mut = children_lock.as_mut().unwrap();
 
     let mut fallback_result = WaitResult::NoMatch;
+    // The tracers in the current process whose tracees are children of the current thread.
+    let mut tracers_of_children = Vec::new();
 
     for child in children_mut.values() {
-        if !wait_filter(child.pid(), child, child_filter) {
+        if !wait_filter(child.pid(), child, child_filter) || !is_eligible_child(child, wait_options)
+        {
+            continue;
+        }
+        if is_wnothread && !is_child_of_current_thread(child, is_first_alive_thread, ctx) {
             continue;
         }
 
-        if let Some(tracer) = child.main_thread().as_posix_thread().unwrap().tracer() {
-            // A child traced by a thread in the current process is handled as a tracee.
+        let main_thread = child.main_thread();
+        let main_posix_thread = main_thread.as_posix_thread().unwrap();
+        let tracer = main_posix_thread.tracer();
+
+        if let Some(tracer) = tracer.as_ref()
+            && core::ptr::eq(
+                Weak::as_ptr(tracer.as_posix_thread().unwrap().weak_process()),
+                Arc::as_ptr(&ctx.process),
+            )
+        {
+            // A child traced by a thread in the current process is handled as a tracee. This
+            // also hides the group stop from the real parent, so that a stop is not reported
+            // twice.
             // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1494-L1507>
-            let tracer_process = tracer.as_posix_thread().unwrap().weak_process();
-            if !core::ptr::eq(Weak::as_ptr(tracer_process), Arc::as_ptr(&ctx.process)) {
-                fallback_result = WaitResult::MatchedButUnready;
+            if is_wnothread && !core::ptr::eq(tracer.as_ref(), ctx.thread) {
+                tracers_of_children.push((tracer.clone(), main_posix_thread.tid()));
             }
             continue;
         }
 
         if child.status().is_zombie() {
-            // Without `WEXITED`, a zombie child is skipped as if it did not match.
-            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1192-L1193>
-            if !wait_options.contains(WaitOptions::WEXITED) {
-                continue;
-            }
+            // A zombie child traced by another process is reaped after the tracer reaps or
+            // detaches it.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1509-L1519>
+            if tracer.is_none() {
+                // Without `WEXITED`, a zombie child is skipped as if it did not match.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1192-L1193>
+                if !wait_options.contains(WaitOptions::WEXITED) {
+                    continue;
+                }
 
-            let child = child.clone();
-            if !wait_options.contains(WaitOptions::WNOWAIT) {
-                reap_zombie_child(
-                    child.pid(),
-                    children_mut,
-                    ctx.process.reaped_children_stats(),
-                );
+                let child = child.clone();
+                if !wait_options.contains(WaitOptions::WNOWAIT) {
+                    reap_zombie_child(
+                        child.pid(),
+                        children_mut,
+                        ctx.process.reaped_children_stats(),
+                    );
+                }
+                return WaitResult::Found(WaitStatus::Zombie(child));
             }
-            return WaitResult::Found(WaitStatus::Zombie(child));
         }
 
-        // We have found at least one live child matching `child_filter`.
+        // We have found at least one child matching `child_filter`, whose state may change.
         fallback_result = WaitResult::MatchedButUnready;
 
-        if !wait_options.intersects(WaitOptions::WSTOPPED | WaitOptions::WCONTINUED) {
-            continue;
+        // The real parent waits for group stops even if the child is traced by another process.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1311-L1321>
+        if wait_options.contains(WaitOptions::WSTOPPED)
+            && let Some(sig_num) = child.wait_group_stopped(wait_options)
+        {
+            return WaitResult::Found(WaitStatus::Stop(child.clone(), sig_num));
         }
-        let Some(stop_wait_status) = child.wait_stopped_or_continued(wait_options) else {
-            continue;
-        };
-        let wait_status = match stop_wait_status {
-            StopWaitStatus::Stopped(sig_num) => WaitStatus::Stop(child.clone(), sig_num),
-            StopWaitStatus::Continue => WaitStatus::Continue(child.clone()),
-        };
-        return WaitResult::Found(wait_status);
+        if wait_options.contains(WaitOptions::WCONTINUED) && child.wait_continued(wait_options) {
+            return WaitResult::Found(WaitStatus::Continue(child.clone()));
+        }
+    }
+
+    drop(children_lock);
+
+    // With `__WNOTHREAD`, a child of the current thread traced by another thread in the current
+    // process is not checked in `try_wait_tracees`.
+    for (tracer, tid) in tracers_of_children {
+        let tracer = tracer.as_posix_thread().unwrap();
+        match try_wait_tracees_of(tracer, child_filter, Some(tid), wait_options, ctx) {
+            WaitResult::Found(status) => return WaitResult::Found(status),
+            WaitResult::MatchedButUnready => fallback_result = WaitResult::MatchedButUnready,
+            WaitResult::NoMatch => {}
+        }
     }
 
     fallback_result
+}
+
+/// Returns whether `child` matches `__WALL` and `__WCLONE` in `wait_options`.
+///
+/// A "clone" child is one that sends no `SIGCHLD` to its parent on exit. It is waited for only
+/// with `__WCLONE`, and otherwise only the other children are waited for, unless with `__WALL`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1152-L1177>
+fn is_eligible_child(child: &Process, wait_options: WaitOptions) -> bool {
+    if wait_options.contains(WaitOptions::WALL) {
+        return true;
+    }
+
+    let is_clone_child = child.exit_signal() != Some(SIGCHLD);
+    is_clone_child == wait_options.contains(WaitOptions::WCLONE)
+}
+
+/// Returns whether the current thread is the first alive thread in the current process, which
+/// inherits the children of the exited threads.
+fn is_first_alive_thread(ctx: &Context) -> bool {
+    let tasks = ctx.process.tasks().lock();
+    tasks
+        .as_slice()
+        .iter()
+        .map(|task| task.as_thread().unwrap())
+        .find(|thread| !thread.is_exited())
+        .is_some_and(|thread| core::ptr::eq(thread.as_ref(), ctx.thread))
+}
+
+/// Returns whether `child` is a child of the current thread.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1635-L1643>
+fn is_child_of_current_thread(child: &Process, is_first_alive_thread: bool, ctx: &Context) -> bool {
+    // Lock order: children of process -> parent of process
+    let parent_thread = child.parent().lock().thread().upgrade();
+    match parent_thread {
+        Some(thread) if !thread.is_exited() => core::ptr::eq(thread.as_ref(), ctx.thread),
+        _ => is_first_alive_thread,
+    }
 }
 
 /// Free zombie child with `child_pid`, returns the exit code of child process.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use aster_rights::{ReadDupOp, ReadOp};
 use aster_util::fixed_str::FixedCStr;
@@ -77,6 +77,11 @@ pub struct PosixThread {
     /// The per-thread signal [`Waker`], which will be used to wake up the thread
     /// when enqueuing a signal, along with the reason why the thread is paused.
     signalled_waker: SpinLock<Option<(Arc<Waker>, PauseReason)>>,
+    /// Whether this thread has yet to participate in the group stop in progress
+    /// (`JOBCTL_STOP_PENDING | JOBCTL_STOP_CONSUME` in Linux).
+    ///
+    /// This is only modified with the lock of the process's stop status held.
+    group_stop_pending: AtomicBool,
 
     // Time
     /// A profiling clock measures the user CPU time and kernel CPU time in the thread.
@@ -246,6 +251,11 @@ impl PosixThread {
             (None, true) => SleepingState::Uninterruptible,
             (_, false) => SleepingState::Running,
         }
+    }
+
+    /// Returns whether this thread has yet to participate in the group stop in progress.
+    pub(in crate::process) fn group_stop_pending(&self) -> &AtomicBool {
+        &self.group_stop_pending
     }
 
     /// Wakes up the signalled waker.

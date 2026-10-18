@@ -64,6 +64,7 @@ fn exit_internal(
     let thread_local = current_task.as_thread_local().unwrap();
     let posix_process = posix_thread.process();
 
+    let mut group_stop_done = None;
     let is_last_thread = {
         let mut tasks = posix_process.tasks().lock();
         let has_exited_group = tasks.has_exited_group();
@@ -72,6 +73,7 @@ fn exit_internal(
         if is_exiting_group && !has_exited_group && !in_evecve {
             sigkill_other_threads(&current_task, &tasks);
             tasks.set_exited_group();
+            posix_process.clear_group_stop_for_group_exit(&tasks);
         }
 
         // According to Linux's behavior, the last thread's exit code will become the process's
@@ -89,8 +91,21 @@ fn exit_internal(
         }
         current_thread.exit();
 
-        tasks.remove_exited(&current_task)
+        let is_last_thread = tasks.remove_exited(&current_task);
+
+        // An exiting thread participates in the group stop in progress, so that the group stop
+        // can complete without it.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L3221-L3231>
+        if !is_last_thread && !tasks.has_exited_group() {
+            group_stop_done = posix_process.participate_group_stop(posix_thread);
+        }
+
+        is_last_thread
     };
+
+    if let Some(sig_num) = group_stop_done {
+        posix_process.notify_parent_of_group_stop(sig_num);
+    }
 
     // This is put after `current_thread.exit()`,
     // so `attach_tracee` will observe that the tracer has exited while

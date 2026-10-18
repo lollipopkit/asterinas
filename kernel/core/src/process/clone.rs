@@ -35,7 +35,7 @@ use crate::{
     },
     sched::Nice,
     security::audit,
-    thread::{AsThread, Tid},
+    thread::{AsThread, Thread, Tid},
     vm::vmar::{Vmar, VmarHandle},
 };
 
@@ -497,16 +497,16 @@ fn clone_child_task(
         thread_builder.build()
     };
 
-    process
-        .tasks()
-        .lock()
-        .insert(child_task.clone())
-        .map_err(|_| {
-            Error::with_message(
-                Errno::EINTR,
-                "the process has exited or has already executed a new program",
-            )
-        })?;
+    let mut tasks = process.tasks().lock();
+    tasks.insert(child_task.clone()).map_err(|_| {
+        Error::with_message(
+            Errno::EINTR,
+            "the process has exited or has already executed a new program",
+        )
+    })?;
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2527-L2534>
+    process.join_group_stop(child_task.as_posix_thread().unwrap());
+    drop(tasks);
 
     let child_thread = child_task.as_thread().unwrap();
     pid_table::pid_table_mut().insert_thread(child_tid, child_thread);
@@ -668,7 +668,7 @@ fn clone_child_process(
     audit::on_fork(process, &child);
 
     // Sets parent process and group for child process.
-    set_parent_and_group(clone_flags, process, &child);
+    set_parent_and_group(clone_flags, ctx, &child);
 
     Ok(child)
 }
@@ -900,9 +900,11 @@ fn create_child_process(
     child_proc
 }
 
-fn set_parent_and_group(clone_flags: CloneFlags, parent: &Arc<Process>, child: &Arc<Process>) {
+fn set_parent_and_group(clone_flags: CloneFlags, ctx: &Context, child: &Arc<Process>) {
+    let parent = &ctx.process;
+
     loop {
-        let real_parent = clone_parent(clone_flags, parent);
+        let (real_parent, real_parent_thread) = clone_parent(clone_flags, ctx);
 
         // Lock the parent's children before checking its status.
         let mut children_mut = real_parent.children().lock();
@@ -915,7 +917,10 @@ fn set_parent_and_group(clone_flags: CloneFlags, parent: &Arc<Process>, child: &
         };
 
         // Lock order: children of process -> parent of process
-        child.parent().lock().set_process(&real_parent);
+        child
+            .parent()
+            .lock()
+            .set_process_and_thread(&real_parent, real_parent_thread);
 
         // Update `has_child_subreaper` for the child process to
         // make sure the `has_child_subreaper` state of the child process
@@ -950,12 +955,25 @@ fn set_parent_and_group(clone_flags: CloneFlags, parent: &Arc<Process>, child: &
     }
 }
 
-fn clone_parent(clone_flags: CloneFlags, current: &Arc<Process>) -> Cow<'_, Arc<Process>> {
+/// Returns the real parent process and the real parent thread of the new child process.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2443-L2449>
+fn clone_parent<'a>(
+    clone_flags: CloneFlags,
+    ctx: &'a Context,
+) -> (Cow<'a, Arc<Process>>, Weak<Thread>) {
     if clone_flags.contains(CloneFlags::CLONE_PARENT) {
         // The parent process of the current process cannot be `None`, since we have checked that
         // the current process is not the init process.
-        Cow::Owned(current.parent().lock().process().upgrade().unwrap())
+        let parent = ctx.process.parent().lock();
+        (
+            Cow::Owned(parent.process().upgrade().unwrap()),
+            parent.thread().clone(),
+        )
     } else {
-        Cow::Borrowed(current)
+        (
+            Cow::Borrowed(&ctx.process),
+            Arc::downgrade(ctx.task.as_thread().unwrap()),
+        )
     }
 }

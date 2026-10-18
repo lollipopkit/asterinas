@@ -33,12 +33,6 @@ Supported functionality in SCML:
 {{#include wait4.scml}}
 ```
 
-Ignored options:
-* `WEXITED`
-* `WNOTHREAD`
-* `WALL`
-* `WCLONE`
-
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/wait4.2.html).
 
@@ -74,9 +68,6 @@ Supported functionality in SCML:
 ```c
 {{#include waitid.scml}}
 ```
-
-Ignored options:
-* `WEXITED`
 
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/waitid.2.html).
@@ -116,7 +107,6 @@ Limitations:
 * `PTRACE_PEEKUSER` and `PTRACE_POKEUSER` only support offsets for general-purpose registers.
 * `PTRACE_O_TRACESECCOMP` is accepted but never reports events,
   and `PTRACE_O_SUSPEND_SECCOMP` is rejected with `EINVAL`, because seccomp is not supported.
-* A tracer cannot wait for the `CLD_CONTINUED` state of a tracee with `WCONTINUED`.
 
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/ptrace.2.html).

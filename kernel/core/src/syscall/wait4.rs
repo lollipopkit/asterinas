@@ -67,7 +67,7 @@ fn calculate_status_code(wait_status: &WaitStatus) -> u32 {
     match wait_status {
         WaitStatus::Zombie(process) => process.status().exit_code(),
         WaitStatus::Stop(_, sig_num) => ((sig_num.as_u8() as u32) << 8) | 0x7f,
-        WaitStatus::Continue(_) => 0xffff,
+        WaitStatus::Continue(_) | WaitStatus::TraceeContinue(_) => 0xffff,
         WaitStatus::TraceeExit(_, exit_code) => *exit_code,
         WaitStatus::TraceeStop(_, status) => status.to_wait4_status(),
     }

@@ -72,7 +72,9 @@ fn calculate_si_code_and_si_status(wait_status: &WaitStatus) -> (i32, i32) {
     match wait_status {
         WaitStatus::Zombie(process) => decode_exit_code(process.status().exit_code()),
         WaitStatus::Stop(_process, signum) => (CLD_STOPPED, signum.as_u8() as i32),
-        WaitStatus::Continue(_) => (CLD_CONTINUED, SIGCONT.as_u8() as i32),
+        WaitStatus::Continue(_) | WaitStatus::TraceeContinue(_) => {
+            (CLD_CONTINUED, SIGCONT.as_u8() as i32)
+        }
         WaitStatus::TraceeExit(_, exit_code) => decode_exit_code(*exit_code),
         WaitStatus::TraceeStop(_, status) => (CLD_TRAPPED, status.to_waitid_si_status()),
     }

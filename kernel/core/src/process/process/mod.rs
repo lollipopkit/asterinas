@@ -10,7 +10,7 @@ use spin::Once;
 use self::timer_manager::PosixTimerManager;
 use super::{
     pid_table::{self, PidTable},
-    posix_thread::{AsPosixThread, FIRST_POSIX_TID},
+    posix_thread::{AsPosixThread, FIRST_POSIX_TID, PosixThread},
     process_vm::ProcessVmarGuard,
     rlimit::ResourceLimits,
     sigchld::{self, ChildSource},
@@ -23,7 +23,7 @@ use super::{
         sig_num::{AtomicSigNum, SigNum},
         signals::Signal,
     },
-    status::ProcessStatus,
+    status::{ProcessStatus, StopNotification},
     task_set::TaskSet,
 };
 use crate::{
@@ -33,7 +33,6 @@ use crate::{
     process::{
         UserNamespace, WaitOptions,
         signal::{Pollee, sig_queues::SigQueues},
-        status::StopWaitStatus,
     },
     sched::{AtomicNice, Nice},
     thread::{AsThread, Thread},
@@ -189,9 +188,23 @@ impl Drop for Process {
 ///
 /// The benefit of using `ParentProcess` over `(Mutex<Weak<Process>>, AtomicPid,)` is to
 /// enforce the invariant that the cached PID and the weak reference are always kept in sync.
+///
+/// The thread in the parent process that the process is a child of is also recorded (as the
+/// `real_parent` of Linux, which is a thread).
 pub(crate) struct ParentProcess {
-    process: Mutex<Weak<Process>>,
+    inner: Mutex<ParentInner>,
     pid: AtomicPid,
+}
+
+struct ParentInner {
+    process: Weak<Process>,
+    /// The parent thread, or `Weak::new()` if it is the first alive thread of the parent.
+    ///
+    /// Linux reparents the children of an exiting thread to the first alive thread in its
+    /// thread group. Here, the first alive thread is looked up when it is needed.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L648-L655>
+    thread: Weak<Thread>,
 }
 
 impl ParentProcess {
@@ -202,7 +215,10 @@ impl ParentProcess {
         };
 
         Self {
-            process: Mutex::new(process),
+            inner: Mutex::new(ParentInner {
+                process,
+                thread: Weak::new(),
+            }),
             pid: AtomicPid::new(pid),
         }
     }
@@ -213,26 +229,46 @@ impl ParentProcess {
 
     pub(crate) fn lock(&self) -> ParentProcessGuard<'_> {
         ParentProcessGuard {
-            guard: self.process.lock(),
+            guard: self.inner.lock(),
             this: self,
         }
     }
 }
 
 pub(crate) struct ParentProcessGuard<'a> {
-    guard: MutexGuard<'a, Weak<Process>>,
+    guard: MutexGuard<'a, ParentInner>,
     this: &'a ParentProcess,
 }
 
 impl ParentProcessGuard<'_> {
     pub(crate) fn process(&self) -> &Weak<Process> {
-        &self.guard
+        &self.guard.process
+    }
+
+    /// Returns the parent thread in the parent process.
+    ///
+    /// If the parent thread has exited or is `Weak::new()`, the first alive thread in the parent
+    /// process is the parent thread.
+    pub(crate) fn thread(&self) -> &Weak<Thread> {
+        &self.guard.thread
     }
 
     /// Update both pid and weak ref.
+    ///
+    /// The parent thread becomes the first alive thread in `new_process`.
     pub(crate) fn set_process(&mut self, new_process: &Arc<Process>) {
+        self.set_process_and_thread(new_process, Weak::new());
+    }
+
+    /// Updates the parent process and the parent thread in it.
+    pub(crate) fn set_process_and_thread(
+        &mut self,
+        new_process: &Arc<Process>,
+        new_thread: Weak<Thread>,
+    ) {
         self.this.pid.store(new_process.pid(), Ordering::Relaxed);
-        *self.guard = Arc::downgrade(new_process);
+        self.guard.process = Arc::downgrade(new_process);
+        self.guard.thread = new_thread;
     }
 }
 
@@ -801,70 +837,149 @@ impl Process {
         }
     }
 
-    /// Stops the process.
+    /// Initiates a group stop with `sig_num`.
     ///
-    /// Traced threads do not stop here. Instead, they will trap into the group-stop and
-    /// report it to their tracers, even if the process has already been stopped.
+    /// Each thread participates in the group stop when it stops, or, if it is traced, when it
+    /// traps into the group stop and reports it to its tracer. The real parent is notified when
+    /// all the threads have participated.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2638-L2742>
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2643-L2696>
     pub(crate) fn stop(&self, sig_num: SigNum) {
-        if self.status.stop_status().stop(sig_num) {
-            self.notify_parent_of_stop(CLD_STOPPED, sig_num.as_u8() as i32);
+        let tasks = self.tasks.lock();
+        if tasks.has_exited_group() || tasks.in_execve() {
+            return;
         }
 
-        for task in self.tasks.lock().as_slice() {
+        // Threads that are exiting or will be killed do not participate.
+        let threads = tasks
+            .as_slice()
+            .iter()
+            .map(|task| {
+                let posix_thread = task.as_posix_thread().unwrap();
+                let participates =
+                    !task.as_thread().unwrap().is_exited() && !posix_thread.has_pending_sigkill();
+                (posix_thread, participates)
+            })
+            .collect::<Vec<_>>();
+        self.status.stop_status().stop(sig_num, threads.into_iter());
+
+        for task in tasks.as_slice() {
             let posix_thread = task.as_posix_thread().unwrap();
             posix_thread.ptrace_notify_group_stop(sig_num);
+            posix_thread.wake_signalled_waker();
         }
+    }
+
+    /// Makes `thread` participate in the group stop in progress, if it has yet to.
+    ///
+    /// Returns the stop signal if the group stop completes. If so, the caller should notify the
+    /// real parent with [`Self::notify_parent_of_group_stop`].
+    pub(crate) fn participate_group_stop(&self, thread: &PosixThread) -> Option<SigNum> {
+        self.status.stop_status().participate(thread)
+    }
+
+    /// Makes the new `thread` join the group stop in progress, if any.
+    pub(super) fn join_group_stop(&self, thread: &PosixThread) {
+        self.status.stop_status().join(thread);
+    }
+
+    /// Clears the group stop states because the process is exiting as a group.
+    pub(in crate::process) fn clear_group_stop_for_group_exit(&self, tasks: &TaskSet) {
+        let threads = tasks
+            .as_slice()
+            .iter()
+            .map(|task| task.as_posix_thread().unwrap());
+        self.status.stop_status().clear_for_group_exit(threads);
+    }
+
+    /// Makes the threads no longer participate in the group stop in progress, because the
+    /// process is executing a new program.
+    pub(in crate::process) fn cancel_group_stop_for_execve(&self, tasks: &TaskSet) {
+        let threads = tasks
+            .as_slice()
+            .iter()
+            .map(|task| task.as_posix_thread().unwrap());
+        self.status.stop_status().cancel_participation(threads);
+    }
+
+    /// Notifies the real parent of the completion of a group stop with `sig_num`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2721-L2725>
+    pub(crate) fn notify_parent_of_group_stop(&self, sig_num: SigNum) {
+        self.notify_parent_of_stop(CLD_STOPPED, sig_num, false);
     }
 
     /// Resumes the stopped process.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L918-L957>
     fn resume(&self) {
-        if self.status.stop_status().resume() {
-            self.notify_parent_of_stop(CLD_CONTINUED, SIGCONT.as_u8() as i32);
+        let tasks = self.tasks.lock();
+        let threads = tasks
+            .as_slice()
+            .iter()
+            .map(|task| task.as_posix_thread().unwrap());
+        let notification = self.status.stop_status().resume(threads);
 
-            // Note that the resume function is called by the thread which deals with SIGCONT,
-            // since SIGCONT is handled by any thread in this process, we need to wake
-            // up other stopped threads in the same process.
-            for task in self.tasks.lock().as_slice() {
-                let posix_thread = task.as_posix_thread().unwrap();
-                posix_thread.wake_signalled_waker();
+        // Note that the resume function is called by the thread which deals with SIGCONT,
+        // since SIGCONT is handled by any thread in this process, we need to wake
+        // up other stopped threads in the same process.
+        for task in tasks.as_slice() {
+            let posix_thread = task.as_posix_thread().unwrap();
+            posix_thread.wake_signalled_waker();
+        }
+        drop(tasks);
+
+        match notification {
+            Some(StopNotification::Stopped(sig_num)) => {
+                self.notify_parent_of_stop(CLD_STOPPED, sig_num, true)
             }
+            Some(StopNotification::Continued) => {
+                self.notify_parent_of_stop(CLD_CONTINUED, SIGCONT, true)
+            }
+            None => {}
         }
     }
 
-    /// Returns whether the process is stopped.
+    /// Returns whether a group stop is in effect.
     pub(crate) fn is_stopped(&self) -> bool {
         self.status.stop_status().is_stopped()
     }
 
-    /// Returns the signal that has stopped the process, if the process is stopped.
+    /// Returns the signal of the group stop in effect, if any.
     pub(in crate::process) fn stop_signal(&self) -> Option<SigNum> {
         self.status.stop_status().stop_signal()
     }
 
-    /// Gets and clears the stop status changes for the `wait` syscall.
-    pub(super) fn wait_stopped_or_continued(&self, options: WaitOptions) -> Option<StopWaitStatus> {
-        self.status.stop_status().wait(options)
+    /// Returns the stop signal of the completed group stop for the `wait` syscall.
+    ///
+    /// The status is consumed unless `options` contains `WNOWAIT`.
+    pub(super) fn wait_group_stopped(&self, options: WaitOptions) -> Option<SigNum> {
+        self.status.stop_status().wait_stopped(options)
+    }
+
+    /// Returns whether the process has been continued for the `wait` syscall.
+    ///
+    /// The status is consumed unless `options` contains `WNOWAIT`.
+    pub(super) fn wait_continued(&self, options: WaitOptions) -> bool {
+        self.status.stop_status().wait_continued(options)
     }
 
     /// Notifies the real parent of a job control stop or continuation.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2721-L2725>
-    /// and <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2939-L2944>
+    /// If `notify_tracer` is true, the tracer of the main thread is notified as well, if it is
+    /// not in the real parent. Otherwise, tracers are notified of group stops by the traps of
+    /// their tracees.
     ///
-    /// The tracer of the main thread is notified of a continuation as well, if it is not in
-    /// the real parent. Tracers are notified of group-stops by the traps of their tracees.
-    ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2941-L2943>
-    fn notify_parent_of_stop(&self, code: i32, status: i32) {
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2939-L2944>
+    fn notify_parent_of_stop(&self, code: i32, sig_num: SigNum, notify_tracer: bool) {
+        let status = sig_num.as_u8() as i32;
         let parent = self.parent.lock().process().upgrade().unwrap();
         let main_thread = self.main_thread();
         let main_posix_thread = main_thread.as_posix_thread().unwrap();
         let child = ChildSource::Thread(main_posix_thread);
         sigchld::notify_parent_of_stop(child, &parent, code, status);
 
-        if code != CLD_CONTINUED {
+        if !notify_tracer {
             return;
         }
         if let Some(tracer) = main_posix_thread.tracer() {

@@ -87,6 +87,7 @@ pub(crate) fn do_execve(
 
     // Terminate all other threads
     sigkill_other_threads(ctx.task, &task_set);
+    ctx.process.cancel_group_stop_for_execve(&task_set);
     drop(task_set);
 
     let former_tid = ctx.posix_thread.tid();

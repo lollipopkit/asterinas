@@ -2,12 +2,12 @@
 
 //! The process status.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use ostd::sync::SpinLock;
 
 use super::ExitCode;
-use crate::process::{WaitOptions, signal::sig_num::SigNum};
+use crate::process::{WaitOptions, posix_thread::PosixThread, signal::sig_num::SigNum};
 
 /// The status of a process.
 ///
@@ -84,110 +84,238 @@ impl ProcessStatus {
     }
 }
 
+/// The group stop status of a process.
+///
+/// This combines the process-wide job control states that Linux keeps in `signal_struct`.
 #[derive(Debug)]
 pub(super) struct StopStatus {
-    /// Indicates whether the process is stopped.
-    is_stopped: AtomicBool,
-
-    /// The signal that has stopped the process, or zero if the process is not stopped.
-    stop_signal: AtomicU8,
-
-    /// Indicates whether the process's status has changed and has not yet been waited on.
+    /// Whether a group stop is in effect, i.e., whether [`GroupStop::signal`] is `Some(_)`.
     ///
-    /// User programs may use the wait* syscalls to check for changes in
-    /// the process's status. This field will be set to `Some(_)` once the
-    /// process's status changes and will be set to `None` if the process
-    /// has already been waited on.
-    wait_status: SpinLock<Option<StopWaitStatus>>,
+    /// This is used for checks that need no lock.
+    is_stopped: AtomicBool,
+    group_stop: SpinLock<GroupStop>,
+}
+
+#[derive(Debug)]
+struct GroupStop {
+    /// The signal of the group stop in effect (`JOBCTL_STOP_SIGMASK`).
+    signal: Option<SigNum>,
+    /// The number of threads that have yet to participate in the group stop
+    /// (`group_stop_count`).
+    count: usize,
+    /// Whether the group stop has completed (`SIGNAL_STOP_STOPPED`).
+    is_completed: bool,
+    /// Whether the process has been continued and the continuation has not yet been waited
+    /// for (`SIGNAL_STOP_CONTINUED`).
+    is_continued: bool,
+    /// The stop signal for the real parent to wait for, or `None` if it has been waited for
+    /// (`group_exit_code`).
+    exit_code: Option<SigNum>,
+}
+
+/// A notification of a group stop or continuation to the real parent.
+pub(super) enum StopNotification {
+    /// `CLD_STOPPED` with the stop signal.
+    Stopped(SigNum),
+    /// `CLD_CONTINUED`.
+    Continued,
 }
 
 impl StopStatus {
     pub(self) const fn new() -> Self {
         Self {
             is_stopped: AtomicBool::new(false),
-            stop_signal: AtomicU8::new(0),
-            wait_status: SpinLock::new(None),
+            group_stop: SpinLock::new(GroupStop {
+                signal: None,
+                count: 0,
+                is_completed: false,
+                is_continued: false,
+                exit_code: None,
+            }),
         }
     }
 
-    /// Stops the process by some signal.
+    /// Initiates a group stop with `sig_num`.
     ///
-    /// The return value indicates whether the stop status has changed.
-    pub(super) fn stop(&self, signum: SigNum) -> bool {
-        // Hold the lock first to avoid race conditions
-        let mut wait_status = self.wait_status.lock();
-
-        if self.is_stopped.load(Ordering::Relaxed) {
-            false
-        } else {
-            self.is_stopped.store(true, Ordering::Relaxed);
-            self.stop_signal.store(signum.as_u8(), Ordering::Relaxed);
-            *wait_status = Some(StopWaitStatus::Stopped(signum));
-            true
-        }
-    }
-
-    /// Resumes the process.
+    /// Each thread in `threads` is paired with whether it should participate in the group stop.
+    /// The group stop completes when all the participating threads have called
+    /// [`Self::participate`].
     ///
-    /// The return value indicates whether the stop status has changed.
-    pub(super) fn resume(&self) -> bool {
-        // Hold the lock first to avoid race conditions
-        let mut wait_status = self.wait_status.lock();
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2643-L2696>
+    pub(super) fn stop<'a>(
+        &self,
+        sig_num: SigNum,
+        threads: impl Iterator<Item = (&'a PosixThread, bool)>,
+    ) {
+        let mut group_stop = self.group_stop.lock();
 
-        if self.is_stopped.load(Ordering::Relaxed) {
-            self.is_stopped.store(false, Ordering::Relaxed);
-            self.stop_signal.store(0, Ordering::Relaxed);
-            *wait_status = Some(StopWaitStatus::Continue);
-            true
-        } else {
-            false
+        // A traced thread may initiate a new group stop when the previous one has completed. Do
+        // not report the new one to the real parent in such case.
+        if !group_stop.is_completed {
+            group_stop.exit_code = Some(sig_num);
+        }
+        group_stop.signal = Some(sig_num);
+        self.is_stopped.store(true, Ordering::Relaxed);
+
+        group_stop.count = 0;
+        for (thread, participates) in threads {
+            thread
+                .group_stop_pending()
+                .store(participates, Ordering::Relaxed);
+            if participates {
+                group_stop.count += 1;
+            }
         }
     }
 
-    /// Returns whether the process is stopped.
+    /// Makes `thread` participate in the group stop in progress, if it has yet to.
+    ///
+    /// Returns the stop signal if the group stop completes, in which case the real parent should
+    /// be notified.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L361-L385>
+    pub(super) fn participate(&self, thread: &PosixThread) -> Option<SigNum> {
+        let mut group_stop = self.group_stop.lock();
+
+        if !thread.group_stop_pending().swap(false, Ordering::Relaxed) {
+            return None;
+        }
+
+        // The count may be reset to zero by `execve`.
+        group_stop.count = group_stop.count.saturating_sub(1);
+        if group_stop.count != 0 || group_stop.is_completed {
+            return None;
+        }
+        group_stop.is_completed = true;
+        group_stop.is_continued = false;
+
+        group_stop.exit_code.or(group_stop.signal)
+    }
+
+    /// Makes the new `thread` join the group stop in progress, if any.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L387-L399>
+    pub(super) fn join(&self, thread: &PosixThread) {
+        let mut group_stop = self.group_stop.lock();
+
+        if group_stop.count > 0 {
+            group_stop.count += 1;
+            thread.group_stop_pending().store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Ends the group stop in effect because `SIGCONT` is generated.
+    ///
+    /// Returns the notification to the real parent, if any. If the group stop has not completed,
+    /// it is reported as completed (since `SIGCHLD` does not queue, the following continuation
+    /// is not reported).
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L918-L957>
+    pub(super) fn resume<'a>(
+        &self,
+        threads: impl Iterator<Item = &'a PosixThread>,
+    ) -> Option<StopNotification> {
+        let mut group_stop = self.group_stop.lock();
+
+        for thread in threads {
+            thread.group_stop_pending().store(false, Ordering::Relaxed);
+        }
+
+        let notification = if group_stop.is_completed {
+            Some(StopNotification::Continued)
+        } else if group_stop.count > 0 {
+            group_stop
+                .exit_code
+                .or(group_stop.signal)
+                .map(StopNotification::Stopped)
+        } else {
+            None
+        };
+        if notification.is_some() {
+            group_stop.is_completed = false;
+            group_stop.is_continued = true;
+            group_stop.count = 0;
+            group_stop.exit_code = None;
+        }
+
+        group_stop.signal = None;
+        self.is_stopped.store(false, Ordering::Relaxed);
+
+        notification
+    }
+
+    /// Makes `threads` no longer participate in the group stop in progress, because the process
+    /// is executing a new program.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L1381-L1389>
+    pub(super) fn cancel_participation<'a>(&self, threads: impl Iterator<Item = &'a PosixThread>) {
+        let mut group_stop = self.group_stop.lock();
+
+        group_stop.count = 0;
+        for thread in threads {
+            thread.group_stop_pending().store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Clears the group stop states because the process is exiting as a group.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L1039-L1045>
+    pub(super) fn clear_for_group_exit<'a>(&self, threads: impl Iterator<Item = &'a PosixThread>) {
+        let mut group_stop = self.group_stop.lock();
+
+        for thread in threads {
+            thread.group_stop_pending().store(false, Ordering::Relaxed);
+        }
+        group_stop.signal = None;
+        group_stop.count = 0;
+        group_stop.is_completed = false;
+        group_stop.is_continued = false;
+        group_stop.exit_code = None;
+        self.is_stopped.store(false, Ordering::Relaxed);
+    }
+
+    /// Returns whether a group stop is in effect.
     pub(super) fn is_stopped(&self) -> bool {
         self.is_stopped.load(Ordering::Relaxed)
     }
 
-    /// Returns the signal that has stopped the process, if the process is stopped.
+    /// Returns the signal of the group stop in effect, if any.
     pub(super) fn stop_signal(&self) -> Option<SigNum> {
-        // Hold the lock to read a consistent state.
-        let _wait_status = self.wait_status.lock();
-
-        let sig_num = self.stop_signal.load(Ordering::Relaxed);
-        (sig_num != 0).then(|| SigNum::from_u8(sig_num))
+        self.group_stop.lock().signal
     }
 
-    /// Returns the stop status changes for the `wait` syscall.
-    pub(super) fn wait(&self, options: WaitOptions) -> Option<StopWaitStatus> {
-        let mut wait_status = self.wait_status.lock();
+    /// Returns the stop signal of the completed group stop for the `wait` syscall,
+    /// and consumes it unless `options` contains `WNOWAIT`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1311-L1373>
+    pub(super) fn wait_stopped(&self, options: WaitOptions) -> Option<SigNum> {
+        let mut group_stop = self.group_stop.lock();
 
-        if options.contains(WaitOptions::WSTOPPED)
-            && let Some(StopWaitStatus::Stopped(_)) = wait_status.as_ref()
-        {
-            return if options.contains(WaitOptions::WNOWAIT) {
-                wait_status.as_ref().cloned()
-            } else {
-                wait_status.take()
-            };
+        if !group_stop.is_completed {
+            return None;
+        }
+        let exit_code = group_stop.exit_code?;
+        if !options.contains(WaitOptions::WNOWAIT) {
+            group_stop.exit_code = None;
         }
 
-        if options.contains(WaitOptions::WCONTINUED)
-            && let Some(StopWaitStatus::Continue) = wait_status.as_ref()
-        {
-            return if options.contains(WaitOptions::WNOWAIT) {
-                wait_status.as_ref().cloned()
-            } else {
-                wait_status.take()
-            };
-        }
-
-        None
+        Some(exit_code)
     }
-}
 
-#[derive(Clone, Debug)]
-pub(super) enum StopWaitStatus {
-    Stopped(SigNum),
-    Continue,
+    /// Returns whether the process has been continued for the `wait` syscall,
+    /// and consumes the continuation unless `options` contains `WNOWAIT`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1413-L1433>
+    pub(super) fn wait_continued(&self, options: WaitOptions) -> bool {
+        let mut group_stop = self.group_stop.lock();
+
+        if !group_stop.is_continued {
+            return false;
+        }
+        if !options.contains(WaitOptions::WNOWAIT) {
+            group_stop.is_continued = false;
+        }
+
+        true
+    }
 }

@@ -75,7 +75,7 @@ pub(crate) fn create_new_user_task(
         let is_group_stopped = || ctx.process.is_stopped() && !ctx.posix_thread.is_traced();
 
         let handle_signals = |user_ctx: &mut UserContext| {
-            let mut is_handled = handle_pending_signal(user_ctx, &ctx);
+            let mut is_handled = false;
 
             // Handle signals while the thread is stopped
             // FIXME: Currently, we handle all signals when the process is stopped.
@@ -84,18 +84,27 @@ pub(crate) fn create_new_user_task(
             // Certain signals, such as SIGKILL, should be handled even if the process is stopped.
             // We need to further investigate Linux behavior regarding which signals should be handled
             // when the thread is stopped.
-            while !current_thread.is_exited() {
-                if ctx.posix_thread.ptrace_has_pending_trap() {
-                    // The trap is taken in `handle_pending_signal`.
-                } else if is_group_stopped() {
+            loop {
+                // As in Linux, a thread participates in the group stop before handling signals.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2698-L2732>
+                if !ctx.posix_thread.ptrace_has_pending_trap() && is_group_stopped() {
+                    if let Some(sig_num) = ctx.process.participate_group_stop(ctx.posix_thread) {
+                        ctx.process.notify_parent_of_group_stop(sig_num);
+                    }
                     let _ = stop_waiter.pause_until_by(
                         || (!is_group_stopped()).then_some(()),
                         PauseReason::StopBySignal,
                     );
-                } else {
+                }
+
+                // The trap is taken in `handle_pending_signal`.
+                is_handled |= handle_pending_signal(user_ctx, &ctx);
+
+                if current_thread.is_exited()
+                    || (!ctx.posix_thread.ptrace_has_pending_trap() && !is_group_stopped())
+                {
                     break;
                 }
-                is_handled |= handle_pending_signal(user_ctx, &ctx);
             }
 
             // The restart decision is deferred until the thread is continued, so that a user

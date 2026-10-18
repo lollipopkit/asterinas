@@ -52,6 +52,7 @@ fi
 ./ptrace/ptrace
 ./ptrace/seize
 ./ptrace/set_options
+./ptrace/stop_wait
 
 if [ "$(uname -m)" = "x86_64" ]; then
     ./ptrace/debugger
@@ -90,3 +91,4 @@ fi
 ./pidfd
 ./pidfd_getfd
 ./wait4
+./wait_flags
