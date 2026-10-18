@@ -46,7 +46,25 @@ impl ToFaultSignal for CpuException {
                 // Reference: <https://elixir.bootlin.com/linux/v7.0/source/arch/x86/kernel/traps.c#L387>
                 (SIGSEGV, SI_KERNEL, None)
             }
+            CpuException::BoundRangeExceeded => {
+                // Linux uses `SI_KERNEL` without an address.
+                //
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/traps.c#L718-L731>
+                (SIGSEGV, SI_KERNEL, None)
+            }
             CpuException::InvalidOpcode => (SIGILL, ILL_ILLOPN, Some(rip)),
+            CpuException::CoprocessorSegmentOverrun => {
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/traps.c#L500-L504>
+                (SIGFPE, SI_KERNEL, None)
+            }
+            CpuException::InvalidTss(..) => {
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/traps.c#L506-L510>
+                (SIGSEGV, SI_KERNEL, None)
+            }
+            CpuException::SegmentNotPresent(..) => {
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/traps.c#L512-L516>
+                (SIGBUS, SI_KERNEL, None)
+            }
             CpuException::StackSegmentFault(..) => {
                 // Linux uses `SI_KERNEL` without an address.
                 //
@@ -82,6 +100,10 @@ impl ToFaultSignal for CpuException {
                 //
                 // Reference: <https://elixir.bootlin.com/linux/v7.0/source/arch/x86/kernel/traps.c#L538-L539>
                 (SIGBUS, BUS_ADRALN, None)
+            }
+            CpuException::ControlProtectionException => {
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/cet.c#L48-L81>
+                (SIGSEGV, SEGV_CPERR, Some(0))
             }
 
             _ => return None,
