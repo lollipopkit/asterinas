@@ -63,7 +63,12 @@ pub(crate) trait HandlePendingSignal {
     /// Note that ignored but not blocked signals may be dequeued silently.
     fn has_pending(&self) -> bool;
 
-    /// Returns if a SIGKILL signal is pending.
+    /// Returns if a fatal signal is pending.
+    ///
+    /// A fatal signal kills every thread with a thread-directed `SIGKILL` (see
+    /// `Process::complete_signal`), so only the thread-directed queue is checked.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/sched/signal.h#L399-L402>
     fn has_pending_sigkill(&self) -> bool;
 
     /// Dequeues the next pending signal that is not masked by `mask`.
@@ -84,8 +89,7 @@ impl HandlePendingSignal for Context<'_> {
     }
 
     fn has_pending_sigkill(&self) -> bool {
-        self.posix_thread.sig_queues().has_pending_signal(SIGKILL)
-            || self.process.sig_queues().has_pending_signal(SIGKILL)
+        self.posix_thread.has_pending_sigkill()
     }
 
     fn dequeue_signal(&self, mask: &SigMask) -> Option<DequeuedSignal> {
@@ -114,7 +118,6 @@ impl HandlePendingSignal for PosixThread {
 
     fn has_pending_sigkill(&self) -> bool {
         self.sig_queues().has_pending_signal(SIGKILL)
-            || self.process().sig_queues().has_pending_signal(SIGKILL)
     }
 
     fn dequeue_signal(&self, mask: &SigMask) -> Option<DequeuedSignal> {

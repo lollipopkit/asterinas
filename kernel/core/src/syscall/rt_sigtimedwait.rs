@@ -74,7 +74,10 @@ pub(super) fn sys_rt_sigtimedwait(
         return Ok(SyscallReturn::Return(signal.num().as_u8() as _));
     }
 
-    with_sigmask_changed(
+    // The signals waited for are not fatal while being waited for.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L3857-L3867>
+    ctx.posix_thread.set_real_blocked(block_list);
+    let res = with_sigmask_changed(
         ctx,
         |sig_mask| sig_mask & mask,
         || {
@@ -100,7 +103,10 @@ pub(super) fn sys_rt_sigtimedwait(
 
             Ok(SyscallReturn::Return(signal.num().as_u8() as _))
         },
-    )
+    );
+    ctx.posix_thread.set_real_blocked(SigMask::new_empty());
+
+    res
 }
 
 /// Dequeue a signal from the thread's pending signal queue.

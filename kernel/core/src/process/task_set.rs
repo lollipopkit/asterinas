@@ -91,8 +91,10 @@ impl TaskSet {
     }
 
     /// Sets a flag that denotes that an `exit_group` has been initiated.
+    ///
+    /// This may happen during an `execve` if a fatal signal is generated, which kills the thread
+    /// executing the new program as well.
     pub(super) fn set_exited_group(&mut self) {
-        debug_assert!(!self.in_execve);
         self.has_exited_group = true;
     }
 

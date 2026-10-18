@@ -49,7 +49,7 @@ pub(crate) trait Pause: WaitTimeout {
     /// This pause happens due to the reason specified. If the reason is `PauseReason::Sleep`,
     /// the caller should use `pause_until` straightforwardly.
     ///
-    /// If the reason is `PauseReason::StopByPtrace`, it can only be interrupted by `SIGKILL`.
+    /// If the reason is not `PauseReason::Sleep`, it can only be interrupted by `SIGKILL`.
     ///
     /// # Errors
     ///
@@ -148,8 +148,10 @@ impl Pause for Waiter {
 
         let cancel_cond = || {
             let has_pending = match reason {
-                PauseReason::StopByPtrace => posix_thread.has_pending_sigkill(),
-                _ => posix_thread.has_pending(),
+                PauseReason::Sleep => posix_thread.has_pending(),
+                PauseReason::Killable | PauseReason::StopBySignal | PauseReason::StopByPtrace => {
+                    posix_thread.has_pending_sigkill()
+                }
             };
 
             if has_pending {
@@ -268,8 +270,13 @@ where
 /// The reason why a process is paused by a `pause`-family method.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PauseReason {
+    /// An interruptible sleep (`TASK_INTERRUPTIBLE` in Linux).
     Sleep,
+    /// A sleep that only `SIGKILL` interrupts (`TASK_KILLABLE` in Linux).
+    Killable,
+    /// A group stop (`TASK_STOPPED` in Linux), which only `SIGKILL` interrupts.
     StopBySignal,
+    /// A ptrace-stop (`TASK_TRACED` in Linux), which only `SIGKILL` interrupts.
     StopByPtrace,
 }
 

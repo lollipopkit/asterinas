@@ -77,13 +77,6 @@ pub(crate) fn create_new_user_task(
         let handle_signals = |user_ctx: &mut UserContext| {
             let mut is_handled = false;
 
-            // Handle signals while the thread is stopped
-            // FIXME: Currently, we handle all signals when the process is stopped.
-            // However, when the process is stopped, at least signals with user-provided handlers
-            // should not be handled; these signals should only be handled when the process is continued.
-            // Certain signals, such as SIGKILL, should be handled even if the process is stopped.
-            // We need to further investigate Linux behavior regarding which signals should be handled
-            // when the thread is stopped.
             loop {
                 // As in Linux, a thread participates in the group stop before handling signals.
                 // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2698-L2732>
@@ -95,6 +88,13 @@ pub(crate) fn create_new_user_task(
                         || (!is_group_stopped()).then_some(()),
                         PauseReason::StopBySignal,
                     );
+                    // As `TASK_STOPPED` in Linux, a stopped thread handles no signals other than
+                    // `SIGKILL` until it is continued. A fatal signal that a thread can take kills
+                    // the whole group with `SIGKILL` when it is generated (see
+                    // `Process::complete_signal`), and other signals stay pending.
+                    if is_group_stopped() && !ctx.has_pending_sigkill() {
+                        continue;
+                    }
                 }
 
                 // The trap is taken in `handle_pending_signal`.

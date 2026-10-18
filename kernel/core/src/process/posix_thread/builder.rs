@@ -193,6 +193,7 @@ impl PosixThreadBuilder {
                     fs: RwMutex::new(fs.clone()),
                     file_table: Mutex::new(Some(file_table.clone_ro())),
                     sig_mask,
+                    real_blocked: AtomicSigMask::new_empty(),
                     sig_queues,
                     signalled_waker: SpinLock::new(None),
                     group_stop_pending: AtomicBool::new(false),
