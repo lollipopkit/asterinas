@@ -49,6 +49,12 @@ time(tloc);
 // Synchronously wait for a signal with a timeout
 rt_sigtimedwait(set, info, timeout, sigsetsize);
 
+// Queue a signal and data to a process
+rt_sigqueueinfo(tgid, sig, info);
+
+// Queue a signal and data to a thread
+rt_tgsigqueueinfo(tgid, tid, sig, info);
+
 // Arm or disarm a POSIX per-process timer
 timer_settime(timer_id, flags, new_setting, old_setting);
 

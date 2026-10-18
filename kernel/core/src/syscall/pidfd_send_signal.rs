@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use ostd::mm::VmIo;
-
 use crate::{
     fs::file::file_table::{RawFileDesc, get_file_fast},
     prelude::*,
@@ -84,7 +82,7 @@ pub(super) fn sys_pidfd_send_signal(
 
 fn read_siginfo_from_user(info_ptr: Vaddr, sig_num: SigNum, ctx: &Context) -> Result<siginfo_t> {
     if info_ptr != 0 {
-        let si = ctx.user_space().read_val::<siginfo_t>(info_ptr)?;
+        let si = siginfo_t::read_from_user(info_ptr, None, ctx)?;
         if si.si_signo != sig_num.as_u8() as i32 {
             return_errno_with_message!(
                 Errno::EINVAL,

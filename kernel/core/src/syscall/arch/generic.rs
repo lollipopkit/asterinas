@@ -110,6 +110,7 @@ macro_rules! import_generic_syscall_entries {
             rt_sigaction::sys_rt_sigaction,
             rt_sigpending::sys_rt_sigpending,
             rt_sigprocmask::sys_rt_sigprocmask,
+            rt_sigqueueinfo::{sys_rt_sigqueueinfo, sys_rt_tgsigqueueinfo},
             rt_sigreturn::sys_rt_sigreturn,
             rt_sigsuspend::sys_rt_sigsuspend,
             rt_sigtimedwait::sys_rt_sigtimedwait,
@@ -323,6 +324,7 @@ macro_rules! define_syscalls_with_generic_syscall_table {
             SYS_RT_SIGPROCMASK = 135         => sys_rt_sigprocmask(args[..4]);
             SYS_RT_SIGPENDING = 136          => sys_rt_sigpending(args[..2]);
             SYS_RT_SIGTIMEDWAIT = 137        => sys_rt_sigtimedwait(args[..4]);
+            SYS_RT_SIGQUEUEINFO = 138        => sys_rt_sigqueueinfo(args[..3]);
             SYS_RT_SIGRETURN = 139           => sys_rt_sigreturn(args[..0], &mut user_ctx);
             SYS_SET_PRIORITY = 140           => sys_set_priority(args[..3]);
             SYS_GET_PRIORITY = 141           => sys_get_priority(args[..2]);
@@ -391,6 +393,7 @@ macro_rules! define_syscalls_with_generic_syscall_table {
             SYS_MPROTECT = 226               => sys_mprotect(args[..3]);
             SYS_MSYNC = 227                  => sys_msync(args[..3]);
             SYS_MADVISE = 233                => sys_madvise(args[..3]);
+            SYS_RT_TGSIGQUEUEINFO = 240      => sys_rt_tgsigqueueinfo(args[..4]);
             SYS_ACCEPT4 = 242                => sys_accept4(args[..4]);
             SYS_WAIT4 = 260                  => sys_wait4(args[..4]);
             SYS_PRLIMIT64 = 261              => sys_prlimit64(args[..4]);

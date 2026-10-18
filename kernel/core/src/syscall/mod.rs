@@ -131,6 +131,7 @@ mod rmdir;
 mod rt_sigaction;
 mod rt_sigpending;
 mod rt_sigprocmask;
+mod rt_sigqueueinfo;
 mod rt_sigreturn;
 mod rt_sigsuspend;
 mod rt_sigtimedwait;

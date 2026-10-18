@@ -55,8 +55,8 @@ Unsupported predefined clock IDs:
 * `CLOCK_BOOTTIME_ALARM`
 * `CLOCK_TAI`
 
-Unsupported notification methods:
-* `SIGEV_THREAD`
+Partially-supported functionality:
+* `si_overrun` in the signal information is always zero
 
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/timer_create.2.html).

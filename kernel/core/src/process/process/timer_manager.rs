@@ -12,6 +12,7 @@ use ostd::{cpu::PrivilegeLevel, irq::InterruptLevel, sync::Mutex, timer};
 use super::Process;
 use crate::{
     fs::cgroupfs::{CpuStatKind, charge_cpu_time},
+    prelude::{Errno, Result, return_errno_with_message},
     process::{
         posix_thread::AsPosixThread,
         signal::{
@@ -186,19 +187,40 @@ impl PosixTimerManager {
         self.virtual_timer.timer_manager().create_timer(func)
     }
 
-    /// Adds a POSIX timer to the managed `posix_timers`, and allocate a timer ID for this timer.
-    /// Returns the timer ID, or `None` if allocation failed.
-    pub(crate) fn add_posix_timer(&self, posix_timer: Arc<Timer>) -> Option<timer_t> {
+    /// Allocates a timer ID, creates a POSIX timer with the ID via `create_timer`, and adds the
+    /// timer to the managed `posix_timers`.
+    ///
+    /// The timer cannot be found by the ID until this method returns successfully.
+    pub(crate) fn add_posix_timer<F>(&self, create_timer: F) -> Result<timer_t>
+    where
+        F: FnOnce(timer_t) -> Result<Arc<Timer>>,
+    {
+        let timer_id = {
+            let _timers = self.posix_timers.lock();
+            // Holding the lock of `posix_timers` is required to operate the `id_allocator`.
+            self.id_allocator.lock().alloc()
+        };
+        let Some(timer_id) = timer_id else {
+            return_errno_with_message!(Errno::EAGAIN, "timer IDs are exhausted");
+        };
+
+        let posix_timer = create_timer(timer_id as timer_t);
+
         let mut timers = self.posix_timers.lock();
-        // Holding the lock of `posix_timers` is required to operate the `id_allocator`.
-        let timer_id = self.id_allocator.lock().alloc()?;
+        let posix_timer = match posix_timer {
+            Ok(posix_timer) => posix_timer,
+            Err(error) => {
+                self.id_allocator.lock().free(timer_id);
+                return Err(error);
+            }
+        };
         if timers.len() <= timer_id {
             timers.resize(timer_id + 1, None);
         }
         // The ID allocated is not used by any other timers so this index in `timers`
         // must be `None`.
         timers[timer_id] = Some(posix_timer);
-        Some(timer_id as timer_t)
+        Ok(timer_id as timer_t)
     }
 
     /// Finds a POSIX timer by the input `timer_id`.

@@ -60,7 +60,11 @@ define_std_signums! {
     SIGSYS    = 31, // Bad system call (SVr4); see also seccomp(2)
 }
 
+/// An alias of `SIGIO`.
+pub(crate) const SIGPOLL: SigNum = SIGIO;
+
 pub(crate) const SI_ASYNCNL: i32 = -60;
+pub(crate) const SI_DETHREAD: i32 = -7;
 pub(crate) const SI_TKILL: i32 = -6;
 pub(crate) const SI_SIGIO: i32 = -5;
 pub(crate) const SI_ASYNCIO: i32 = -4;
@@ -69,6 +73,18 @@ pub(crate) const SI_TIMER: i32 = -2;
 pub(crate) const SI_QUEUE: i32 = -1;
 pub(crate) const SI_USER: i32 = 0;
 pub(crate) const SI_KERNEL: i32 = 128;
+
+/// The numbers of signal-specific codes.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/uapi/asm-generic/siginfo.h>
+pub(crate) const NSIGILL: i32 = 11;
+pub(crate) const NSIGFPE: i32 = 15;
+pub(crate) const NSIGSEGV: i32 = 10;
+pub(crate) const NSIGBUS: i32 = 5;
+pub(crate) const NSIGTRAP: i32 = 6;
+pub(crate) const NSIGCHLD: i32 = 6;
+pub(crate) const NSIGPOLL: i32 = 6;
+pub(crate) const NSIGSYS: i32 = 2;
 
 pub(crate) const FPE_INTDIV: i32 = 1;
 pub(crate) const FPE_INTOVF: i32 = 2;
