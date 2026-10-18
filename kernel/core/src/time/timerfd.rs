@@ -11,7 +11,10 @@ use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
 use crate::{
     events::IoEvents,
     fs::{
-        file::{AccessMode, CreationFlags, FileCommon, FileLike, StatusFlags, file_table::FdFlags},
+        file::{
+            AccessMode, CreationFlags, FileCommon, FileLike, RwfFlags, StatusFlags,
+            file_table::FdFlags,
+        },
         pseudofs::AnonInodeFs,
     },
     prelude::*,
@@ -216,13 +219,22 @@ impl Pollable for TimerfdFile {
 
 impl FileLike for TimerfdFile {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
+        self.read_with_flags(writer, RwfFlags::empty())
+    }
+
+    fn supports_nowait(&self) -> bool {
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/timerfd.c#L464-L467>
+        true
+    }
+
+    fn read_with_flags(&self, writer: &mut VmWriter, flags: RwfFlags) -> Result<usize> {
         let read_len = size_of::<u64>();
 
         if writer.avail() < read_len {
             return_errno_with_message!(Errno::EINVAL, "buf len is less len u64 size");
         }
 
-        if self.is_nonblocking() {
+        if self.is_nonblocking() || flags.contains(RwfFlags::NOWAIT) {
             self.try_read(writer)?;
         } else {
             self.wait_events(IoEvents::IN, None, || self.try_read(writer))?;

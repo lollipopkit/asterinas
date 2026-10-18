@@ -18,7 +18,10 @@ use ostd::sync::LocalIrqDisabled;
 use crate::{
     events::IoEvents,
     fs::{
-        file::{AccessMode, CreationFlags, FileCommon, FileLike, StatusFlags, file_table::FdFlags},
+        file::{
+            AccessMode, CreationFlags, FileCommon, FileLike, RwfFlags, StatusFlags,
+            file_table::FdFlags,
+        },
         pseudofs::AnonInodeFs,
     },
     prelude::*,
@@ -216,18 +219,37 @@ impl Pollable for EventFile {
 
 impl FileLike for EventFile {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
+        self.read_with_flags(writer, RwfFlags::empty())
+    }
+
+    fn supports_nowait(&self) -> bool {
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/eventfd.c#L403-L405>
+        true
+    }
+
+    fn read_with_flags(&self, writer: &mut VmWriter, flags: RwfFlags) -> Result<usize> {
         let read_len = size_of::<u64>();
         if writer.avail() < read_len {
             return_errno_with_message!(Errno::EINVAL, "the event buffer is too small");
         }
 
-        if self.is_nonblocking() {
+        if self.is_nonblocking() || flags.contains(RwfFlags::NOWAIT) {
             self.try_read(writer)?;
         } else {
             self.wait_events(IoEvents::IN, None, || self.try_read(writer))?;
         }
 
         Ok(read_len)
+    }
+
+    fn write_with_flags(&self, reader: &mut VmReader, flags: RwfFlags) -> Result<usize> {
+        // Like Linux, writes do not support the flags except `RWF_HIPRI`, since the file does not
+        // implement `write_iter`.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/read_write.c#L841-L842>
+        if !(flags - RwfFlags::HIPRI).is_empty() {
+            return_errno_with_message!(Errno::EOPNOTSUPP, "the flags are not supported");
+        }
+        self.write(reader)
     }
 
     fn write(&self, reader: &mut VmReader) -> Result<usize> {

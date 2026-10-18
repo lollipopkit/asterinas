@@ -5,7 +5,7 @@
 use core::fmt::Display;
 
 use super::{
-    AccessMode, CreationFlags, FileCommon, FileLike, InodeType, MappableObject,
+    AccessMode, CreationFlags, FileCommon, FileLike, InodeType, MappableObject, RwfFlags,
     SettableStatusFlags, StatusFlags, SyncMode, file_table::FdFlags, flock::FlockItem,
 };
 use crate::{
@@ -224,21 +224,23 @@ impl InodeHandle {
         Ok(inode.as_ref())
     }
 
-    /// Makes the written data durable if the file is opened with `O_SYNC` or `O_DSYNC`, or
-    /// its file system is mounted with `sync`.
+    /// Makes the written data durable if the file is opened with `O_SYNC` or `O_DSYNC`, the
+    /// write has `RWF_SYNC` or `RWF_DSYNC`, or its file system is mounted with `sync`.
     ///
-    /// Reference: Linux `iocb_flags()` and `generic_write_sync()`.
-    fn sync_written(&self, len: usize) -> Result<()> {
+    /// Reference: Linux `iocb_flags()`, `kiocb_set_rw_flags()`, and `generic_write_sync()`.
+    fn sync_written(&self, len: usize, flags: RwfFlags) -> Result<()> {
         if len == 0 || self.open_file.is_some() {
             return Ok(());
         }
         let status_flags = self.status_flags();
-        if !status_flags.intersects(StatusFlags::O_DSYNC | StatusFlags::O_SYNC)
-            && !self.path().fs().flags().contains(FsFlags::SYNCHRONOUS)
-        {
+        let is_sync = status_flags.contains(StatusFlags::O_SYNC) || flags.contains(RwfFlags::SYNC);
+        let is_dsync = is_sync
+            || status_flags.contains(StatusFlags::O_DSYNC)
+            || flags.contains(RwfFlags::DSYNC);
+        if !is_dsync && !self.path().fs().flags().contains(FsFlags::SYNCHRONOUS) {
             return Ok(());
         }
-        let mode = if status_flags.contains(StatusFlags::O_SYNC) {
+        let mode = if is_sync {
             SyncMode::Full
         } else {
             SyncMode::Data
@@ -401,12 +403,36 @@ impl Pollable for InodeHandle {
 
 impl FileLike for InodeHandle {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
+        self.read_with_flags(writer, RwfFlags::empty())
+    }
+
+    fn write(&self, reader: &mut VmReader) -> Result<usize> {
+        self.write_with_flags(reader, RwfFlags::empty())
+    }
+
+    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+        self.read_at_with_flags(offset, writer, RwfFlags::empty())
+    }
+
+    fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        self.write_at_with_flags(offset, reader, RwfFlags::empty())
+    }
+
+    fn supports_nowait(&self) -> bool {
+        // TODO: Support `RWF_NOWAIT` for regular files. Like Linux, it is not supported for
+        // regular files on file systems without `FMODE_NOWAIT` (e.g., ext2 and tmpfs).
+        self.open_file
+            .as_ref()
+            .is_some_and(|open_file| open_file.supports_nowait())
+    }
+
+    fn read_with_flags(&self, writer: &mut VmWriter, flags: RwfFlags) -> Result<usize> {
         if self.status_flags().contains(StatusFlags::O_PATH) || !self.access_mode().is_readable() {
             return_errno_with_message!(Errno::EBADF, "the file is not opened readable");
         }
 
         let (file_ops, is_offset_aware) = self.file_ops_and_is_offset_aware();
-        let status_flags = self.status_flags();
+        let status_flags = io_status_flags(self.status_flags(), flags);
 
         if !is_offset_aware {
             return file_ops.read_at(0, writer, status_flags);
@@ -425,7 +451,7 @@ impl FileLike for InodeHandle {
         Ok(len)
     }
 
-    fn write(&self, reader: &mut VmReader) -> Result<usize> {
+    fn write_with_flags(&self, reader: &mut VmReader, flags: RwfFlags) -> Result<usize> {
         if self.status_flags().contains(StatusFlags::O_PATH) || !self.access_mode().is_writable() {
             return_errno_with_message!(Errno::EBADF, "the file is not opened writable");
         }
@@ -435,35 +461,40 @@ impl FileLike for InodeHandle {
         }
 
         let (file_ops, is_offset_aware) = self.file_ops_and_is_offset_aware();
-        let status_flags = self.status_flags();
+        let status_flags = io_status_flags(self.status_flags(), flags);
 
         if !is_offset_aware {
-            return file_ops.write_at(0, reader, status_flags);
+            return file_ops.write_at_with_flags(0, reader, status_flags, flags);
         }
 
         let mut offset = self.offset.lock();
 
         // FIXME: How can we deal with the `O_APPEND` flag if `open_file` is set?
-        if status_flags.contains(StatusFlags::O_APPEND) && self.open_file.is_none() {
+        if is_append(status_flags, flags) && self.open_file.is_none() {
             // FIXME: `O_APPEND` should ensure that new content is appended even if another process
             // is writing to the file concurrently.
             *offset = self.path().size();
         }
 
-        let len = file_ops.write_at(*offset, reader, status_flags)?;
+        let len = file_ops.write_at_with_flags(*offset, reader, status_flags, flags)?;
         *offset += len;
-        self.sync_written(len)?;
+        self.sync_written(len, flags)?;
 
         Ok(len)
     }
 
-    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+    fn read_at_with_flags(
+        &self,
+        offset: usize,
+        writer: &mut VmWriter,
+        flags: RwfFlags,
+    ) -> Result<usize> {
         let file_ops = self.file_ops_for_positional_io()?;
         if self.status_flags().contains(StatusFlags::O_PATH) || !self.access_mode().is_readable() {
             return_errno_with_message!(Errno::EBADF, "the file is not opened readable");
         }
 
-        let status_flags = self.status_flags();
+        let status_flags = io_status_flags(self.status_flags(), flags);
 
         let requested = writer.avail();
         let len = file_ops.read_at(offset, writer, status_flags)?;
@@ -474,7 +505,12 @@ impl FileLike for InodeHandle {
         Ok(len)
     }
 
-    fn write_at(&self, mut offset: usize, reader: &mut VmReader) -> Result<usize> {
+    fn write_at_with_flags(
+        &self,
+        mut offset: usize,
+        reader: &mut VmReader,
+        flags: RwfFlags,
+    ) -> Result<usize> {
         let file_ops = self.file_ops_for_positional_io()?;
         if self.status_flags().contains(StatusFlags::O_PATH) || !self.access_mode().is_writable() {
             return_errno_with_message!(Errno::EBADF, "the file is not opened writable");
@@ -484,18 +520,18 @@ impl FileLike for InodeHandle {
             clear_file_priv(self.path().dentry())?;
         }
 
-        let status_flags = self.status_flags();
+        let status_flags = io_status_flags(self.status_flags(), flags);
 
         // FIXME: How can we deal with the `O_APPEND` flag if `open_file` is set?
-        if status_flags.contains(StatusFlags::O_APPEND) && self.open_file.is_none() {
+        if is_append(status_flags, flags) && self.open_file.is_none() {
             // If the file has the `O_APPEND` flag, the offset is ignored.
             // FIXME: `O_APPEND` should ensure that new content is appended even if another process
             // is writing to the file concurrently.
             offset = self.path().size();
         }
 
-        let len = file_ops.write_at(offset, reader, status_flags)?;
-        self.sync_written(len)?;
+        let len = file_ops.write_at_with_flags(offset, reader, status_flags, flags)?;
+        self.sync_written(len, flags)?;
         Ok(len)
     }
 
@@ -703,12 +739,39 @@ pub(crate) enum SeekFrom {
     Current(isize),
 }
 
+/// Returns the status flags for an I/O operation with the flags of `preadv2` or `pwritev2`.
+///
+/// Like Linux, `RWF_NOWAIT` makes the operation non-blocking.
+fn io_status_flags(status_flags: StatusFlags, flags: RwfFlags) -> StatusFlags {
+    if flags.contains(RwfFlags::NOWAIT) {
+        status_flags | StatusFlags::O_NONBLOCK
+    } else {
+        status_flags
+    }
+}
+
+/// Returns whether a write appends to the file.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/fs.h#L3460-L3468>
+//
+// TODO: Linux fails `RWF_NOAPPEND` with `EPERM` for append-only inodes, which the VFS does not
+// support yet.
+fn is_append(status_flags: StatusFlags, flags: RwfFlags) -> bool {
+    (status_flags.contains(StatusFlags::O_APPEND) || flags.contains(RwfFlags::APPEND))
+        && !flags.contains(RwfFlags::NOAPPEND)
+}
+
 /// File operations for one opened file description.
 ///
 /// A per-open file object can hold file-description-specific state and override
 /// operations that are not purely inode-backed, such as state and operations for
 /// devices, pipes, namespace files, and procfs files.
 pub trait PerOpenFileOps: Pollable + FileOps + Any + Send + Sync + 'static {
+    /// Returns whether the file supports `RWF_NOWAIT` (`FMODE_NOWAIT` in Linux).
+    fn supports_nowait(&self) -> bool {
+        false
+    }
+
     /// Checks whether the `seek()` operation should fail.
     fn check_seekable(&self) -> Result<()>;
 

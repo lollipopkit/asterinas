@@ -11,10 +11,13 @@ mod fs_config_file;
 mod inode_attr;
 mod inode_handle;
 
-pub use file_attr::status_flags::{SettableStatusFlags, StatusFlags};
 pub(crate) use file_attr::{
     access_mode::AccessMode, creation_flags::CreationFlags, open_args::OpenArgs,
     status_flags::AtomicStatusFlags,
+};
+pub use file_attr::{
+    rw_flags::RwfFlags,
+    status_flags::{SettableStatusFlags, StatusFlags},
 };
 pub(crate) use file_common::FileCommon;
 pub(crate) use file_handle::{FileLike, StatusFlagsUpdate};

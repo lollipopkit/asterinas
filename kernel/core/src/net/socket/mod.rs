@@ -11,8 +11,8 @@ use util::{
 use crate::{
     fs::{
         file::{
-            AccessMode, CreationFlags, FileCommon, FileLike, SettableStatusFlags, StatusFlags,
-            file_table::FdFlags,
+            AccessMode, CreationFlags, FileCommon, FileLike, RwfFlags, SettableStatusFlags,
+            StatusFlags, file_table::FdFlags,
         },
         pseudofs::SockFs,
     },
@@ -251,40 +251,68 @@ pub(crate) trait Socket: private::SocketPrivate + Send + Sync {
 /// Receives one message from a socket into all the buffers, like `read(2)` and `readv(2)`.
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/socket.c#L1201-L1220>
-pub(crate) fn read_socket(socket: &dyn Socket, writer: &mut dyn MultiWrite) -> Result<usize> {
+pub(crate) fn read_socket(
+    socket: &dyn Socket,
+    writer: &mut dyn MultiWrite,
+    rwf_flags: RwfFlags,
+) -> Result<usize> {
     if writer.is_empty() {
         // Linux always returns `Ok(0)` in this case, so we follow it.
         return Ok(0);
     }
 
-    // TODO: Set correct flags
+    let mut flags = RecvFlags::empty();
+    if rwf_flags.contains(RwfFlags::NOWAIT) {
+        flags |= RecvFlags::MSG_DONTWAIT;
+    }
+
     socket
-        .recvmsg(writer, RecvFlags::empty())
+        .recvmsg(writer, flags)
         .map(|(output, _)| output.len())
 }
 
 /// Sends all the buffers to a socket as one message, like `write(2)` and `writev(2)`.
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/socket.c#L1222-L1243>
-pub(crate) fn write_socket(socket: &dyn Socket, reader: &mut dyn MultiRead) -> Result<usize> {
+pub(crate) fn write_socket(
+    socket: &dyn Socket,
+    reader: &mut dyn MultiRead,
+    rwf_flags: RwfFlags,
+) -> Result<usize> {
+    let mut flags = SendFlags::empty();
+    if rwf_flags.contains(RwfFlags::NOWAIT) {
+        flags |= SendFlags::MSG_DONTWAIT;
+    }
+    if rwf_flags.contains(RwfFlags::NOSIGNAL) {
+        flags |= SendFlags::MSG_NOSIGNAL;
+    }
+
     let audit_target = check_connect(socket, None)?;
-    // TODO: Set correct flags
-    let sent_bytes = socket.sendmsg(
-        reader,
-        MessageHeader::new(None, Vec::new()),
-        SendFlags::empty(),
-    )?;
+    let sent_bytes = socket.sendmsg(reader, MessageHeader::new(None, Vec::new()), flags)?;
     audit_connect(audit_target);
     Ok(sent_bytes)
 }
 
 impl<T: Socket + 'static> FileLike for T {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
-        read_socket(self, writer)
+        read_socket(self, writer, RwfFlags::empty())
     }
 
     fn write(&self, reader: &mut VmReader) -> Result<usize> {
-        write_socket(self, reader)
+        write_socket(self, reader, RwfFlags::empty())
+    }
+
+    fn supports_nowait(&self) -> bool {
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/socket.c#L540>
+        true
+    }
+
+    fn read_with_flags(&self, writer: &mut VmWriter, flags: RwfFlags) -> Result<usize> {
+        read_socket(self, writer, flags)
+    }
+
+    fn write_with_flags(&self, reader: &mut VmReader, flags: RwfFlags) -> Result<usize> {
+        write_socket(self, reader, flags)
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {

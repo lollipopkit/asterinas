@@ -18,7 +18,7 @@ use crate::{
     events::IoEvents,
     fs::{
         file::{
-            AccessMode, CreationFlags, FileCommon, FileLike, StatusFlags,
+            AccessMode, CreationFlags, FileCommon, FileLike, RwfFlags, StatusFlags,
             file_table::{FdFlags, RawFileDesc, get_file_fast},
         },
         pseudofs::AnonInodeFs,
@@ -222,6 +222,15 @@ impl Pollable for SignalFile {
 
 impl FileLike for SignalFile {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
+        self.read_with_flags(writer, RwfFlags::empty())
+    }
+
+    fn supports_nowait(&self) -> bool {
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/signalfd.c#L274-L276>
+        true
+    }
+
+    fn read_with_flags(&self, writer: &mut VmWriter, flags: RwfFlags) -> Result<usize> {
         if writer.avail() < size_of::<SignalfdSiginfo>() {
             return_errno_with_message!(Errno::EINVAL, "the signal buffer is too small");
         }
@@ -232,7 +241,10 @@ impl FileLike for SignalFile {
         // Fast path: There are already pending signals or the signalfd is non-blocking.
         // So we don't need to create and register the poller.
         match self.try_read(writer, posix_thread) {
-            Err(e) if e.error() == Errno::EAGAIN && !self.is_non_blocking() => {}
+            Err(e)
+                if e.error() == Errno::EAGAIN
+                    && !self.is_non_blocking()
+                    && !flags.contains(RwfFlags::NOWAIT) => {}
             res => return res,
         }
 
