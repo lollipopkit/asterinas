@@ -22,10 +22,26 @@ pub(crate) type clockid_t = i32;
 pub(crate) type time_t = i64;
 pub(crate) type timer_t = i32;
 pub(crate) type suseconds_t = i64;
+pub(crate) type clock_t = i64;
 
 const NSEC_PER_USEC: i64 = 1_000;
 const USEC_PER_SEC: i64 = 1_000_000;
 pub(crate) const NSEC_PER_SEC: i64 = 1_000_000_000;
+
+/// The frequency of the clock ticks reported to user space (e.g., in `clock_t` values).
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/uapi/asm-generic/param.h#L6>
+pub(crate) const USER_HZ: u64 = 100;
+
+/// Converts a duration into clock ticks of [`USER_HZ`], like `nsec_to_clock_t` in Linux.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/time/time.c#L728-L742>
+pub(crate) fn duration_to_clock_t(duration: Duration) -> clock_t {
+    const NSEC_PER_TICK: u128 = NSEC_PER_SEC as u128 / USER_HZ as u128;
+    const { assert!((NSEC_PER_SEC as u64).is_multiple_of(USER_HZ)) };
+
+    clock_t::try_from(duration.as_nanos() / NSEC_PER_TICK).unwrap_or(clock_t::MAX)
+}
 
 /// The resolution of clocks in nanoseconds, which is one tick since timers expire on ticks and
 /// CPU clocks count ticks, like `TICK_NSEC` in Linux without high-resolution timers.

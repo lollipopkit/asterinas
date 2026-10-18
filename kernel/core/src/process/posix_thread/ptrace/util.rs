@@ -231,6 +231,13 @@ impl PtraceWaitStatus {
     pub(crate) fn to_waitid_si_status(self) -> i32 {
         self.0
     }
+
+    /// Returns the `si_status` of the `SIGCHLD` sent to the tracer.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2406-L2408>
+    pub(in crate::process) fn to_sigchld_si_status(self) -> i32 {
+        self.0 & 0x7f
+    }
 }
 
 /// Creates a `siginfo_t` for a syscall-stop.

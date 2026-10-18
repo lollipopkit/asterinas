@@ -16,6 +16,7 @@ use crate::{
     process::{
         CloneArgs, CloneFlags, Process, Uid, WaitOptions,
         exit::send_child_death_signal,
+        sigchld::{self, ChildSource},
         signal::{
             DequeuedSignal, PauseReason,
             c_types::siginfo_t,
@@ -96,9 +97,14 @@ impl PosixThread {
             return false;
         };
 
-        let tracer = tracer.as_posix_thread().unwrap();
-        tracer.enqueue_signal(Box::new(KernelSignal::new(SIGCHLD)));
-        tracer.process().children_wait_queue().wake_all();
+        let process = self.process();
+        sigchld::notify_parent_of_death(
+            ChildSource::Process(&process),
+            process.status().exit_code(),
+            &tracer.as_posix_thread().unwrap().process(),
+            Some(SIGCHLD),
+            true,
+        );
 
         true
     }
@@ -641,13 +647,12 @@ impl TraceeStatus {
         self.is_stopped.store(true, Ordering::Relaxed);
         drop(state);
 
-        let tracer = tracer.as_posix_thread().unwrap();
-        tracer.enqueue_signal(Box::new(RawSignal::new({
-            let mut siginfo = siginfo_t::new(SIGCHLD, CLD_TRAPPED);
-            siginfo.set_pid_uid_by(ctx);
-            siginfo
-        })));
-        tracer.process().children_wait_queue().wake_all();
+        sigchld::notify_parent_of_stop(
+            ChildSource::Thread(ctx.posix_thread),
+            &tracer.as_posix_thread().unwrap().process(),
+            CLD_TRAPPED,
+            wait_status.to_sigchld_si_status(),
+        );
 
         let waiter = Waiter::new_pair().0;
         if waiter

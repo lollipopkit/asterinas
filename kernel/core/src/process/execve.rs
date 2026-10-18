@@ -265,6 +265,8 @@ fn do_execve_no_return(
     *thread_local.sig_stack().borrow_mut() = SigStack::default();
     // Restore the process exit signal to SIGCHLD.
     process.set_exit_signal(SIGCHLD);
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/exec.c#L1285>
+    process.increase_self_exec_id();
 
     Ok(())
 }

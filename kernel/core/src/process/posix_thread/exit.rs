@@ -15,7 +15,11 @@ use crate::{
         TermStatus,
         exit::{drop_after, exit_process},
         pid_table,
-        signal::{constants::SIGKILL, signals::kernel::KernelSignal},
+        sigchld::{self, ChildSource},
+        signal::{
+            constants::{SIGCHLD, SIGKILL},
+            signals::kernel::KernelSignal,
+        },
         task_set::TaskSet,
     },
     thread::{AsThread, Tid},
@@ -94,8 +98,20 @@ fn exit_internal(
     posix_thread.clear_tracees();
 
     if let Some(tracer) = posix_thread.tracer() {
-        let tracer = tracer.as_posix_thread().unwrap();
-        tracer.process().children_wait_queue().wake_all();
+        let tracer_process = tracer.as_posix_thread().unwrap().process();
+        if is_last_thread && posix_thread.tid() == posix_process.pid() {
+            // The death of the whole process is reported in `exit_process`.
+            tracer_process.children_wait_queue().wake_all();
+        } else {
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L763-L766>
+            sigchld::notify_parent_of_death(
+                ChildSource::Thread(posix_thread),
+                posix_thread.exit_code(),
+                &tracer_process,
+                Some(SIGCHLD),
+                true,
+            );
+        }
     }
 
     wake_clear_ctid(thread_local);

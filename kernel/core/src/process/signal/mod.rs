@@ -206,7 +206,8 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                 }
                 SigDefaultAction::Ign => {}
                 SigDefaultAction::Stop => ctx.process.stop(sig_num),
-                SigDefaultAction::Cont => ctx.process.resume(),
+                // The process has been continued when `SIGCONT` was generated.
+                SigDefaultAction::Cont => {}
             }
         }
     }
@@ -302,10 +303,6 @@ pub(crate) fn handle_user_signal(
     debug!("flags = {:?}", flags);
     debug!("restorer_addr = 0x{:x}", restorer_addr);
     debug!("mask = {:?}, mask_to_restore = {:?}", mask, mask_to_restore);
-
-    if flags.contains_unsupported_flag() {
-        warn!("Unsupported signal flags: {:?}", flags);
-    }
 
     if !flags.contains(SigActionFlags::SA_NODEFER) {
         // Add the current signal to `mask`.

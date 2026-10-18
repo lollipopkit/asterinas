@@ -119,10 +119,6 @@ impl SigActionFlags {
     pub(crate) fn as_u32(&self) -> u32 {
         self.bits()
     }
-
-    pub(crate) fn contains_unsupported_flag(&self) -> bool {
-        self.intersects(SigActionFlags::SA_NOCLDSTOP | SigActionFlags::SA_NOCLDWAIT)
-    }
 }
 
 /// The default action to signals

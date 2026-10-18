@@ -66,6 +66,7 @@ fi
 ./signal/parent_death_signal
 ./signal/pidfd_send_signal
 ./signal/rt_sigpending
+./signal/sigchld_info
 ./signal/signal_fd
 ./signal/signal_test2
 
