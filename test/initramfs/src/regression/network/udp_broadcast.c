@@ -145,14 +145,45 @@ FN_TEST(connect_then_disable_broadcast)
 	TEST_ERRNO(connect(sender, (struct sockaddr *)&broadcast_addr,
 			   addr_len),
 		   EACCES);
-	// FIXME: Asterinas cannot pass the following case.
-	// The problem may be that we should invalidate the connected state
-	// once the above connect fails.
-#ifdef __asterinas__
-	TEST_SUCC(send(sender, MESSAGE, MESSAGE_LEN, 0));
-#else
+	// The socket is still connected, but the failed `connect` resets the
+	// cached route, so the destination is checked again.
 	TEST_ERRNO(send(sender, MESSAGE, MESSAGE_LEN, 0), EACCES);
-#endif
+	TEST_RES(getpeername(sender, (struct sockaddr *)&received_addr,
+			     &addr_len),
+		 received_addr.sin_addr.s_addr ==
+			 broadcast_addr.sin_addr.s_addr);
+
+	// After the route is checked successfully, it is cached again.
+	broadcast_opt = 1;
+	TEST_SUCC(setsockopt(sender, SOL_SOCKET, SO_BROADCAST, &broadcast_opt,
+			     broadcast_opt_len));
+	TEST_SUCC(send(sender, MESSAGE, MESSAGE_LEN, 0));
+	TEST_SUCC(recvfrom(receiver, buf, sizeof(buf), 0,
+			   (struct sockaddr *)&received_addr, &addr_len));
+	broadcast_opt = 0;
+	TEST_SUCC(setsockopt(sender, SOL_SOCKET, SO_BROADCAST, &broadcast_opt,
+			     broadcast_opt_len));
+	TEST_SUCC(send(sender, MESSAGE, MESSAGE_LEN, 0));
+	TEST_SUCC(recvfrom(receiver, buf, sizeof(buf), 0,
+			   (struct sockaddr *)&received_addr, &addr_len));
+}
+END_TEST()
+
+// A failed `connect` to a broadcast address still binds the socket.
+FN_TEST(connect_broadcast_binds)
+{
+	struct sockaddr_in name;
+	socklen_t namelen = sizeof(name);
+	int sk;
+
+	sk = TEST_SUCC(socket(AF_INET, SOCK_DGRAM, 0));
+	TEST_ERRNO(connect(sk, (struct sockaddr *)&broadcast_addr, addr_len),
+		   EACCES);
+	TEST_RES(getsockname(sk, (struct sockaddr *)&name, &namelen),
+		 name.sin_addr.s_addr == htonl(INADDR_ANY) &&
+			 name.sin_port != 0);
+	TEST_ERRNO(send(sk, MESSAGE, MESSAGE_LEN, 0), EDESTADDRREQ);
+	TEST_SUCC(close(sk));
 }
 END_TEST()
 

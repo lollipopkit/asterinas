@@ -6,7 +6,7 @@ use crate::{
     net::{
         iface::BoundTcpPort,
         route,
-        socket::ip::common::{bind_ports, get_ephemeral_endpoint},
+        socket::ip::common::{bind_ports, get_ephemeral_endpoint, rebind_owned_ports},
     },
     prelude::*,
 };
@@ -34,6 +34,22 @@ impl BoundTcpPorts {
             iface.bind_tcp(config)
         })?;
         Ok(Self { ports })
+    }
+
+    /// Binds a port number that the socket still owns at `endpoint` again.
+    ///
+    /// See [`rebind_owned_ports`] for details.
+    pub(super) fn rebind_owned(
+        endpoint: &IpEndpoint,
+        can_reuse: bool,
+        is_dual_stack: bool,
+    ) -> Result<Self> {
+        let ports = rebind_owned_ports(endpoint, is_dual_stack, |iface, config| {
+            iface.bind_tcp(config)
+        })?;
+        let bound_ports = Self { ports };
+        bound_ports.set_can_reuse(can_reuse);
+        Ok(bound_ports)
     }
 
     /// Returns the local endpoint, whose address may be unspecified.

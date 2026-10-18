@@ -31,6 +31,28 @@ fn check_bind_privilege(endpoint: &IpEndpoint) -> Result<()> {
     check_port_privilege(endpoint.port)
 }
 
+/// Whether the local address and the local port are specified by `bind`.
+///
+/// These correspond to `SOCK_BINDADDR_LOCK` and `SOCK_BINDPORT_LOCK` in Linux, which decide what
+/// is kept after `connect(AF_UNSPEC)`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L559-L562>
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct BindLocks {
+    pub(super) addr: bool,
+    pub(super) port: bool,
+}
+
+impl BindLocks {
+    /// Returns the locks set by binding to `endpoint`.
+    pub(super) fn from_bind(endpoint: &IpEndpoint) -> Self {
+        Self {
+            addr: !endpoint.addr.is_unspecified(),
+            port: endpoint.port != 0,
+        }
+    }
+}
+
 /// Binds a local endpoint to ports on ifaces.
 ///
 /// A specified address is bound on the iface that owns it, which results in one port. An
@@ -53,9 +75,44 @@ where
 {
     check_bind_privilege(endpoint)?;
 
+    bind_ports_with(
+        endpoint,
+        is_dual_stack,
+        |endpoint| BindPortConfig::new(endpoint, can_reuse),
+        bind,
+    )
+}
+
+/// Binds a port number that the socket still owns at `endpoint` again.
+///
+/// This works like [`bind_ports`], except that the port number must be specified and owned by
+/// the socket (e.g., by its connection that is being reset). So binding never conflicts with the
+/// ports that are to be released. The caller should then set whether the new ports are reusable.
+pub(super) fn rebind_owned_ports<P>(
+    endpoint: &IpEndpoint,
+    is_dual_stack: bool,
+    bind: impl Fn(&Arc<Iface>, BindPortConfig) -> core::result::Result<P, BindError>,
+) -> Result<Vec<P>>
+where
+    P: Deref<Target = BoundPort>,
+{
+    debug_assert_ne!(endpoint.port, 0);
+
+    bind_ports_with(endpoint, is_dual_stack, BindPortConfig::new_backlog, bind)
+}
+
+fn bind_ports_with<P>(
+    endpoint: &IpEndpoint,
+    is_dual_stack: bool,
+    config: impl Fn(IpEndpoint) -> BindPortConfig,
+    bind: impl Fn(&Arc<Iface>, BindPortConfig) -> core::result::Result<P, BindError>,
+) -> Result<Vec<P>>
+where
+    P: Deref<Target = BoundPort>,
+{
     if !endpoint.addr.is_unspecified() {
         let iface = route::lookup_local_iface(endpoint.addr)?;
-        let port = bind(&iface, BindPortConfig::new(*endpoint, can_reuse))?;
+        let port = bind(&iface, config(*endpoint))?;
         return Ok(vec![port]);
     }
 
@@ -71,12 +128,7 @@ where
     let bind_all = |port: u16| {
         targets
             .iter()
-            .map(|(iface, addr)| {
-                bind(
-                    iface,
-                    BindPortConfig::new(IpEndpoint::new(*addr, port), can_reuse),
-                )
-            })
+            .map(|(iface, addr)| bind(iface, config(IpEndpoint::new(*addr, port))))
             .collect::<core::result::Result<Vec<_>, _>>()
     };
 
@@ -89,10 +141,7 @@ where
     const NUM_EPHEMERAL_PORTS: usize = 60999 - 32768 + 1;
     let (first_iface, first_addr) = targets[0];
     for _ in 0..NUM_EPHEMERAL_PORTS {
-        let first = bind(
-            first_iface,
-            BindPortConfig::new(IpEndpoint::new(first_addr, 0), can_reuse),
-        )?;
+        let first = bind(first_iface, config(IpEndpoint::new(first_addr, 0)))?;
         let port = first.port();
         // Release the picked port so that `bind_all` can bind it again on the first iface.
         drop(first);

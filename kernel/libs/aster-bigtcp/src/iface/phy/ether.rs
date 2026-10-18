@@ -148,11 +148,14 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
         // Resolve the next-hop Ethernet address. If it is unknown, the packet is queued until the
         // address is resolved.
         let now_ms = iface_cx.now().total_millis() as u64;
-        self.neighbors
-            .lock()
-            .resolve(next_hop_ip, packet.packet, now_ms, || {
-                self.new_arp_request(next_hop_ip, None, iface_cx)
-            })
+        let mut neighbors = self.neighbors.lock();
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/ip_output.c#L234-L236>
+        if packet.confirm_neighbor {
+            neighbors.confirm(next_hop_ip, now_ms);
+        }
+        neighbors.resolve(next_hop_ip, packet.packet, now_ms, || {
+            self.new_arp_request(next_hop_ip, None, iface_cx)
+        })
     }
 
     fn poll_timers(&self, iface_cx: &Context) {

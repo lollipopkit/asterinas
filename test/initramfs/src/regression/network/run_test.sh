@@ -32,6 +32,7 @@ sleep 0.2
 ./sockoption_short
 ./sockoption_unix
 ./tcp_accept_reset
+./tcp_disconnect
 ./tcp_err
 ./tcp_poll
 ./tcp_reuseaddr

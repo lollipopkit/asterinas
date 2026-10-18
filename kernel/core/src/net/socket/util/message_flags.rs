@@ -23,7 +23,8 @@ bitflags! {
         const MSG_ZEROCOPY  = 0x4000000;
         const MSG_FASTOPEN  = 0x20000000;
 
-        const SUPPORTED     = SendFlags::MSG_DONTWAIT.bits;
+        const SUPPORTED     = SendFlags::MSG_DONTWAIT.bits
+            | SendFlags::MSG_CONFIRM.bits;
     }
 }
 

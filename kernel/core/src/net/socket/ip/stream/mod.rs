@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use aster_bigtcp::{
     socket::{NeedIfacePoll, RawTcpOption, RawTcpSetOption},
     time::Duration,
     wire::IpEndpoint,
 };
+use bound::BoundTcpPorts;
 use connected::{ConnectedStream, close_and_linger};
 use connecting::{ConnResult, ConnectingStream};
 use init::InitStream;
@@ -20,7 +23,7 @@ use util::{Retrans, TcpOptionSet};
 
 use super::{
     addr::IpAddressFamily,
-    common::{fault_in_user_page, try_copy_in_atomic_mode},
+    common::{BindLocks, fault_in_user_page, try_copy_in_atomic_mode},
     ioctl::ipv4_ioctl,
     options::{IpOptionSet, Ipv6OptionSet, SetIpLevelOption, SetIpv6LevelOption},
 };
@@ -28,7 +31,7 @@ use crate::{
     events::IoEvents,
     fs::file::{FileCommon, FileLike},
     net::{
-        iface::Iface,
+        iface::{Iface, TcpConnection, TcpListener},
         socket::{
             Socket, new_socket_common,
             options::{
@@ -67,6 +70,14 @@ pub(crate) struct StreamSocket {
     family: IpAddressFamily,
     options: RwLock<OptionSet>,
     timeouts: SocketTimeouts,
+    /// What `bind` specifies, which decides what is kept after `connect(AF_UNSPEC)`.
+    ///
+    /// Lock order: `state` first, `bind_locks` second.
+    bind_locks: SpinLock<BindLocks>,
+    /// The number of `connect(AF_UNSPEC)` calls, like `sk_disconnects` in Linux.
+    ///
+    /// A blocking `connect` fails with `EPIPE` if the socket is disconnected while waiting.
+    nr_disconnects: AtomicUsize,
 
     pollee: Pollee,
     common: FileCommon,
@@ -81,6 +92,32 @@ enum State {
     Connected(ConnectedStream),
     // Final State 2
     Listen(ListenStream),
+}
+
+/// The connection or the listeners that a disconnected socket releases.
+enum Teardown {
+    Connection(TcpConnection),
+    Listeners(Vec<Arc<Iface>>, Vec<TcpListener>),
+}
+
+impl Teardown {
+    /// Sends the resets and releases the resources.
+    fn finish(self) {
+        match self {
+            Teardown::Connection(tcp_conn) => {
+                tcp_conn.iface().poll();
+                drop(tcp_conn);
+            }
+            Teardown::Listeners(ifaces, listeners) => {
+                // Polling the ifaces drops the connections reset by `close`, which hold
+                // references to the listeners. So the listeners must be dropped afterward.
+                for iface in ifaces {
+                    iface.poll();
+                }
+                drop(listeners);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +160,8 @@ impl StreamSocket {
             family,
             options: RwLock::new(OptionSet::new()),
             timeouts: SocketTimeouts::new(),
+            bind_locks: SpinLock::new(BindLocks::default()),
+            nr_disconnects: AtomicUsize::new(0),
             pollee: Pollee::new(),
             common: new_socket_common(is_nonblocking),
         })
@@ -133,6 +172,7 @@ impl StreamSocket {
         family: IpAddressFamily,
         listener_options: &OptionSet,
         listener_timeouts: &SocketTimeouts,
+        listener_bind_locks: BindLocks,
         is_nonblocking: bool,
     ) -> Arc<Self> {
         let options = connected_stream.raw_with(|raw_tcp_socket| {
@@ -176,6 +216,9 @@ impl StreamSocket {
             family,
             options: RwLock::new(options),
             timeouts: listener_timeouts.clone(),
+            // Like Linux, the accepted socket inherits the locks (see `sk_clone`).
+            bind_locks: SpinLock::new(listener_bind_locks),
+            nr_disconnects: AtomicUsize::new(0),
             pollee,
             common: new_socket_common(is_nonblocking),
         })
@@ -325,35 +368,109 @@ impl StreamSocket {
         self.family == IpAddressFamily::IPv6 && !options.ipv6.v6only()
     }
 
-    /// Dissolves the association, which is what `connect(AF_UNSPEC)` does.
+    /// Disconnects the socket, which is done by `connect(AF_UNSPEC)` and some `shutdown` calls.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L651-L656>
-    fn disconnect(&self) -> Result<()> {
+    /// Like `tcp_disconnect` in Linux, a connection is reset and a listening socket stops
+    /// listening, after which the socket can be used again as a new socket. The port is kept only
+    /// if it is specified by `bind`, and the address is kept only if it is also specified by
+    /// `bind`. Blocked operations are woken up to see the new state.
+    ///
+    /// References:
+    /// - <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L651-L656>
+    /// - <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp.c#L3360-L3505>
+    /// - <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp.c#L3010-L3017>
+    fn disconnect(&self) {
         let mut state = self.write_updated_state();
+        let options = self.options.read();
 
-        match state.as_mut() {
-            State::Init(init_stream) => {
-                init_stream.disconnect();
-                Ok(())
-            }
-            // TODO: Reset connections and stop listening like `tcp_disconnect` in Linux. This
-            // requires releasing or keeping the bound ports as `tcp_set_state(TCP_CLOSE)` does.
-            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp.c#L3360>
-            State::Connecting(_) | State::Connected(_) | State::Listen(_) => {
-                warn!("disconnecting a connecting, connected, or listening TCP socket");
-                return_errno_with_message!(
-                    Errno::EOPNOTSUPP,
-                    "disconnecting a connecting, connected, or listening TCP socket is not supported"
-                )
-            }
+        if let State::Init(init_stream) = state.as_mut() {
+            init_stream.disconnect();
+            return;
         }
+
+        let locks = *self.bind_locks.lock();
+        let can_reuse = options.socket.reuse_addr();
+        let is_dual_stack = self.is_dual_stack(&options);
+
+        let teardown = state.borrow_result(|owned_state| {
+            let (local_endpoint, teardown) = match owned_state {
+                State::Init(_) => unreachable!("`State::Init` is handled above"),
+                State::Connecting(connecting_stream) => (
+                    connecting_stream.local_endpoint(),
+                    Teardown::Connection(connecting_stream.into_connection()),
+                ),
+                State::Connected(connected_stream) => (
+                    connected_stream.local_endpoint(),
+                    Teardown::Connection(connected_stream.into_connection()),
+                ),
+                State::Listen(listen_stream) => (
+                    listen_stream.local_endpoint(),
+                    Teardown::Listeners(listen_stream.ifaces(), listen_stream.into_listeners()),
+                ),
+            };
+
+            // Bind the kept port again before the old one is released, so that no other socket
+            // can take it in the meantime.
+            let local_addr = locks.addr.then_some(local_endpoint.addr);
+            let bound_ports = if locks.port {
+                let addr = local_addr.unwrap_or(self.family.unspecified_endpoint().addr);
+                let endpoint = IpEndpoint::new(addr, local_endpoint.port);
+                BoundTcpPorts::rebind_owned(&endpoint, can_reuse, is_dual_stack)
+                    .inspect_err(|err| warn!("failed to keep the TCP port: {:?}", err))
+                    .ok()
+            } else {
+                None
+            };
+
+            let error = match &teardown {
+                Teardown::Connection(tcp_conn) if tcp_conn.disconnect() => Some(Errno::ECONNRESET),
+                Teardown::Connection(_) => None,
+                Teardown::Listeners(_, listeners) => {
+                    listeners.iter().for_each(|listener| listener.close());
+                    None
+                }
+            };
+
+            let init_stream = InitStream::new_disconnected(bound_ports, local_addr, error);
+            (State::Init(init_stream), teardown)
+        });
+
+        drop(options);
+        drop(state);
+
+        // Like `sk_error_report`, wake up blocked operations so that they see the new state.
+        self.pollee
+            .notify(IoEvents::IN | IoEvents::OUT | IoEvents::ERR | IoEvents::HUP);
+
+        teardown.finish();
+    }
+
+    /// Checks that the socket has not been disconnected since `nr_disconnects` was read.
+    ///
+    /// Like Linux, an operation that is blocked when the socket is disconnected fails with
+    /// `EPIPE`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/net/sock.h#L1225-L1238>
+    fn check_not_disconnected(&self, nr_disconnects: usize) -> Result<()> {
+        if self.nr_disconnects.load(Ordering::Relaxed) != nr_disconnects {
+            return_errno_with_message!(Errno::EPIPE, "the socket is disconnected while waiting");
+        }
+        Ok(())
     }
 
     fn check_connect(&self) -> Result<()> {
         let mut state = self.write_updated_state();
 
         match state.as_mut() {
-            State::Init(init_stream) => init_stream.finish_last_connect(),
+            State::Init(init_stream) => {
+                init_stream.finish_last_connect()?;
+                // The connection attempt is aborted (e.g., by `shutdown`) after the socket is
+                // disconnected.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L739-L740>
+                Err(init_stream.test_and_clear_error().unwrap_or_else(|| {
+                    Error::with_message(Errno::ECONNABORTED, "the connection is aborted")
+                }))
+            }
             State::Connecting(_) => {
                 return_errno_with_message!(Errno::EAGAIN, "the connection is pending")
             }
@@ -379,6 +496,7 @@ impl StreamSocket {
                 self.family,
                 &listener_options,
                 &self.timeouts,
+                *self.bind_locks.lock(),
                 is_nonblocking,
             );
             (
@@ -553,22 +671,35 @@ impl Socket for StreamSocket {
             self.family,
             options.socket.reuse_addr(),
             self.is_dual_stack(&options),
-        )
+        )?;
+
+        // Like Linux, the locks are only added and never removed.
+        let new_locks = BindLocks::from_bind(&endpoint);
+        let mut locks = self.bind_locks.lock();
+        locks.addr |= new_locks.addr;
+        locks.port |= new_locks.port;
+
+        Ok(())
     }
 
     fn connect(&self, socket_addr: SocketAddr) -> Result<()> {
         if let SocketAddr::Unspec(_) = socket_addr {
-            return self.disconnect();
+            self.nr_disconnects.fetch_add(1, Ordering::Relaxed);
+            self.disconnect();
+            return Ok(());
         }
 
         let remote_endpoint = socket_addr.try_into()?;
 
+        let nr_disconnects = self.nr_disconnects.load(Ordering::Relaxed);
         if let Some(result) = self.start_connect(&remote_endpoint) {
             return result;
         }
 
         let send_timeout = self.timeouts.send_timeout();
         self.wait_events(IoEvents::OUT, send_timeout.as_ref(), || {
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L717-L720>
+            self.check_not_disconnected(nr_disconnects)?;
             self.check_connect()
         })
         .map_err(|err| match err.error() {
@@ -633,8 +764,18 @@ impl Socket for StreamSocket {
                 connected_stream.shutdown(cmd, &self.pollee),
                 connected_stream.iface().clone(),
             ),
-            // TODO: shutdown listening stream
-            _ => return_errno_with_message!(Errno::EINVAL, "cannot shutdown"),
+            // Like Linux, shutting down the receiving half of a listening socket or a connecting
+            // socket disconnects it.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L938-L945>
+            State::Listen(_) if !cmd.shut_read() => return Ok(()),
+            State::Listen(_) | State::Connecting(_) => {
+                drop(state);
+                self.disconnect();
+                return Ok(());
+            }
+            State::Init(_) => {
+                return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected")
+            }
         };
 
         drop(state);
@@ -706,11 +847,15 @@ impl Socket for StreamSocket {
             warn!("sending control message is not supported");
         }
 
+        let nr_disconnects = self.nr_disconnects.load(Ordering::Relaxed);
         self.block_on_unless(
             flags.contains(SendFlags::MSG_DONTWAIT),
             IoEvents::OUT,
             self.timeouts.send_timeout(),
-            || self.try_send(reader, flags),
+            || {
+                self.check_not_disconnected(nr_disconnects)?;
+                self.try_send(reader, flags)
+            },
         )
 
         // TODO: Trigger `SIGPIPE` if the error code is `EPIPE` and `MSG_NOSIGNAL` is not specified
@@ -726,11 +871,15 @@ impl Socket for StreamSocket {
             warn!("unsupported flags: {:?}", flags);
         }
 
+        let nr_disconnects = self.nr_disconnects.load(Ordering::Relaxed);
         let (received_bytes, ()) = self.recv_stream(
             writer,
             flags,
             self.timeouts.recv_timeout(),
-            |writer| self.try_recv(writer, flags).map(|(len, _)| (len, ())),
+            |writer| {
+                self.check_not_disconnected(nr_disconnects)?;
+                self.try_recv(writer, flags).map(|(len, _)| (len, ()))
+            },
             |()| false,
         )?;
 
@@ -1125,17 +1274,10 @@ impl Drop for StreamSocket {
             State::Connecting(connecting_stream) => connecting_stream.into_connection(),
             State::Connected(connected_stream) => connected_stream.into_connection(),
             State::Listen(listen_stream) => {
-                let ifaces_to_poll = listen_stream.ifaces();
+                let ifaces = listen_stream.ifaces();
                 let listeners = listen_stream.into_listeners();
-                for listener in listeners.iter() {
-                    listener.close();
-                }
-                // Polling the ifaces drops the connections reset by `close`, which hold
-                // references to the listeners. So the listeners must be dropped afterward.
-                for iface in ifaces_to_poll {
-                    iface.poll();
-                }
-                drop(listeners);
+                listeners.iter().for_each(|listener| listener.close());
+                Teardown::Listeners(ifaces, listeners).finish();
                 return;
             }
         };

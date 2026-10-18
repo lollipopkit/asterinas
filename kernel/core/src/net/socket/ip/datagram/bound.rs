@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use aster_bigtcp::{
     errors::udp::{RecvError, SendError},
+    socket::UdpRecvQueue,
     wire::{IpAddress, IpEndpoint},
 };
 
@@ -10,8 +13,9 @@ use crate::{
     events::IoEvents,
     net::{
         iface::{Iface, UdpSocket},
+        route::is_broadcast_endpoint,
         socket::{
-            ip::common::select_source,
+            ip::common::{BindLocks, select_source},
             util::{RecvFlags, RecvOutput, SendFlags, datagram_common},
         },
     },
@@ -26,17 +30,24 @@ const MAX_UDP_PAYLOAD_LEN: usize = u16::MAX as usize;
 ///
 /// A socket bound at a specified address has one bigtcp socket. A socket bound at the unspecified
 /// address has one bigtcp socket on each iface, and all the sockets share the same port number.
-//
-// TODO: Linux has one receive queue for each socket, but here each bigtcp socket has its own
-// receive queue. Datagrams that arrive at different ifaces may be received out of order.
+/// Like Linux, all the bigtcp sockets share one receive queue, so datagrams are received in their
+/// arrival order.
 pub(super) struct BoundDatagram {
     // INVARIANT: `bound_sockets` is not empty, and the first socket is bound at the local
     // endpoint.
     bound_sockets: Vec<UdpSocket>,
+    recv_queue: Arc<UdpRecvQueue>,
     remote_endpoint: Option<IpEndpoint>,
     /// The source address selected by `connect` if the socket is bound at the unspecified
     /// address.
     connected_source: Option<ConnectedSource>,
+    /// Whether the route to the remote endpoint has been checked, like a cached route (i.e.,
+    /// `sk_dst_cache`) in Linux.
+    ///
+    /// Like Linux, a datagram to the remote endpoint is not checked against `SO_BROADCAST` if the
+    /// route is cached. The cache is set by a successful `connect` or `send`, and is reset by
+    /// every `connect`, even if it fails.
+    is_route_cached: AtomicBool,
     locks: BindLocks,
 }
 
@@ -47,25 +58,66 @@ struct ConnectedSource {
     socket_index: usize,
 }
 
-/// Whether the local address and the local port are specified by `bind`.
-///
-/// These correspond to `SOCK_BINDADDR_LOCK` and `SOCK_BINDPORT_LOCK` in Linux, which decide what
-/// is kept after `connect(AF_UNSPEC)`.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct BindLocks {
-    pub(super) addr: bool,
-    pub(super) port: bool,
-}
-
 impl BoundDatagram {
-    pub(super) fn new(bound_sockets: Vec<UdpSocket>, locks: BindLocks) -> Self {
+    pub(super) fn new(
+        bound_sockets: Vec<UdpSocket>,
+        recv_queue: Arc<UdpRecvQueue>,
+        locks: BindLocks,
+    ) -> Self {
         debug_assert!(!bound_sockets.is_empty());
         Self {
             bound_sockets,
+            recv_queue,
             remote_endpoint: None,
             connected_source: None,
+            is_route_cached: AtomicBool::new(false),
             locks,
         }
+    }
+
+    /// Connects to the remote endpoint.
+    ///
+    /// Like Linux, connecting to a broadcast address requires `SO_BROADCAST`. If connecting
+    /// fails, the socket stays associated with the previous remote endpoint (if any), but the
+    /// route must be checked again.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/datagram.c#L36-L63>
+    pub(super) fn connect(&mut self, remote: &IpEndpoint, can_broadcast: bool) -> Result<()> {
+        *self.is_route_cached.get_mut() = false;
+
+        if !can_broadcast && is_broadcast_endpoint(remote) {
+            return_errno_with_message!(
+                Errno::EACCES,
+                "connecting to a broadcast address without SO_BROADCAST is not allowed"
+            );
+        }
+
+        datagram_common::Bound::set_remote_endpoint(self, remote)?;
+        *self.is_route_cached.get_mut() = true;
+
+        Ok(())
+    }
+
+    /// Checks the route to the connected remote endpoint if it is not cached.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L1402-L1432>
+    pub(super) fn check_connected_route(&self, can_broadcast: bool) -> Result<()> {
+        if self.is_route_cached.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        if let Some(remote) = self.remote_endpoint.as_ref()
+            && !can_broadcast
+            && is_broadcast_endpoint(remote)
+        {
+            return_errno_with_message!(
+                Errno::EACCES,
+                "sending to a broadcast address without SO_BROADCAST is not allowed"
+            );
+        }
+
+        self.is_route_cached.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn first_socket(&self) -> &UdpSocket {
@@ -80,15 +132,13 @@ impl BoundDatagram {
     /// always reset.
     ///
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L2168-L2193>
-    //
-    // TODO: Linux keeps the received datagrams after releasing the port, but they are dropped
-    // with the bound socket here.
     pub(super) fn disconnect(&mut self) -> Option<UnboundDatagram> {
         for bound_socket in self.bound_sockets.iter() {
             bound_socket.disconnect();
         }
         self.remote_endpoint = None;
         self.connected_source = None;
+        *self.is_route_cached.get_mut() = false;
 
         if self.locks.port {
             return None;
@@ -97,7 +147,10 @@ impl BoundDatagram {
             .locks
             .addr
             .then(|| self.first_socket().local_endpoint().addr);
-        Some(UnboundDatagram::new_disconnected(local_addr))
+        Some(UnboundDatagram::new_disconnected(
+            local_addr,
+            self.recv_queue.clone(),
+        ))
     }
 
     /// Returns the ifaces of the bigtcp sockets.
@@ -153,7 +206,7 @@ impl BoundDatagram {
         &self,
         reader: &mut dyn MultiRead,
         remote: &IpEndpoint,
-        _flags: SendFlags,
+        flags: SendFlags,
     ) -> Result<(usize, &Arc<Iface>)> {
         let len = reader.sum_lens();
         if len > MAX_UDP_PAYLOAD_LEN {
@@ -167,9 +220,15 @@ impl BoundDatagram {
         let mut data = vec![0u8; len];
         reader.read(&mut VmWriter::from(data.as_mut_slice()))?;
 
-        let result = bound_socket.send(len, *remote, source_addr, |socket_buffer| {
-            socket_buffer.copy_from_slice(&data)
-        });
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/ip_output.c#L1195-L1196>
+        let confirm_neighbor = flags.contains(SendFlags::MSG_CONFIRM);
+        let result = bound_socket.send(
+            len,
+            *remote,
+            source_addr,
+            confirm_neighbor,
+            |socket_buffer| socket_buffer.copy_from_slice(&data),
+        );
 
         match result {
             Ok(()) => Ok((len, bound_socket.iface())),
@@ -235,37 +294,7 @@ impl datagram_common::Bound for BoundDatagram {
         writer: &mut dyn MultiWrite,
         flags: RecvFlags,
     ) -> Result<(RecvOutput, Self::Endpoint)> {
-        // User space cannot be accessed while holding spin locks, so the packet is first copied to
-        // a kernel buffer. If copying to user space fails later, the packet is dropped like Linux.
-        let user_len = writer.sum_lens();
-        let mut result = Err(RecvError::Exhausted);
-        for bound_socket in self.bound_sockets.iter() {
-            result = bound_socket.recv(flags.receive_behavior(), |packet, udp_metadata| {
-                let copy_len = packet.len().min(user_len);
-                (
-                    packet[..copy_len].to_vec(),
-                    udp_metadata.endpoint,
-                    packet.len(),
-                )
-            });
-            if !matches!(result, Err(RecvError::Exhausted)) {
-                break;
-            }
-        }
-
-        match result {
-            Ok((data, endpoint, message_len)) => {
-                let copied_len = writer.write(&mut VmReader::from(data.as_slice()))?;
-                let output = RecvOutput::new_for_packet(flags, copied_len, message_len);
-                Ok((output, endpoint))
-            }
-            Err(RecvError::Exhausted) => {
-                return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty")
-            }
-            Err(RecvError::Truncated) => {
-                unreachable!("`recv` should never fail with `RecvError::Truncated`")
-            }
-        }
+        recv_from_queue(&self.recv_queue, writer, flags)
     }
 
     fn try_send(
@@ -278,17 +307,13 @@ impl datagram_common::Bound for BoundDatagram {
     }
 
     fn check_io_events(&self) -> IoEvents {
-        let mut can_recv = false;
-        let mut can_send = true;
-        for bound_socket in self.bound_sockets.iter() {
-            bound_socket.raw_with(|socket| {
-                can_recv |= socket.can_recv();
-                can_send &= socket.can_send();
-            });
-        }
+        let can_send = self
+            .bound_sockets
+            .iter()
+            .all(|bound_socket| bound_socket.raw_with(|socket| socket.can_send()));
 
         let mut events = IoEvents::empty();
-        if can_recv {
+        if self.recv_queue.can_recv() {
             events |= IoEvents::IN;
         }
         // Datagrams may be sent from any of the sockets.
@@ -296,5 +321,38 @@ impl datagram_common::Bound for BoundDatagram {
             events |= IoEvents::OUT;
         }
         events
+    }
+}
+
+/// Receives a datagram from the receive queue.
+pub(super) fn recv_from_queue(
+    recv_queue: &UdpRecvQueue,
+    writer: &mut dyn MultiWrite,
+    flags: RecvFlags,
+) -> Result<(RecvOutput, IpEndpoint)> {
+    // User space cannot be accessed while holding spin locks, so the packet is first copied to a
+    // kernel buffer. If copying to user space fails later, the packet is dropped like Linux.
+    let user_len = writer.sum_lens();
+    let result = recv_queue.recv(flags.receive_behavior(), |packet, udp_metadata| {
+        let copy_len = packet.len().min(user_len);
+        (
+            packet[..copy_len].to_vec(),
+            udp_metadata.endpoint,
+            packet.len(),
+        )
+    });
+
+    match result {
+        Ok((data, endpoint, message_len)) => {
+            let copied_len = writer.write(&mut VmReader::from(data.as_slice()))?;
+            let output = RecvOutput::new_for_packet(flags, copied_len, message_len);
+            Ok((output, endpoint))
+        }
+        Err(RecvError::Exhausted) => {
+            return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty")
+        }
+        Err(RecvError::Truncated) => {
+            unreachable!("`recv` should never fail with `RecvError::Truncated`")
+        }
     }
 }

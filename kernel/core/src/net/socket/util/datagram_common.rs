@@ -26,6 +26,15 @@ pub(crate) trait Unbound {
         pollee: &Pollee,
     ) -> Result<Self::Bound>;
 
+    /// Receives a message, which is possible if messages are kept after the socket is unbound.
+    fn try_recv(
+        &self,
+        _writer: &mut dyn MultiWrite,
+        _flags: RecvFlags,
+    ) -> Result<(RecvOutput, Self::Endpoint)> {
+        return_errno_with_message!(Errno::EAGAIN, "the socket is not bound");
+    }
+
     fn check_io_events(&self) -> IoEvents;
 }
 
@@ -130,9 +139,7 @@ where
         flags: RecvFlags,
     ) -> Result<(RecvOutput, UnboundSocket::Endpoint)> {
         match self {
-            Inner::Unbound(_) => {
-                return_errno_with_message!(Errno::EAGAIN, "the socket is not bound");
-            }
+            Inner::Unbound(unbound_datagram) => unbound_datagram.try_recv(writer, flags),
             Inner::Bound(bound_datagram) => bound_datagram.try_recv(writer, flags),
         }
     }

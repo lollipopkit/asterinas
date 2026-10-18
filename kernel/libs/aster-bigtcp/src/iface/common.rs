@@ -51,6 +51,9 @@ pub struct IfaceCommon<E: Ext> {
 pub(super) struct TxPacketWithDst {
     pub(super) packet: TxPacket<NetworkLayer>,
     pub(super) dst_addr: IpAddress,
+    /// Whether the packet confirms that the next hop is reachable, like
+    /// `skb->dst_pending_confirm` in Linux.
+    pub(super) confirm_neighbor: bool,
 }
 
 pub(super) enum PhyProcessResult {
@@ -384,6 +387,17 @@ impl<E: Ext> BoundTcpPort<E> {
     ///
     /// The bound address will be converted to a unicast address belonging to the local interface if
     /// it is a broadcast address.
+    ///
+    /// Like Linux, which binds the socket at the source address selected by routing when
+    /// connecting, this does not check bind conflicts at the new address. If another socket is
+    /// bound there, both sockets hold the port at that address afterward. Each socket still
+    /// accounts for its own reservation (including whether it is reusable) in `PortState`, so
+    /// new sockets can bind there only if all the sockets allow reuse, and the port is released
+    /// when all the sockets are closed.
+    ///
+    /// References:
+    /// - <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L536-L538>
+    /// - <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp_ipv4.c#L273-L278>
     pub(crate) fn ensure_unicast(&mut self, interface: &PollableIface<E>) {
         let new_addr = interface.map_broadcast_to_local(self.addr);
         if new_addr == self.addr {

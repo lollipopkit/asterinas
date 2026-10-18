@@ -2,7 +2,7 @@
 
 use core::{
     net::Ipv4Addr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicI32, Ordering},
 };
 
 use aster_bigtcp::{
@@ -32,6 +32,9 @@ use crate::{
 
 pub(super) struct InitStream {
     bound_ports: Option<BoundTcpPorts>,
+    /// The local address specified by `bind`, which is kept after `connect(AF_UNSPEC)` releases
+    /// the port.
+    local_addr: Option<IpAddress>,
     /// Indicates if the last `connect()` is considered to be done.
     ///
     /// If `connect()` is called but we're still in the `InitStream`, this means that the
@@ -46,28 +49,28 @@ pub(super) struct InitStream {
     ///    `connect()`, which checks and resets the boolean value and returns an appropriate error
     ///    code.
     is_connect_done: bool,
-    /// Indicates whether the socket error is `ECONNREFUSED`.
+    /// The pending socket error, or zero if there is none.
     ///
-    /// This boolean value is set to true when the connection is refused and set to false when the
-    /// error code is reported via `getsockopt(SOL_SOCKET, SO_ERROR)`, `send()`, `recv()`, or
-    /// `connect()`.
-    is_conn_refused: AtomicBool,
+    /// This is set to `ECONNREFUSED` when the connection is refused, or `ECONNRESET` when the
+    /// connection is reset by `connect(AF_UNSPEC)`. It is cleared when the error code is reported
+    /// via `getsockopt(SOL_SOCKET, SO_ERROR)`, `send()`, `recv()`, or `connect()`.
+    error: AtomicI32,
 }
 
 impl InitStream {
     pub(super) fn new() -> Self {
         Self {
             bound_ports: None,
+            local_addr: None,
             is_connect_done: true,
-            is_conn_refused: AtomicBool::new(false),
+            error: AtomicI32::new(0),
         }
     }
 
     pub(super) fn new_bound(bound_ports: BoundTcpPorts) -> Self {
         Self {
             bound_ports: Some(bound_ports),
-            is_connect_done: true,
-            is_conn_refused: AtomicBool::new(false),
+            ..Self::new()
         }
     }
 
@@ -75,7 +78,24 @@ impl InitStream {
         Self {
             bound_ports: Some(bound_port.into()),
             is_connect_done: false,
-            is_conn_refused: AtomicBool::new(true),
+            error: AtomicI32::new(Errno::ECONNREFUSED as i32),
+            ..Self::new()
+        }
+    }
+
+    /// Creates a socket that is disconnected by `connect(AF_UNSPEC)`.
+    ///
+    /// If `bound_ports` is `None`, the port is released, but `local_addr` (if any) is kept.
+    pub(super) fn new_disconnected(
+        bound_ports: Option<BoundTcpPorts>,
+        local_addr: Option<IpAddress>,
+        error: Option<Errno>,
+    ) -> Self {
+        Self {
+            bound_ports,
+            local_addr,
+            error: AtomicI32::new(error.map_or(0, |errno| errno as i32)),
+            ..Self::new()
         }
     }
 
@@ -100,6 +120,7 @@ impl InitStream {
         }
 
         self.bound_ports = Some(BoundTcpPorts::bind(endpoint, can_reuse, is_dual_stack)?);
+        self.local_addr = None;
 
         Ok(())
     }
@@ -169,9 +190,12 @@ impl InitStream {
                 Err((err, bound_ports)) => return Err((err, Self::new_bound(bound_ports))),
             }
         } else {
-            let endpoint = match get_ephemeral_endpoint(&route_endpoint) {
-                Ok(endpoint) => endpoint,
-                Err(err) => return Err((err, self)),
+            let endpoint = match self.local_addr {
+                Some(addr) => IpEndpoint::new(addr, 0),
+                None => match get_ephemeral_endpoint(&route_endpoint) {
+                    Ok(endpoint) => endpoint,
+                    Err(err) => return Err((err, self)),
+                },
             };
             match BoundTcpPorts::bind(&endpoint, can_reuse, false) {
                 Ok(bound_ports) => bound_ports.into_ports().pop().unwrap(),
@@ -214,16 +238,13 @@ impl InitStream {
 
         self.is_connect_done = true;
 
-        let is_conn_refused = self.is_conn_refused.get_mut();
-        if *is_conn_refused {
-            *is_conn_refused = false;
-            return_errno_with_message!(Errno::ECONNREFUSED, "the connection is refused");
-        } else {
-            return_errno_with_message!(
-                Errno::ECONNABORTED,
-                "the error code for the connection failure is not available"
-            );
+        if let Some(err) = self.test_and_clear_error() {
+            return Err(err);
         }
+        return_errno_with_message!(
+            Errno::ECONNABORTED,
+            "the error code for the connection failure is not available"
+        );
     }
 
     pub(super) fn listen(
@@ -250,9 +271,14 @@ impl InitStream {
         let bound_ports = if let Some(bound_ports) = self.bound_ports {
             bound_ports
         } else {
-            // An unbound socket is bound to the unspecified address with an ephemeral port.
+            // An unbound socket is bound to the unspecified address (or the address kept by
+            // `connect(AF_UNSPEC)`) with an ephemeral port.
             // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/ipv4/inet_connection_sock.c#L1363>.
-            let endpoint = family.unspecified_endpoint();
+            let endpoint = self
+                .local_addr
+                .map_or(family.unspecified_endpoint(), |addr| {
+                    IpEndpoint::new(addr, 0)
+                });
             match BoundTcpPorts::bind(&endpoint, can_reuse, is_dual_stack) {
                 Ok(bound_ports) => bound_ports,
                 Err(err) => return Err((err, self)),
@@ -273,12 +299,15 @@ impl InitStream {
 
         // Below are some magic checks to make our behavior identical to Linux.
 
-        if self.is_connect_done {
-            return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected");
-        }
-
         if let Some(err) = self.test_and_clear_error() {
             return Err(err);
+        }
+
+        // Before the last `connect()` is done, the refused socket is shut down, so EOF is
+        // reported. After that, Linux disconnects the socket, which clears the shutdown state.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp.c#L2759-L2776>
+        if self.is_connect_done {
+            return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected");
         }
 
         Ok((0, UNSPECIFIED_SOCKET_ADDR))
@@ -293,16 +322,17 @@ impl InitStream {
     }
 
     pub(super) fn local_endpoint(&self) -> Option<IpEndpoint> {
-        self.bound_ports
-            .as_ref()
-            .map(|bound_ports| bound_ports.local_endpoint())
+        if let Some(bound_ports) = self.bound_ports.as_ref() {
+            return Some(bound_ports.local_endpoint());
+        }
+        self.local_addr.map(|addr| IpEndpoint::new(addr, 0))
     }
 
     pub(super) fn check_io_events(&self) -> IoEvents {
         // Linux adds OUT and HUP events for a newly created socket
         let mut events = IoEvents::OUT | IoEvents::HUP;
 
-        if self.is_conn_refused.load(Ordering::Relaxed) {
+        if self.error.load(Ordering::Relaxed) != 0 {
             events |= IoEvents::ERR;
         }
 
@@ -310,13 +340,12 @@ impl InitStream {
     }
 
     pub(super) fn test_and_clear_error(&self) -> Option<Error> {
-        if self.is_conn_refused.swap(false, Ordering::Relaxed) {
-            Some(Error::with_message(
-                Errno::ECONNREFUSED,
-                "the connection is refused",
-            ))
-        } else {
-            None
-        }
+        let errno = Errno::try_from(self.error.swap(0, Ordering::Relaxed)).ok()?;
+        let message = match errno {
+            Errno::ECONNREFUSED => "the connection is refused",
+            Errno::ECONNRESET => "the connection is reset",
+            _ => "the socket has an error",
+        };
+        Some(Error::with_message(errno, message))
     }
 }

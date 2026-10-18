@@ -1,37 +1,60 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use aster_bigtcp::{
-    socket::UdpSocket,
+    socket::{UdpRecvQueue, UdpSocket},
     wire::{IpAddress, IpEndpoint},
 };
 
 use super::{
-    bound::{BindLocks, BoundDatagram},
+    bound::{BoundDatagram, recv_from_queue},
     observer::DatagramObserver,
 };
 use crate::{
     events::IoEvents,
     net::socket::{
-        ip::{addr::UNSPECIFIED_LOCAL_ENDPOINT, common::bind_ports},
-        util::datagram_common,
+        ip::{
+            addr::UNSPECIFIED_LOCAL_ENDPOINT,
+            common::{BindLocks, bind_ports},
+        },
+        util::{RecvFlags, RecvOutput, datagram_common},
     },
     prelude::*,
     process::signal::Pollee,
+    util::MultiWrite,
 };
 
 pub(super) struct UnboundDatagram {
     /// The local address specified by `bind`, which is kept after `connect(AF_UNSPEC)` releases
     /// the port.
     local_addr: Option<IpAddress>,
+    /// The receive queue, which is created when the socket is bound for the first time.
+    ///
+    /// Like Linux, the received datagrams are kept after `connect(AF_UNSPEC)` releases the port.
+    recv_queue: Option<Arc<UdpRecvQueue>>,
 }
 
 impl UnboundDatagram {
     pub(super) fn new() -> Self {
-        Self { local_addr: None }
+        Self {
+            local_addr: None,
+            recv_queue: None,
+        }
     }
 
-    pub(super) fn new_disconnected(local_addr: Option<IpAddress>) -> Self {
-        Self { local_addr }
+    pub(super) fn new_disconnected(
+        local_addr: Option<IpAddress>,
+        recv_queue: Arc<UdpRecvQueue>,
+    ) -> Self {
+        Self {
+            local_addr,
+            recv_queue: Some(recv_queue),
+        }
+    }
+
+    fn recv_queue(&mut self) -> Arc<UdpRecvQueue> {
+        self.recv_queue
+            .get_or_insert_with(UdpRecvQueue::new)
+            .clone()
     }
 
     /// Returns the local endpoint, whose port is always zero.
@@ -57,11 +80,14 @@ impl datagram_common::Unbound for UnboundDatagram {
         pollee: &Pollee,
         options: BindOptions,
     ) -> Result<Self::Bound> {
-        let locks = BindLocks {
-            addr: !endpoint.addr.is_unspecified(),
-            port: endpoint.port != 0,
-        };
-        new_bound(endpoint, options.can_reuse, locks, pollee)
+        let locks = BindLocks::from_bind(endpoint);
+        new_bound(
+            endpoint,
+            options.can_reuse,
+            locks,
+            self.recv_queue(),
+            pollee,
+        )
     }
 
     /// Binds the socket to an ephemeral port.
@@ -80,11 +106,36 @@ impl datagram_common::Unbound for UnboundDatagram {
             addr: self.local_addr.is_some(),
             port: false,
         };
-        new_bound(&self.local_endpoint(), false, locks, pollee)
+        new_bound(
+            &self.local_endpoint(),
+            false,
+            locks,
+            self.recv_queue(),
+            pollee,
+        )
+    }
+
+    fn try_recv(
+        &self,
+        writer: &mut dyn MultiWrite,
+        flags: RecvFlags,
+    ) -> Result<(RecvOutput, Self::Endpoint)> {
+        match self.recv_queue.as_ref() {
+            Some(recv_queue) => recv_from_queue(recv_queue, writer, flags),
+            None => return_errno_with_message!(Errno::EAGAIN, "the socket is not bound"),
+        }
     }
 
     fn check_io_events(&self) -> IoEvents {
-        IoEvents::OUT
+        let mut events = IoEvents::OUT;
+        if self
+            .recv_queue
+            .as_ref()
+            .is_some_and(|recv_queue| recv_queue.can_recv())
+        {
+            events |= IoEvents::IN;
+        }
+        events
     }
 }
 
@@ -92,6 +143,7 @@ fn new_bound(
     endpoint: &IpEndpoint,
     can_reuse: bool,
     locks: BindLocks,
+    recv_queue: Arc<UdpRecvQueue>,
     pollee: &Pollee,
 ) -> Result<BoundDatagram> {
     let bound_ports = bind_ports(endpoint, can_reuse, false, |iface, config| {
@@ -101,7 +153,11 @@ fn new_bound(
     let bound_sockets = bound_ports
         .into_iter()
         .map(|bound_port| {
-            match UdpSocket::new_bind(bound_port, DatagramObserver::new(pollee.clone())) {
+            match UdpSocket::new_bind(
+                bound_port,
+                recv_queue.clone(),
+                DatagramObserver::new(pollee.clone()),
+            ) {
                 Ok(bound_socket) => bound_socket,
                 Err((_, err)) => {
                     unreachable!("`new_bind` fails with {:?}, which should not happen", err)
@@ -110,5 +166,5 @@ fn new_bound(
         })
         .collect();
 
-    Ok(BoundDatagram::new(bound_sockets, locks))
+    Ok(BoundDatagram::new(bound_sockets, recv_queue, locks))
 }

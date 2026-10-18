@@ -76,8 +76,9 @@ const LOCKTIME_MS: u64 = 1000;
 /// - `Probe`: Unicast requests are sent to the known address. The entry is removed if no reply
 ///   arrives.
 ///
-/// TODO: Linux also moves `Delay` entries back to `Reachable` if upper layers (e.g., TCP)
-/// confirm that the neighbor is reachable (see `neigh_confirm`). Support such confirmations.
+/// Like Linux, upper layers (e.g., TCP) can also confirm that a neighbor is reachable (see
+/// [`Self::confirm`]). Then a `Reachable` entry stays reachable and a `Delay` entry becomes
+/// `Reachable` again without being reprobed.
 pub(super) struct NeighborCache {
     local_ether: EthernetAddress,
     entries: BTreeMap<Ipv4Address, Neighbor>,
@@ -94,6 +95,11 @@ struct Neighbor {
     state: State,
     /// The last time at which the state or the address changed, like `neigh->updated` in Linux.
     updated_at_ms: u64,
+    /// The last time at which the neighbor was confirmed to be reachable, like `neigh->confirmed`
+    /// in Linux.
+    ///
+    /// This is `None` if the neighbor has never been confirmed.
+    confirmed_at_ms: Option<u64>,
 }
 
 enum State {
@@ -182,6 +188,7 @@ impl NeighborCache {
                     next_probe_at_ms: now_ms + RETRANS_TIME_MS,
                 },
                 now_ms,
+                None,
             );
             return new_probe();
         };
@@ -235,7 +242,8 @@ impl NeighborCache {
         let len = self.entries.len();
         let Some(neighbor) = self.entries.get_mut(&ip_addr) else {
             if update.may_create && len < MAX_NR_ENTRIES {
-                self.insert(ip_addr, new_state, now_ms);
+                let confirmed_at_ms = update.confirms.then_some(now_ms);
+                self.insert(ip_addr, new_state, now_ms, confirmed_at_ms);
             }
             return;
         };
@@ -257,6 +265,13 @@ impl NeighborCache {
                 neighbor.updated_at_ms = now_ms;
             }
             neighbor.state = new_state;
+            // A new address that is not confirmed invalidates the last confirmation.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/neighbour.c#L1495-L1502>
+            if update.confirms {
+                neighbor.confirmed_at_ms = Some(now_ms);
+            } else if old_ether_addr != ether_addr {
+                neighbor.confirmed_at_ms = None;
+            }
         } else {
             let State::Incomplete { queue, .. } =
                 core::mem::replace(&mut neighbor.state, new_state)
@@ -264,6 +279,9 @@ impl NeighborCache {
                 unreachable!("only incomplete neighbors have no Ethernet addresses");
             };
             neighbor.updated_at_ms = now_ms;
+            if update.confirms {
+                neighbor.confirmed_at_ms = Some(now_ms);
+            }
 
             let ether_repr = self.ether_repr(ether_addr);
             self.ready.extend(
@@ -276,6 +294,19 @@ impl NeighborCache {
 
         if update.confirms {
             self.arm_timer(now_ms + REACHABLE_TIME_MS);
+        }
+    }
+
+    /// Confirms that a neighbor is reachable, which is what `neigh_confirm` does in Linux.
+    ///
+    /// This only records the time of the confirmation. When the timer of the entry expires, a
+    /// recently confirmed entry becomes or stays `Reachable` instead of being reprobed. Entries
+    /// that are being resolved or probed need a reply to the address resolution request.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/net/neighbour.h#L331-L340>
+    pub(super) fn confirm(&mut self, ip_addr: Ipv4Address, now_ms: u64) {
+        if let Some(neighbor) = self.entries.get_mut(&ip_addr) {
+            neighbor.confirmed_at_ms = Some(now_ms);
         }
     }
 
@@ -322,7 +353,13 @@ impl NeighborCache {
         self.next_timer_at_ms
     }
 
-    fn insert(&mut self, ip_addr: Ipv4Address, state: State, now_ms: u64) {
+    fn insert(
+        &mut self,
+        ip_addr: Ipv4Address,
+        state: State,
+        now_ms: u64,
+        confirmed_at_ms: Option<u64>,
+    ) {
         if let Some(at_ms) = state.timer_at_ms() {
             self.arm_timer(at_ms);
         }
@@ -331,6 +368,7 @@ impl NeighborCache {
             Neighbor {
                 state,
                 updated_at_ms: now_ms,
+                confirmed_at_ms,
             },
         );
     }
@@ -358,6 +396,7 @@ impl Neighbor {
             return true;
         }
 
+        let confirmed_at_ms = self.confirmed_at_ms;
         match &mut self.state {
             State::Incomplete {
                 probes,
@@ -374,11 +413,22 @@ impl Neighbor {
                 *next_probe_at_ms = now_ms + RETRANS_TIME_MS;
                 probe(None);
             }
-            State::Reachable { ether_addr, .. } => {
+            State::Reachable {
+                ether_addr,
+                expires_at_ms,
+            } => {
+                // A recently confirmed entry stays reachable.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/neighbour.c#L1117-L1121>
+                if let Some(at_ms) = confirmed_until_ms(confirmed_at_ms, REACHABLE_TIME_MS, now_ms)
+                {
+                    *expires_at_ms = at_ms;
+                    return true;
+                }
+
                 // Linux moves the entry to `NUD_DELAY` instead if it was used within
                 // `DELAY_PROBE_TIME`. However, sending through a reachable entry does not mark it
                 // as used in Linux (see `neigh_hh_output`), so this rarely happens.
-                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/neighbour.c#L1117>
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/neighbour.c#L1122-L1136>
                 self.state = State::Stale {
                     ether_addr: *ether_addr,
                 };
@@ -387,6 +437,21 @@ impl Neighbor {
             State::Stale { .. } => unreachable!("stale neighbors have no timers"),
             State::Delay { ether_addr, .. } => {
                 let ether_addr = *ether_addr;
+
+                // A recently confirmed entry becomes reachable again without being reprobed.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/neighbour.c#L1137-L1146>
+                if let Some(confirmed_at_ms) = confirmed_at_ms
+                    && confirmed_until_ms(Some(confirmed_at_ms), DELAY_PROBE_TIME_MS, now_ms)
+                        .is_some()
+                {
+                    self.state = State::Reachable {
+                        ether_addr,
+                        expires_at_ms: confirmed_at_ms + REACHABLE_TIME_MS,
+                    };
+                    self.updated_at_ms = now_ms;
+                    return true;
+                }
+
                 self.state = State::Probe {
                     ether_addr,
                     probes: 1,
@@ -411,6 +476,17 @@ impl Neighbor {
 
         true
     }
+}
+
+/// Returns the time until which a confirmation at `confirmed_at_ms` lasts for `duration_ms`, if
+/// it has not expired at `now_ms`.
+///
+/// Like other timers here, a confirmation expires exactly at the end of `duration_ms`. Linux
+/// keeps it until the next timer tick at that time, which is not significant.
+fn confirmed_until_ms(confirmed_at_ms: Option<u64>, duration_ms: u64, now_ms: u64) -> Option<u64> {
+    confirmed_at_ms
+        .map(|at_ms| at_ms + duration_ms)
+        .filter(|&until_ms| now_ms < until_ms)
 }
 
 impl State {
@@ -666,6 +742,70 @@ mod test {
         assert!(poll(&mut cache, t + RETRANS_TIME_MS * 3).is_empty());
         assert_eq!(cache.next_poll_at_ms(), Some(t + REACHABLE_TIME_MS));
         assert_eq!(send(&mut cache, t + RETRANS_TIME_MS * 3), Some(PEER));
+    }
+
+    #[ktest]
+    fn confirm_keeps_reachable() {
+        let mut cache = NeighborCache::new(LOCAL);
+        learn(&mut cache, PEER_IP, PEER);
+
+        // An active flow keeps confirming the neighbor, so it is never reprobed.
+        let mut last_confirmed_ms = 0;
+        for t in (1000..=REACHABLE_TIME_MS * 4).step_by(1000) {
+            if t % 10_000 == 0 {
+                cache.confirm(PEER_IP, t);
+                last_confirmed_ms = t;
+            }
+            assert!(poll(&mut cache, t).is_empty());
+            assert_eq!(send(&mut cache, t), Some(PEER));
+        }
+        assert_eq!(
+            cache.next_poll_at_ms(),
+            Some(last_confirmed_ms + REACHABLE_TIME_MS)
+        );
+
+        // Without confirmations, the entry becomes stale.
+        let t = last_confirmed_ms + REACHABLE_TIME_MS;
+        assert!(poll(&mut cache, t).is_empty());
+        assert!(poll(&mut cache, t + 1).is_empty());
+        assert_eq!(cache.next_poll_at_ms(), None);
+    }
+
+    #[ktest]
+    fn confirm_delayed() {
+        let mut cache = NeighborCache::new(LOCAL);
+        learn(&mut cache, PEER_IP, PEER);
+        poll(&mut cache, REACHABLE_TIME_MS + 1);
+
+        // A confirmation after the entry is used makes it reachable without reprobing.
+        let t = REACHABLE_TIME_MS + 100;
+        assert_eq!(send(&mut cache, t), Some(PEER));
+        cache.confirm(PEER_IP, t + 10);
+        assert!(poll(&mut cache, t + DELAY_PROBE_TIME_MS).is_empty());
+        assert_eq!(cache.next_poll_at_ms(), Some(t + 10 + REACHABLE_TIME_MS));
+        assert_eq!(send(&mut cache, t + DELAY_PROBE_TIME_MS), Some(PEER));
+
+        // A confirmation that is too old does not prevent reprobing.
+        let t = t + 10 + REACHABLE_TIME_MS;
+        assert!(poll(&mut cache, t + 1).is_empty());
+        assert_eq!(send(&mut cache, t + 1), Some(PEER));
+        assert_eq!(poll(&mut cache, t + 1 + DELAY_PROBE_TIME_MS), [Some(PEER)]);
+
+        // Confirmations do not stop reprobing, which needs a reply.
+        cache.confirm(PEER_IP, t + 1 + DELAY_PROBE_TIME_MS);
+        assert_eq!(
+            poll(&mut cache, t + 1 + DELAY_PROBE_TIME_MS + RETRANS_TIME_MS),
+            [Some(PEER)]
+        );
+    }
+
+    #[ktest]
+    fn confirm_unknown() {
+        let mut cache = NeighborCache::new(LOCAL);
+
+        // Confirming an unknown neighbor does nothing.
+        cache.confirm(PEER_IP, 0);
+        assert!(starts_resolution(&mut cache, PEER_IP, 0));
     }
 
     #[ktest]

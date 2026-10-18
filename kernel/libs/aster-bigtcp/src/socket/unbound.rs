@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{boxed::Box, vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 
 pub(super) type RawTcpSocket = smoltcp::socket::tcp::Socket<'static>;
 pub type RawUdpSocket = smoltcp::socket::udp::Socket<'static>;
@@ -14,13 +14,15 @@ pub(super) fn new_tcp_socket() -> Box<RawTcpSocket> {
     Box::new(raw_tcp_socket)
 }
 
+/// Creates a raw UDP socket that only sends datagrams.
+///
+/// Received datagrams are queued in a [`UdpRecvQueue`] instead.
+///
+/// [`UdpRecvQueue`]: super::bound::UdpRecvQueue
 pub(super) fn new_udp_socket() -> Box<RawUdpSocket> {
     let raw_udp_socket = {
         let metadata = smoltcp::socket::udp::PacketMetadata::EMPTY;
-        let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(
-            vec![metadata; UDP_METADATA_LEN],
-            vec![0u8; UDP_RECV_PAYLOAD_LEN],
-        );
+        let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(Vec::new(), Vec::new());
         let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(
             vec![metadata; UDP_METADATA_LEN],
             vec![0u8; UDP_SEND_PAYLOAD_LEN],
@@ -28,6 +30,14 @@ pub(super) fn new_udp_socket() -> Box<RawUdpSocket> {
         RawUdpSocket::new(rx_buffer, tx_buffer)
     };
     Box::new(raw_udp_socket)
+}
+
+pub(super) fn new_udp_recv_buffer() -> smoltcp::socket::udp::PacketBuffer<'static> {
+    let metadata = smoltcp::socket::udp::PacketMetadata::EMPTY;
+    smoltcp::socket::udp::PacketBuffer::new(
+        vec![metadata; UDP_METADATA_LEN],
+        vec![0u8; UDP_RECV_PAYLOAD_LEN],
+    )
 }
 
 // TCP socket buffer sizes:

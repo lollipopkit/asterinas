@@ -10,8 +10,8 @@ pub use tcp_conn::{ConnectState, RawTcpSocketExt, TcpConnection};
 pub(crate) use tcp_conn::{TcpConnectionBg, TcpProcessResult};
 pub use tcp_listen::TcpListener;
 pub(crate) use tcp_listen::TcpListenerBg;
-pub use udp::UdpSocket;
 pub(crate) use udp::UdpSocketBg;
+pub use udp::{UdpRecvQueue, UdpSocket};
 
 /// Describes how receive operations consume queued data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
