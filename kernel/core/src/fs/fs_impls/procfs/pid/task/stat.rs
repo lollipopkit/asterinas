@@ -199,7 +199,7 @@ impl ProcFileOps for StatFileOps {
         let nice = process.nice().load(Ordering::Relaxed).value().get();
         let num_threads = process.tasks().lock().as_slice().len();
         let itrealvalue = 0;
-        let starttime = duration_to_clock_t(process.start_time().as_duration());
+        let starttime = duration_to_clock_t(process.start_time());
 
         let (
             vsize,

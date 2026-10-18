@@ -5,7 +5,7 @@
 mod jiffies;
 
 use alloc::{boxed::Box, vec::Vec};
-use core::{cell::RefCell, sync::atomic::Ordering};
+use core::cell::RefCell;
 
 pub use jiffies::Jiffies;
 
@@ -46,7 +46,7 @@ pub(crate) fn call_timer_callback_functions(_: &TrapFrame) {
     let irq_guard = irq::disable_local();
 
     if irq_guard.current_cpu() == CpuId::bsp() {
-        jiffies::ELAPSED.fetch_add(1, Ordering::Relaxed);
+        jiffies::update_elapsed();
     }
 
     let callbacks_guard = INTERRUPT_CALLBACKS.get_with(&irq_guard);
