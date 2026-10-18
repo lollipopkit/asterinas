@@ -713,6 +713,11 @@ impl Process {
 
         if sig_num == SIGCONT {
             self.resume();
+
+            for task in self.tasks.lock().as_slice() {
+                let posix_thread = task.as_posix_thread().unwrap();
+                posix_thread.ptrace_notify_group_continue();
+            }
         }
     }
 
@@ -798,9 +803,19 @@ impl Process {
     }
 
     /// Stops the process.
+    ///
+    /// Traced threads do not stop here. Instead, they will trap into the group-stop and
+    /// report it to their tracers, even if the process has already been stopped.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2638-L2742>
     pub(crate) fn stop(&self, sig_num: SigNum) {
         if self.status.stop_status().stop(sig_num) {
             self.notify_parent_of_stop(CLD_STOPPED, sig_num.as_u8() as i32);
+        }
+
+        for task in self.tasks.lock().as_slice() {
+            let posix_thread = task.as_posix_thread().unwrap();
+            posix_thread.ptrace_notify_group_stop(sig_num);
         }
     }
 
@@ -824,6 +839,11 @@ impl Process {
         self.status.stop_status().is_stopped()
     }
 
+    /// Returns the signal that has stopped the process, if the process is stopped.
+    pub(in crate::process) fn stop_signal(&self) -> Option<SigNum> {
+        self.status.stop_status().stop_signal()
+    }
+
     /// Gets and clears the stop status changes for the `wait` syscall.
     pub(super) fn wait_stopped_or_continued(&self, options: WaitOptions) -> Option<StopWaitStatus> {
         self.status.stop_status().wait(options)
@@ -833,14 +853,27 @@ impl Process {
     ///
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2721-L2725>
     /// and <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2939-L2944>
-    //
-    // TODO: Notify the tracer as well if it is not the real parent. This requires reporting
-    // group-stops to the tracer, which is not supported yet.
+    ///
+    /// The tracer of the main thread is notified of a continuation as well, if it is not in
+    /// the real parent. Tracers are notified of group-stops by the traps of their tracees.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2941-L2943>
     fn notify_parent_of_stop(&self, code: i32, status: i32) {
         let parent = self.parent.lock().process().upgrade().unwrap();
         let main_thread = self.main_thread();
-        let child = ChildSource::Thread(main_thread.as_posix_thread().unwrap());
+        let main_posix_thread = main_thread.as_posix_thread().unwrap();
+        let child = ChildSource::Thread(main_posix_thread);
         sigchld::notify_parent_of_stop(child, &parent, code, status);
+
+        if code != CLD_CONTINUED {
+            return;
+        }
+        if let Some(tracer) = main_posix_thread.tracer() {
+            let tracer_process = tracer.as_posix_thread().unwrap().process();
+            if !Arc::ptr_eq(&tracer_process, &parent) {
+                sigchld::notify_parent_of_stop(child, &tracer_process, code, status);
+            }
+        }
     }
 
     fn wake_up_parent(&self) {

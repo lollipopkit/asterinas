@@ -47,8 +47,10 @@ fi
 ./pthread/pthread_signal_test
 ./pthread/pthread_test
 
+./ptrace/attach
 ./ptrace/clone_events
 ./ptrace/ptrace
+./ptrace/seize
 ./ptrace/set_options
 
 if [ "$(uname -m)" = "x86_64" ]; then

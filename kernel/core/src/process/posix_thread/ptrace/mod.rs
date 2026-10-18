@@ -18,9 +18,10 @@ use crate::{
         exit::send_child_death_signal,
         sigchld::{self, ChildSource},
         signal::{
-            DequeuedSignal, PauseReason,
+            DequeuedSignal, HandlePendingSignal, PauseReason,
             c_types::siginfo_t,
-            constants::{CLD_TRAPPED, SIGCHLD, SIGKILL, SIGSTOP, SIGTRAP},
+            constants::{CLD_STOPPED, CLD_TRAPPED, SIGCHLD, SIGKILL, SIGSTOP, SIGTRAP},
+            sig_num::SigNum,
             signals::{
                 kernel::KernelSignal,
                 raw::RawSignal,
@@ -34,12 +35,14 @@ use crate::{
 mod util;
 
 pub(in crate::process) use util::PtraceEvent;
-use util::StopDeliverySignal;
-pub(crate) use util::{PtraceContRequest, PtraceOptions, PtraceStopResult, PtraceWaitStatus};
+use util::{JobCtl, StopDeliverySignal, parse_resume_signal};
+pub(crate) use util::{
+    PtraceAttachMode, PtraceContRequest, PtraceOptions, PtraceStopResult, PtraceWaitStatus,
+};
 
 impl PosixThread {
     /// Returns whether this thread is being traced.
-    pub(in crate::process) fn is_traced(&self) -> bool {
+    pub(crate) fn is_traced(&self) -> bool {
         self.tracer().is_some()
     }
 
@@ -53,9 +56,14 @@ impl PosixThread {
     /// # Errors
     ///
     /// Returns `EPERM` if this thread is already being traced.
-    fn set_tracer(&self, tracer: Weak<Thread>, options: PtraceOptions) -> Result<()> {
+    fn set_tracer(
+        &self,
+        tracer: Weak<Thread>,
+        options: PtraceOptions,
+        is_seized: bool,
+    ) -> Result<()> {
         let status = self.tracee_status.call_once(TraceeStatus::new);
-        status.set_tracer(tracer, options)
+        status.set_tracer(tracer, options, is_seized)
     }
 
     /// Detaches the tracer of this thread.
@@ -169,7 +177,7 @@ impl PosixThread {
         child_thread: &Arc<Thread>,
     ) -> Option<PtraceEvent> {
         let child = child_thread.as_posix_thread().unwrap();
-        let (tracer_thread, options, event) = self
+        let (tracer_thread, options, is_seized, event) = self
             .tracee_status
             .get()?
             .clone_trace(clone_args, child.tid())?;
@@ -177,12 +185,16 @@ impl PosixThread {
         let tracer = tracer_thread.as_posix_thread().unwrap();
         // The child is newly created, so it cannot have been traced.
         let is_attached = tracer
-            .link_tracee(&tracer_thread, child_thread.clone(), options)
+            .link_tracee(&tracer_thread, child_thread.clone(), options, is_seized)
             .unwrap();
-        if is_attached {
-            // TODO: Set a pending trap (i.e., `JOBCTL_TRAP_STOP`) instead of `SIGSTOP`
-            // if the tracer has used `PTRACE_SEIZE`, after `PTRACE_SEIZE` is supported.
-            //
+        if !is_attached {
+            return event;
+        }
+
+        let child_status = child.tracee_status.get().unwrap();
+        if is_seized {
+            child_status.set_trap_stop_for_new_child(&child.process());
+        } else {
             // Linux adds `SIGSTOP` to the private pending set without a `siginfo`,
             // which is then reported as a `SI_USER` signal from PID 0 and UID 0.
             child.enqueue_signal(Box::new(UserSignal::new(
@@ -206,18 +218,99 @@ impl PosixThread {
             .and_then(|status| status.wait(options))
     }
 
-    /// Continues this thread from a ptrace-stop.
+    /// Continues this thread from a ptrace-stop with the signal in `data`.
     ///
     /// # Errors
     ///
-    /// Returns `ESRCH` if this thread is not ptrace-stopped.
-    pub(crate) fn ptrace_continue(&self, request: PtraceContRequest, ctx: &Context) -> Result<()> {
+    /// Returns `ESRCH` if this thread is not ptrace-stopped,
+    /// or `EIO` if `data` is not a valid signal number.
+    pub(crate) fn ptrace_continue(
+        &self,
+        request: PtraceContRequest,
+        data: usize,
+        ctx: &Context,
+    ) -> Result<()> {
         let status = self.get_tracee_status()?;
 
-        status.resume(request, ctx)?;
+        status.resume(request, data, ctx)?;
         self.wake_signalled_waker();
 
         Ok(())
+    }
+
+    /// Makes this seized thread trap with `PTRACE_EVENT_STOP` (`PTRACE_INTERRUPT`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `EIO` if this thread is not seized.
+    pub(crate) fn ptrace_interrupt(&self) -> Result<()> {
+        let status = self.get_tracee_status()?;
+
+        status.interrupt(self)?;
+        self.wake_signalled_waker();
+
+        Ok(())
+    }
+
+    /// Makes this seized thread listen for events in a `PTRACE_EVENT_STOP` (`PTRACE_LISTEN`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ESRCH` if this thread is not ptrace-stopped,
+    /// or `EIO` if this thread is not seized or not in a `PTRACE_EVENT_STOP`.
+    pub(crate) fn ptrace_listen(&self) -> Result<()> {
+        let status = self.get_tracee_status()?;
+
+        status.listen()?;
+        self.wake_signalled_waker();
+
+        Ok(())
+    }
+
+    /// Returns whether this thread has a pending ptrace trap.
+    ///
+    /// A pending trap interrupts blocking syscalls like a pending signal.
+    pub(crate) fn ptrace_has_pending_trap(&self) -> bool {
+        self.tracee_status
+            .get()
+            .is_some_and(|status| status.has_pending_trap())
+    }
+
+    /// Takes the pending ptrace trap of this thread, if any.
+    ///
+    /// Returns whether a trap is taken and ended by the tracer.
+    pub(in crate::process) fn ptrace_do_jobctl_trap(
+        &self,
+        ctx: &Context,
+        user_ctx: &mut UserContext,
+    ) -> bool {
+        self.tracee_status
+            .get()
+            .is_some_and(|status| status.do_jobctl_trap(ctx, user_ctx))
+    }
+
+    /// Notifies this thread, if traced, that a group-stop with `sig_num` is initiated.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2680-L2693>
+    pub(in crate::process) fn ptrace_notify_group_stop(&self, sig_num: SigNum) {
+        let Some(status) = self.tracee_status.get() else {
+            return;
+        };
+        if status.notify_group_stop(self, sig_num) {
+            self.wake_signalled_waker();
+        }
+    }
+
+    /// Notifies this thread, if traced, that `SIGCONT` is generated for its process.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L922-L931>
+    pub(in crate::process) fn ptrace_notify_group_continue(&self) {
+        let Some(status) = self.tracee_status.get() else {
+            return;
+        };
+        if status.notify_group_continue(self) {
+            self.wake_signalled_waker();
+        }
     }
 
     /// Gets the general-purpose registers of this thread for ptrace.
@@ -310,6 +403,9 @@ impl PosixThread {
     /// # Errors
     ///
     /// Returns `ESRCH` if this thread is not ptrace-stopped.
+    ///
+    /// Returns `EINVAL` if the ptrace-stop has no signal info
+    /// (i.e., it is a group-stop of a tracee that is not seized).
     pub(crate) fn ptrace_get_siginfo(&self) -> Result<siginfo_t> {
         let status = self.get_tracee_status()?;
         status.get_siginfo()
@@ -330,20 +426,54 @@ impl PosixThread {
 impl PosixThread {
     /// Attaches this tracer to the given tracee.
     ///
+    /// With [`PtraceAttachMode::Attach`], a `SIGSTOP` is sent to the tracee. Unless with
+    /// [`PtraceAttachMode::TraceMe`], a tracee in a group-stop re-traps into the group-stop
+    /// so that the tracer can observe it, and this method waits for the transition.
+    ///
     /// # Errors
     ///
-    /// Returns `EPERM` if the tracee is already being traced.
+    /// Returns `EPERM` if the tracee is already being traced or has exited.
     ///
     /// # Panics
     ///
     /// Panics if `tracer_thread` and `self` do not point to the same thread,
     /// or if `tracee_thread` is not a POSIX thread.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/ptrace.c#L403-L504>
     pub(crate) fn attach_to(
         &self,
         tracer_thread: &Arc<Thread>,
         tracee_thread: Arc<Thread>,
+        mode: PtraceAttachMode,
     ) -> Result<()> {
-        self.link_tracee(tracer_thread, tracee_thread, PtraceOptions::empty())?;
+        let (options, is_seized) = match mode {
+            PtraceAttachMode::TraceMe | PtraceAttachMode::Attach => (PtraceOptions::empty(), false),
+            PtraceAttachMode::Seize(options) => (options, true),
+        };
+        if !self.link_tracee(tracer_thread, tracee_thread.clone(), options, is_seized)? {
+            return Ok(());
+        }
+
+        let tracee = tracee_thread.as_posix_thread().unwrap();
+        if matches!(mode, PtraceAttachMode::TraceMe) {
+            return Ok(());
+        }
+        if matches!(mode, PtraceAttachMode::Attach) {
+            tracee.enqueue_signal(Box::new(KernelSignal::new(SIGSTOP)));
+        }
+
+        let tracee_status = tracee.tracee_status.get().unwrap();
+        if !tracee_status.set_trap_stop_if_group_stopped(&tracee.process()) {
+            return Ok(());
+        }
+        tracee.wake_signalled_waker();
+
+        // Wait for the tracee to enter the trap, so the tracer can wait for it immediately.
+        // Like Linux, an interruption is not reported, and the trap still happens later.
+        let _ = self.process().children_wait_queue().pause_until(|| {
+            (!tracee_status.is_trapping() || tracee_thread.is_exited()).then_some(())
+        });
+
         Ok(())
     }
 
@@ -354,7 +484,7 @@ impl PosixThread {
     ///
     /// # Errors
     ///
-    /// Returns `EPERM` if the tracee is already being traced.
+    /// Returns `EPERM` if the tracee is already being traced or has exited.
     ///
     /// # Panics
     ///
@@ -365,6 +495,7 @@ impl PosixThread {
         tracer_thread: &Arc<Thread>,
         tracee_thread: Arc<Thread>,
         options: PtraceOptions,
+        is_seized: bool,
     ) -> Result<bool> {
         debug_assert!(core::ptr::eq(
             tracer_thread.as_posix_thread().unwrap(),
@@ -381,12 +512,52 @@ impl PosixThread {
             // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/ptrace.c#L496-L498>
             return Ok(false);
         }
+        if tracee_thread.is_exited() {
+            return_errno_with_message!(Errno::EPERM, "the thread has exited");
+        }
 
         let tracee = tracee_thread.as_posix_thread().unwrap();
-        tracee.set_tracer(Arc::downgrade(tracer_thread), options)?;
+        tracee.set_tracer(Arc::downgrade(tracer_thread), options, is_seized)?;
         tracees.insert(tracee.tid(), tracee_thread);
 
         Ok(true)
+    }
+
+    /// Detaches the tracee with `tid` from this tracer and resumes it with the signal in `data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ESRCH` if there is no such tracee or it is not ptrace-stopped,
+    /// or `EIO` if `data` is not a valid signal number.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/ptrace.c#L589-L614>
+    pub(crate) fn ptrace_detach(&self, tid: Tid, data: usize, ctx: &Context) -> Result<()> {
+        let tracees = self
+            .tracees()
+            .ok_or_else(|| Error::with_message(Errno::ESRCH, "no such tracee"))?;
+
+        // Lock order: tracer.tracees -> tracee.tracee_status
+        let mut tracees = tracees.lock();
+        let tracee_thread = tracees
+            .get(&tid)
+            .cloned()
+            .ok_or_else(|| Error::with_message(Errno::ESRCH, "no such tracee"))?;
+        let tracee = tracee_thread.as_posix_thread().unwrap();
+
+        // The tracee is ptrace-stopped, so it is not a zombie and has no deferred exit
+        // notification.
+        let is_exit_notify_deferred = tracee
+            .tracee_status
+            .get()
+            .unwrap()
+            .detach_stopped(data, ctx)?;
+        debug_assert!(!is_exit_notify_deferred);
+        tracees.remove(&tid);
+        drop(tracees);
+
+        tracee.wake_signalled_waker();
+
+        Ok(())
     }
 
     /// Silently unlinks this exited thread from its tracer and wakes up the tracer.
@@ -477,6 +648,8 @@ impl PosixThread {
 
 pub(super) struct TraceeStatus {
     is_stopped: AtomicBool,
+    /// Whether [`TraceeState::jobctl`] contains any of [`JobCtl::PENDING_MASK`].
+    has_pending_trap: AtomicBool,
     state: Mutex<TraceeState>,
 }
 
@@ -484,6 +657,7 @@ impl TraceeStatus {
     pub(super) fn new() -> Self {
         Self {
             is_stopped: AtomicBool::new(false),
+            has_pending_trap: AtomicBool::new(false),
             state: Mutex::new(TraceeState::new()),
         }
     }
@@ -492,13 +666,20 @@ impl TraceeStatus {
         self.state.lock().tracer()
     }
 
-    fn set_tracer(&self, tracer: Weak<Thread>, options: PtraceOptions) -> Result<()> {
+    fn set_tracer(
+        &self,
+        tracer: Weak<Thread>,
+        options: PtraceOptions,
+        is_seized: bool,
+    ) -> Result<()> {
         let mut state = self.state.lock();
         if state.tracer().is_some() {
             return_errno_with_message!(Errno::EPERM, "the thread is already being traced");
         }
         state.tracer = tracer;
         state.options = options;
+        state.is_seized = is_seized;
+        self.set_jobctl(&mut state, JobCtl::empty());
 
         Ok(())
     }
@@ -509,7 +690,23 @@ impl TraceeStatus {
     {
         // Hold the lock first to avoid race conditions.
         let mut state = self.state.lock();
+        self.do_detach_tracer(&mut state, detach_callback)
+    }
 
+    /// Detaches the tracer and resumes the tracee, as `__ptrace_unlink` does.
+    ///
+    /// Pending traps are cleared. If a group-stop is in effect, the tracee will
+    /// participate in it after resuming.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/ptrace.c#L135-L179>
+    fn do_detach_tracer<F>(
+        &self,
+        state: &mut MutexGuard<'_, TraceeState>,
+        detach_callback: F,
+    ) -> bool
+    where
+        F: FnOnce(&TraceeState),
+    {
         state.tracer = Weak::new();
         #[cfg(target_arch = "x86_64")]
         {
@@ -518,10 +715,234 @@ impl TraceeStatus {
             }
         }
         state.is_tracing_syscall = false;
-        detach_callback(&state);
+        detach_callback(state);
+        state.is_seized = false;
+        self.set_jobctl(state, JobCtl::empty());
         self.is_stopped.store(false, Ordering::Relaxed);
 
         core::mem::take(&mut state.is_exit_notify_deferred)
+    }
+
+    /// Detaches the tracer from this ptrace-stopped tracee with the signal in `data`.
+    fn detach_stopped(&self, data: usize, ctx: &Context) -> Result<bool> {
+        let mut state = self.state.lock();
+        self.check_ptrace_stopped(&state)?;
+
+        Self::set_resume_signal(&mut state, data, ctx)?;
+
+        Ok(self.do_detach_tracer(&mut state, |_| {}))
+    }
+
+    /// Updates the job control states and whether a trap is pending.
+    fn set_jobctl(&self, state: &mut TraceeState, jobctl: JobCtl) {
+        state.jobctl = jobctl;
+        self.has_pending_trap
+            .store(jobctl.intersects(JobCtl::PENDING_MASK), Ordering::Release);
+    }
+
+    fn has_pending_trap(&self) -> bool {
+        self.has_pending_trap.load(Ordering::Acquire)
+    }
+
+    fn is_trapping(&self) -> bool {
+        self.state.lock().jobctl.contains(JobCtl::TRAPPING)
+    }
+
+    /// Ends the current `PTRACE_LISTEN`, if any, so that the tracee re-traps.
+    fn end_listening(&self, state: &TraceeState) -> bool {
+        if state.jobctl.contains(JobCtl::LISTENING) && self.is_ptrace_stopped() {
+            self.is_stopped.store(false, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Schedules a trap for a newly attached tracee if its process is in a group-stop.
+    ///
+    /// Returns whether the tracer should wait for the tracee to enter the trap.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/ptrace.c#L403-L432>
+    fn set_trap_stop_if_group_stopped(&self, process: &Process) -> bool {
+        let mut state = self.state.lock();
+
+        let Some(stop_signal) = process.stop_signal() else {
+            return false;
+        };
+        if state.tracer().is_none() {
+            return false;
+        }
+
+        state.stop_signal = stop_signal;
+        let jobctl = state.jobctl | JobCtl::TRAP_STOP | JobCtl::TRAPPING;
+        self.set_jobctl(&mut state, jobctl);
+
+        true
+    }
+
+    /// Schedules the initial `PTRACE_EVENT_STOP` of a new child of a seized tracee.
+    ///
+    /// The child also joins the group-stop that is in effect.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L387-L399>
+    fn set_trap_stop_for_new_child(&self, process: &Process) {
+        let mut state = self.state.lock();
+
+        let mut jobctl = state.jobctl | JobCtl::TRAP_STOP;
+        if let Some(stop_signal) = process.stop_signal() {
+            state.stop_signal = stop_signal;
+            jobctl |= JobCtl::STOP_PENDING;
+        }
+        self.set_jobctl(&mut state, jobctl);
+    }
+
+    /// Records a new group-stop with `sig_num`.
+    ///
+    /// Returns whether the tracee should be woken up.
+    fn notify_group_stop(&self, tracee: &PosixThread, sig_num: SigNum) -> bool {
+        let mut state = self.state.lock();
+        if state.tracer().is_none() || tracee.has_pending_sigkill() {
+            return false;
+        }
+
+        state.stop_signal = sig_num;
+        let mut jobctl = state.jobctl | JobCtl::STOP_PENDING;
+        if state.is_seized {
+            jobctl |= JobCtl::TRAP_NOTIFY;
+            self.end_listening(&state);
+        }
+        self.set_jobctl(&mut state, jobctl);
+
+        true
+    }
+
+    /// Cancels the pending group-stop and notifies a seized tracee.
+    ///
+    /// Returns whether the tracee should be woken up.
+    fn notify_group_continue(&self, tracee: &PosixThread) -> bool {
+        let mut state = self.state.lock();
+        if state.tracer().is_none() {
+            return false;
+        }
+
+        let mut jobctl = state.jobctl - JobCtl::STOP_PENDING;
+        if state.is_seized && !tracee.has_pending_sigkill() {
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L876-L883>
+            jobctl |= JobCtl::TRAP_NOTIFY;
+            self.end_listening(&state);
+        }
+        self.set_jobctl(&mut state, jobctl);
+
+        state.is_seized
+    }
+
+    fn interrupt(&self, tracee: &PosixThread) -> Result<()> {
+        let mut state = self.state.lock();
+        if !state.is_seized {
+            return_errno_with_message!(Errno::EIO, "the thread is not seized");
+        }
+        // Like Linux, the request succeeds without effects if the tracee is dying.
+        if tracee.has_pending_sigkill() {
+            return Ok(());
+        }
+
+        // A trap that has been reported is not disturbed, except for `PTRACE_LISTEN`.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/ptrace.c#L1257-L1282>
+        let jobctl = state.jobctl | JobCtl::TRAP_STOP;
+        self.end_listening(&state);
+        self.set_jobctl(&mut state, jobctl);
+
+        Ok(())
+    }
+
+    fn listen(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        self.check_ptrace_stopped(&state)?;
+        if !state.is_seized || !state.is_event_stop {
+            return_errno_with_message!(Errno::EIO, "the thread is not in a `PTRACE_EVENT_STOP`");
+        }
+
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/ptrace.c#L1284-L1308>
+        let jobctl = state.jobctl | JobCtl::LISTENING;
+        self.set_jobctl(&mut state, jobctl);
+        if jobctl.contains(JobCtl::TRAP_NOTIFY) {
+            // An event has happened since this trap started, so re-trap now.
+            self.end_listening(&state);
+        }
+
+        Ok(())
+    }
+
+    /// Takes the pending trap (`do_jobctl_trap` in Linux).
+    ///
+    /// A seized tracee reports a `PTRACE_EVENT_STOP` with the stop signal if a group-stop is
+    /// in effect, or `SIGTRAP` otherwise. A tracee that is not seized reports the stop
+    /// signal of the group-stop without a `siginfo`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2756-L2782>
+    fn do_jobctl_trap(&self, ctx: &Context, user_ctx: &mut UserContext) -> bool {
+        if !self.has_pending_trap() {
+            return false;
+        }
+
+        let mut state = self.state.lock();
+        let mut jobctl = state.jobctl;
+        if !jobctl.intersects(JobCtl::PENDING_MASK) {
+            return false;
+        }
+
+        let tracer = state.tracer();
+        if tracer.is_none() || ctx.posix_thread.has_pending_sigkill() {
+            // A fatal signal cancels all traps.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2464-L2465>
+            self.set_jobctl(&mut state, jobctl - JobCtl::PENDING_MASK - JobCtl::TRAPPING);
+            drop(state);
+            if let Some(tracer) = tracer {
+                let tracer_process = tracer.as_posix_thread().unwrap().process();
+                tracer_process.children_wait_queue().wake_all();
+            }
+            return false;
+        }
+        let tracer = tracer.unwrap();
+
+        let (signal, wait_status) = if state.is_seized {
+            let sig_num = if ctx.process.is_stopped() {
+                state.stop_signal
+            } else {
+                SIGTRAP
+            };
+            let wait_status = PtraceWaitStatus::from_event_stop(sig_num);
+            let mut siginfo = siginfo_t::new(sig_num, wait_status.to_si_code());
+            siginfo.set_pid_uid_by(ctx);
+            let signal = DequeuedSignal::FromThread(Box::new(RawSignal::new(siginfo)));
+            (Some(signal), wait_status)
+        } else {
+            (None, PtraceWaitStatus::from_signal(state.stop_signal))
+        };
+
+        // Any trap clears `TRAP_STOP` and participates in the pending group-stop. A
+        // `PTRACE_EVENT_STOP` also clears `TRAP_NOTIFY`. Entering a trap clears `TRAPPING`.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2495-L2510>
+        jobctl -= JobCtl::STOP_PENDING | JobCtl::TRAP_STOP | JobCtl::TRAPPING;
+        if state.is_seized {
+            jobctl -= JobCtl::TRAP_NOTIFY;
+        }
+        self.set_jobctl(&mut state, jobctl);
+        state.is_event_stop = state.is_seized;
+
+        let result = self.do_ptrace_stop(
+            state,
+            tracer,
+            signal,
+            wait_status,
+            None,
+            CLD_STOPPED,
+            ctx,
+            user_ctx,
+        );
+        // The signal to resume with is ignored after a trap.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2756-L2772>
+        !matches!(result, PtraceStopResult::Interrupted)
     }
 
     fn defer_exit_notify(&self, real_parent: &Arc<Process>) -> Option<Arc<Thread>> {
@@ -555,7 +976,16 @@ impl TraceeStatus {
 
         let wait_status = PtraceWaitStatus::from_signal(signal.signal().num());
 
-        self.do_ptrace_stop(state, tracer, signal, wait_status, None, ctx, user_ctx)
+        self.do_ptrace_stop(
+            state,
+            tracer,
+            Some(signal),
+            wait_status,
+            None,
+            CLD_TRAPPED,
+            ctx,
+            user_ctx,
+        )
     }
 
     fn ptrace_may_stop_on(&self, event: PtraceEvent, ctx: &Context, user_ctx: &mut UserContext) {
@@ -588,9 +1018,10 @@ impl TraceeStatus {
         self.do_ptrace_stop(
             state,
             tracer,
-            signal,
+            Some(signal),
             wait_status,
             Some(event),
+            CLD_TRAPPED,
             ctx,
             user_ctx,
         );
@@ -615,17 +1046,29 @@ impl TraceeStatus {
         let signal = DequeuedSignal::FromThread(signal);
         let wait_status = PtraceWaitStatus::from_syscall(&state.options);
 
-        self.do_ptrace_stop(state, tracer, signal, wait_status, None, ctx, user_ctx)
+        self.do_ptrace_stop(
+            state,
+            tracer,
+            Some(signal),
+            wait_status,
+            None,
+            CLD_TRAPPED,
+            ctx,
+            user_ctx,
+        )
     }
 
+    /// Enters a ptrace-stop and notifies the tracer with `SIGCHLD` of `code`
+    /// (`CLD_TRAPPED` or `CLD_STOPPED`).
     #[expect(clippy::too_many_arguments)]
     fn do_ptrace_stop(
         &self,
         mut state: MutexGuard<'_, TraceeState>,
         tracer: Arc<Thread>,
-        signal: DequeuedSignal,
+        signal: Option<DequeuedSignal>,
         wait_status: PtraceWaitStatus,
         event: Option<PtraceEvent>,
+        code: i32,
         ctx: &Context,
         user_ctx: &mut UserContext,
     ) -> PtraceStopResult {
@@ -650,7 +1093,7 @@ impl TraceeStatus {
         sigchld::notify_parent_of_stop(
             ChildSource::Thread(ctx.posix_thread),
             &tracer.as_posix_thread().unwrap().process(),
-            CLD_TRAPPED,
+            code,
             wait_status.to_sigchld_si_status(),
         );
 
@@ -666,6 +1109,9 @@ impl TraceeStatus {
             let mut state = self.state.lock();
             state.signal.clear();
             state.event = None;
+            state.is_event_stop = false;
+            let jobctl = state.jobctl - JobCtl::LISTENING;
+            self.set_jobctl(&mut state, jobctl);
             #[cfg(target_arch = "x86_64")]
             {
                 state.user_context = None;
@@ -681,6 +1127,10 @@ impl TraceeStatus {
         let mut state = self.state.lock();
         let signal = state.signal.clear();
         state.event = None;
+        // `PTRACE_LISTEN` can only be used during this ptrace-stop.
+        state.is_event_stop = false;
+        let jobctl = state.jobctl - JobCtl::LISTENING;
+        self.set_jobctl(&mut state, jobctl);
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -695,13 +1145,14 @@ impl TraceeStatus {
         PtraceStopResult::Continued(signal)
     }
 
-    /// Returns the tracer, the ptrace options, and the clone-family event (if enabled)
-    /// if the new child `child_tid` created with `clone_args` should be traced.
+    /// Returns the tracer, the ptrace options, whether the tracer has used `PTRACE_SEIZE`,
+    /// and the clone-family event (if enabled) if the new child `child_tid` created with
+    /// `clone_args` should be traced.
     fn clone_trace(
         &self,
         clone_args: &CloneArgs,
         child_tid: Tid,
-    ) -> Option<(Arc<Thread>, PtraceOptions, Option<PtraceEvent>)> {
+    ) -> Option<(Arc<Thread>, PtraceOptions, bool, Option<PtraceEvent>)> {
         let state = self.state.lock();
         let tracer = state.tracer()?;
         let options = state.options;
@@ -724,15 +1175,18 @@ impl TraceeStatus {
             return None;
         }
 
-        Some((tracer, options, event))
+        Some((tracer, options, state.is_seized, event))
     }
 
     fn is_ptrace_stopped(&self) -> bool {
         self.is_stopped.load(Ordering::Relaxed)
     }
 
-    fn check_ptrace_stopped(&self, _state_guard: &MutexGuard<'_, TraceeState>) -> Result<()> {
-        if self.is_ptrace_stopped() {
+    /// Checks that the tracee is ptrace-stopped and not listening (`ptrace_freeze_traced`).
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/ptrace.c#L202-L219>
+    fn check_ptrace_stopped(&self, state: &TraceeState) -> Result<()> {
+        if self.is_ptrace_stopped() && !state.jobctl.contains(JobCtl::LISTENING) {
             Ok(())
         } else {
             return_errno_with_message!(Errno::ESRCH, "the thread is not ptrace-stopped");
@@ -744,36 +1198,45 @@ impl TraceeStatus {
         let mut state = self.state.lock();
 
         // Avoid the race with `detach_tracer` or `resume` in between.
-        if !self.is_ptrace_stopped() {
+        // A listening tracee is not reported.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1311-L1321>
+        if !self.is_ptrace_stopped() || state.jobctl.contains(JobCtl::LISTENING) {
             return None;
         }
 
         state.signal.wait(options)
     }
 
-    fn resume(&self, request: PtraceContRequest, ctx: &Context) -> Result<()> {
-        // Hold the lock first to avoid race conditions.
-        let mut state = self.state.lock();
-        self.check_ptrace_stopped(&state)?;
-
-        if let Some(sig_num) = request.sig_num() {
+    /// Sets the signal that the tracee delivers after resuming from the ptrace-stop.
+    fn set_resume_signal(state: &mut TraceeState, data: usize, ctx: &Context) -> Result<()> {
+        if let Some(sig_num) = parse_resume_signal(data)? {
             let signal = Box::new(UserSignal::new_kill(sig_num, ctx));
             state.signal.inject(signal);
         } else {
             state.signal.clear();
         }
 
+        Ok(())
+    }
+
+    fn resume(&self, request: PtraceContRequest, data: usize, ctx: &Context) -> Result<()> {
+        // Hold the lock first to avoid race conditions.
+        let mut state = self.state.lock();
+        self.check_ptrace_stopped(&state)?;
+
+        Self::set_resume_signal(&mut state, data, ctx)?;
+
         #[cfg(target_arch = "x86_64")]
         {
             let user_context = state.user_context.as_mut().unwrap();
-            if matches!(request, PtraceContRequest::SingleStep(_)) {
+            if request == PtraceContRequest::SingleStep {
                 arch_ptrace::enable_single_step(user_context);
             } else {
                 arch_ptrace::disable_single_step(user_context);
             }
         }
 
-        state.is_tracing_syscall = matches!(request, PtraceContRequest::Syscall(_));
+        state.is_tracing_syscall = request == PtraceContRequest::Syscall;
 
         self.is_stopped.store(false, Ordering::Relaxed);
 
@@ -917,12 +1380,24 @@ impl TraceeStatus {
         let state = self.state.lock();
         self.check_ptrace_stopped(&state)?;
 
-        Ok(state.signal.get().unwrap().to_info())
+        state
+            .signal
+            .get()
+            .map(|signal| signal.to_info())
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "the ptrace-stop has no signal info"))
     }
 }
 
 struct TraceeState {
     tracer: Weak<Thread>,
+    /// Whether the tracer has used `PTRACE_SEIZE` (`PT_SEIZED`).
+    is_seized: bool,
+    /// The job control states.
+    jobctl: JobCtl,
+    /// The stop signal of the latest group-stop (`JOBCTL_STOP_SIGMASK`).
+    stop_signal: SigNum,
+    /// Whether the current ptrace-stop is a `PTRACE_EVENT_STOP`.
+    is_event_stop: bool,
     /// The signal associated with the current ptrace-stop and later signal delivery.
     signal: StopDeliverySignal,
     /// The event associated with the current ptrace-event-stop.
@@ -953,6 +1428,10 @@ impl TraceeState {
     fn new() -> Self {
         Self {
             tracer: Weak::new(),
+            is_seized: false,
+            jobctl: JobCtl::empty(),
+            stop_signal: SIGSTOP,
+            is_event_stop: false,
             signal: StopDeliverySignal::default(),
             event: None,
             options: PtraceOptions::empty(),

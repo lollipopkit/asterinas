@@ -2,7 +2,7 @@
 
 //! The process status.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use ostd::sync::SpinLock;
 
@@ -89,6 +89,9 @@ pub(super) struct StopStatus {
     /// Indicates whether the process is stopped.
     is_stopped: AtomicBool,
 
+    /// The signal that has stopped the process, or zero if the process is not stopped.
+    stop_signal: AtomicU8,
+
     /// Indicates whether the process's status has changed and has not yet been waited on.
     ///
     /// User programs may use the wait* syscalls to check for changes in
@@ -102,6 +105,7 @@ impl StopStatus {
     pub(self) const fn new() -> Self {
         Self {
             is_stopped: AtomicBool::new(false),
+            stop_signal: AtomicU8::new(0),
             wait_status: SpinLock::new(None),
         }
     }
@@ -117,6 +121,7 @@ impl StopStatus {
             false
         } else {
             self.is_stopped.store(true, Ordering::Relaxed);
+            self.stop_signal.store(signum.as_u8(), Ordering::Relaxed);
             *wait_status = Some(StopWaitStatus::Stopped(signum));
             true
         }
@@ -131,6 +136,7 @@ impl StopStatus {
 
         if self.is_stopped.load(Ordering::Relaxed) {
             self.is_stopped.store(false, Ordering::Relaxed);
+            self.stop_signal.store(0, Ordering::Relaxed);
             *wait_status = Some(StopWaitStatus::Continue);
             true
         } else {
@@ -141,6 +147,15 @@ impl StopStatus {
     /// Returns whether the process is stopped.
     pub(super) fn is_stopped(&self) -> bool {
         self.is_stopped.load(Ordering::Relaxed)
+    }
+
+    /// Returns the signal that has stopped the process, if the process is stopped.
+    pub(super) fn stop_signal(&self) -> Option<SigNum> {
+        // Hold the lock to read a consistent state.
+        let _wait_status = self.wait_status.lock();
+
+        let sig_num = self.stop_signal.load(Ordering::Relaxed);
+        (sig_num != 0).then(|| SigNum::from_u8(sig_num))
     }
 
     /// Returns the stop status changes for the `wait` syscall.

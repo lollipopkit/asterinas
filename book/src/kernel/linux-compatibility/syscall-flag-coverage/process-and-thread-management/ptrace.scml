@@ -1,6 +1,25 @@
 // Request that the calling thread should be traced by its parent
 ptrace(request = PTRACE_TRACEME, tid, addr, data);
 
+// Attach to a thread and stop it with `SIGSTOP`
+ptrace(request = PTRACE_ATTACH, tid, addr, data);
+
+// Attach to a thread without stopping it, setting the ptrace options in `data`
+ptrace(request = PTRACE_SEIZE, tid, addr, data = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
+                                                 PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
+                                                 PTRACE_O_TRACEEXEC | PTRACE_O_TRACEVFORKDONE |
+                                                 PTRACE_O_TRACEEXIT | PTRACE_O_TRACESECCOMP |
+                                                 PTRACE_O_EXITKILL);
+
+// Detach from a ptrace-stopped tracee, optionally injecting a signal
+ptrace(request = PTRACE_DETACH, tid, addr, data);
+
+// Stop a seized tracee with a `PTRACE_EVENT_STOP`
+ptrace(request = PTRACE_INTERRUPT, tid, addr, data);
+
+// Let a seized tracee in a `PTRACE_EVENT_STOP` wait for job control events
+ptrace(request = PTRACE_LISTEN, tid, addr, data);
+
 // Read one word from the tracee's text space
 ptrace(request = PTRACE_PEEKTEXT, tid, addr, data);
 
