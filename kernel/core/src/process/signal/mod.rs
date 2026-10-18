@@ -465,7 +465,16 @@ pub(crate) fn handle_user_signal(
             );
             let fpu_context_addr = (ucontext_addr as usize) + size_of::<ucontext_t>();
         }
-        any(target_arch = "loongarch64", target_arch = "aarch64") => {
+        target_arch = "aarch64" => {
+            // The FP/SIMD state is a record in the reserved area of `uc_mcontext`.
+            ucontext.uc_mcontext.set_fpsimd_record(fpu_context_bytes);
+            let ucontext_addr = alloc_aligned_in_user_stack(
+                stack_pointer,
+                size_of::<ucontext_t>(),
+                align_of::<ucontext_t>(),
+            );
+        }
+        target_arch = "loongarch64" => {
             // FIXME: Allocate the FPU context.
             // Example: <https://elixir.bootlin.com/linux/v6.15.7/source/arch/loongarch/kernel/signal.c#L848>
             let ucontext_addr = alloc_aligned_in_user_stack(
@@ -482,6 +491,7 @@ pub(crate) fn handle_user_signal(
         }
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     user_space.write_bytes(fpu_context_addr as _, fpu_context_bytes)?;
     user_space.write_val(ucontext_addr as _, &ucontext)?;
 

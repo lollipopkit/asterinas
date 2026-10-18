@@ -11,6 +11,7 @@ use ostd::{
 
 use crate::{
     cpu::{LinuxAbi, topology::CpuTopology},
+    prelude::*,
     vm::{perms::VmPerms, vmar::PageFaultInfo},
 };
 
@@ -84,10 +85,10 @@ macro_rules! copy_gp_regs {
 /// This contains the context saved before a signal handler is invoked; it will be restored by
 /// `sys_rt_sigreturn`.
 ///
-/// Reference: <https://elixir.bootlin.com/linux/v6.15.7/source/arch/arm64/include/uapi/asm/sigcontext.h#L28>
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/arm64/include/uapi/asm/sigcontext.h#L28-L37>
 #[repr(C)]
 #[repr(align(16))]
-#[derive(Clone, Copy, Debug, Default, Pod)]
+#[derive(Clone, Copy, Debug, Pod)]
 pub(crate) struct SigContext {
     fault_address: u64,
     regs: [u64; 31],
@@ -95,11 +96,81 @@ pub(crate) struct SigContext {
     pc: u64,
     pstate: u64,
     _pad: u64,
-    // In ARM, the signal stack layout places the FPU context directly
-    // after the general-purpose registers.
+    /// The records of the FP/SIMD state and future extensions, each starting with a header of
+    /// its magic and size, and terminated by a header of zeros.
+    reserved: [u8; SIG_CONTEXT_RESERVED_SIZE],
+}
+
+const SIG_CONTEXT_RESERVED_SIZE: usize = 4096;
+
+/// The size of the header of a record in [`SigContext::reserved`].
+const RECORD_HEADER_SIZE: usize = 2 * size_of::<u32>();
+
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/arm64/include/uapi/asm/sigcontext.h#L75-L94>
+const FPSIMD_MAGIC: u32 = 0x46508001;
+const ESR_MAGIC: u32 = 0x45535201;
+
+impl Default for SigContext {
+    fn default() -> Self {
+        Self::new_zeroed()
+    }
 }
 
 impl SigContext {
+    /// Writes the FP/SIMD record, which must start with its header, followed by the terminator.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/arm64/kernel/signal.c#L1277-L1408>
+    pub(crate) fn set_fpsimd_record(&mut self, record: &[u8]) {
+        debug_assert!(record.len() + RECORD_HEADER_SIZE <= SIG_CONTEXT_RESERVED_SIZE);
+        self.reserved.fill(0);
+        self.reserved[..record.len()].copy_from_slice(record);
+    }
+
+    /// Returns the FP/SIMD record of `expected_size` bytes, after validating the records like
+    /// Linux.
+    ///
+    /// Records that Asterinas never produces (SVE, SME, extra context, etc.) are rejected, like
+    /// Linux does on systems that do not support them.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/arm64/kernel/signal.c#L791-L1017>
+    pub(crate) fn fpsimd_record(&self, expected_size: usize) -> Result<&[u8]> {
+        let mut fpsimd = None;
+        let mut offset = 0;
+        loop {
+            if SIG_CONTEXT_RESERVED_SIZE - offset < RECORD_HEADER_SIZE {
+                return_errno_with_message!(Errno::EINVAL, "the signal frame has no terminator");
+            }
+            let header = &self.reserved[offset..offset + RECORD_HEADER_SIZE];
+            let magic = u32::from_ne_bytes(header[..4].try_into().unwrap());
+            let size = u32::from_ne_bytes(header[4..].try_into().unwrap()) as usize;
+            if SIG_CONTEXT_RESERVED_SIZE - offset < size {
+                return_errno_with_message!(Errno::EINVAL, "a signal frame record is too large");
+            }
+
+            match magic {
+                0 if size == 0 => break,
+                FPSIMD_MAGIC if fpsimd.is_none() => fpsimd = Some((offset, size)),
+                ESR_MAGIC => {}
+                _ => return_errno_with_message!(Errno::EINVAL, "invalid signal frame record"),
+            }
+
+            if size < RECORD_HEADER_SIZE {
+                return_errno_with_message!(Errno::EINVAL, "a signal frame record is too small");
+            }
+            offset += size;
+            if !offset.is_multiple_of(16) {
+                return_errno_with_message!(Errno::EINVAL, "a signal frame record is misaligned");
+            }
+        }
+
+        match fpsimd {
+            Some((offset, size)) if size == expected_size => {
+                Ok(&self.reserved[offset..offset + size])
+            }
+            _ => return_errno_with_message!(Errno::EINVAL, "invalid FP/SIMD signal frame record"),
+        }
+    }
+
     pub(crate) fn copy_user_regs_to(&self, dst: &mut UserContext) {
         macro_rules! copy_reg {
             ($idx: literal, $name: ident, $regs: ident) => {
