@@ -65,7 +65,12 @@ pub(crate) fn kill_group<S: Signal + Clone>(
     // A process group that exists is not empty.
     let signal = signal?;
 
-    let mut result = Ok(());
+    // The result is the first success, or the last error if all attempts fail.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L1483-L1501>
+    let mut result = Err(Error::with_message(
+        Errno::ESRCH,
+        "the target group does not exist",
+    ));
 
     let inner = process_group.lock();
     for process in inner.iter() {
@@ -74,7 +79,7 @@ pub(crate) fn kill_group<S: Signal + Clone>(
             signal.clone().map(|s| Box::new(s) as Box<dyn Signal>),
             ctx,
         );
-        if res.is_err_and(|err| err.error() != Errno::EPERM) {
+        if result.is_err() {
             result = res;
         }
     }
@@ -135,7 +140,9 @@ pub(crate) fn tgkill(
 /// The credentials of the current process will be checked to determine
 /// if it is authorized to send the signal to the target group.
 ///
-/// If `signal` is an error, the error is returned if any target is found.
+/// The result is that of the last attempt that does not fail with `EPERM`, so the method
+/// succeeds if all attempts fail with `EPERM`. If `signal` is an error, the error is returned
+/// if any target is found.
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L1642-L1656>
 pub(crate) fn kill_all<S: Signal + Clone>(signal: Result<Option<S>>, ctx: &Context) -> Result<()> {
@@ -155,7 +162,7 @@ pub(crate) fn kill_all<S: Signal + Clone>(signal: Result<Option<S>>, ctx: &Conte
                 ctx,
             )
         });
-        if res.is_err_and(|err| err.error() != Errno::EPERM) {
+        if !res.is_err_and(|err| err.error() == Errno::EPERM) {
             result = res;
         }
     }

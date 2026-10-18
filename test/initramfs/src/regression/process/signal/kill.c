@@ -171,3 +171,52 @@ FN_TEST(invalid_signal_numbers)
 	TEST_RES(waitpid(child_pid, NULL, 0), _ret == child_pid);
 }
 END_TEST()
+
+FN_TEST(rt_sigaction_error_order)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = SIG_IGN;
+
+	// The size of the signal set is checked first.
+	TEST_ERRNO(syscall(SYS_rt_sigaction, BAD_SIG, (void *)1, NULL, 7),
+		   EINVAL);
+	// The new action is read before the signal number is checked.
+	TEST_ERRNO(syscall(SYS_rt_sigaction, BAD_SIG, (void *)1, NULL, 8),
+		   EFAULT);
+	TEST_ERRNO(syscall(SYS_rt_sigaction, 0, (void *)1, NULL, 8), EFAULT);
+	TEST_ERRNO(syscall(SYS_rt_sigaction, SIGKILL, (void *)1, NULL, 8),
+		   EFAULT);
+	TEST_ERRNO(syscall(SYS_rt_sigaction, SIGKILL, &sa, NULL, 8), EINVAL);
+	TEST_ERRNO(syscall(SYS_rt_sigaction, BAD_SIG, &sa, NULL, 8), EINVAL);
+	TEST_SUCC(syscall(SYS_rt_sigaction, SIGKILL, NULL, NULL, 8));
+}
+END_TEST()
+
+FN_TEST(kill_error_aggregation)
+{
+	pid_t pgid = TEST_SUCC(getpgrp());
+
+	pid_t pid = TEST_SUCC(fork());
+	if (pid == 0) {
+		CHECK(setpgid(0, 0));
+		CHECK(setuid(65534));
+
+		// Sending to a group fails with `EPERM` if all attempts fail with `EPERM`.
+		CHECK_WITH(kill(-pgid, 0), _ret == -1 && errno == EPERM);
+		CHECK_WITH(kill(-pgid, BAD_SIG), _ret == -1 && errno == EINVAL);
+		// The group of the current process can be signaled.
+		CHECK(kill(0, 0));
+
+		// Sending to all processes succeeds even if all attempts fail with
+		// `EPERM`, since there is at least the parent process.
+		CHECK(kill(-1, 0));
+		CHECK_WITH(kill(-1, BAD_SIG), _ret == -1 && errno == EINVAL);
+		_exit(0);
+	}
+
+	int status;
+	TEST_RES(waitpid(pid, &status, 0),
+		 _ret == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+END_TEST()

@@ -18,6 +18,7 @@ use crate::{
     },
 };
 
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L4710-L4733>
 pub(super) fn sys_rt_sigaction(
     sig_num: i32,
     sig_action_addr: Vaddr,
@@ -25,32 +26,36 @@ pub(super) fn sys_rt_sigaction(
     sigset_size: usize,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let sig_num = SigNum::try_from_raw(sig_num as u64)?
-        .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid signal number"))?;
     debug!(
-        "signal = {}, sig_action_addr = 0x{:x}, old_sig_action_addr = 0x{:x}, sigset_size = {}",
-        sig_num.sig_name(),
-        sig_action_addr,
-        old_sig_action_addr,
-        sigset_size
+        "sig_num = {}, sig_action_addr = 0x{:x}, old_sig_action_addr = 0x{:x}, sigset_size = {}",
+        sig_num, sig_action_addr, old_sig_action_addr, sigset_size
     );
 
     // Validate the size of the signal set
     RequireFullSize::new(sigset_size)?;
 
+    // The new action is read before the signal number is checked.
+    let sig_action = if sig_action_addr != 0 {
+        let sig_action_c = ctx.user_space().read_val::<sigaction_t>(sig_action_addr)?;
+        Some(SigAction::from(sig_action_c))
+    } else {
+        None
+    };
+
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L4389-L4390>
+    let sig_num = SigNum::try_from_raw(sig_num as u64)?
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid signal number"))?;
+    if sig_action.is_some() && (sig_num == SIGKILL || sig_num == SIGSTOP) {
+        return_errno_with_message!(
+            Errno::EINVAL,
+            "cannot set a new signal action for SIGKILL and SIGSTOP"
+        );
+    }
+
     let sig_dispositions = ctx.process.sig_dispositions().lock();
     let mut sig_dispositions = sig_dispositions.lock();
 
-    let old_action = if sig_action_addr != 0 {
-        if sig_num == SIGKILL || sig_num == SIGSTOP {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "cannot set a new signal action for SIGKILL and SIGSTOP"
-            );
-        }
-
-        let sig_action_c = ctx.user_space().read_val::<sigaction_t>(sig_action_addr)?;
-        let sig_action = SigAction::from(sig_action_c);
+    let old_action = if let Some(sig_action) = sig_action {
         debug!("sig action = {:?}", sig_action);
         if sig_action.will_ignore(sig_num) {
             discard_signals_if_ignored(ctx, sig_num);
