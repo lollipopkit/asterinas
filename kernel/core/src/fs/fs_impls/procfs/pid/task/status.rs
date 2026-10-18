@@ -154,16 +154,18 @@ impl ProcFileOps for StatusFileOps {
                 .unwrap_or(0)
         )?;
 
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/task_mmu.c#L37-L86>
         if let Some(vmar_ref) = process.lock_vmar().as_ref() {
-            let vsize = vmar_ref.get_mappings_total_size();
+            let vsize = vmar_ref.get_mappings_total_size() / 1024;
             let anon = vmar_ref.get_rss_counter(RssType::Anon) * (PAGE_SIZE / 1024);
             let file = vmar_ref.get_rss_counter(RssType::File) * (PAGE_SIZE / 1024);
-            let rss = anon + file;
-            writeln!(
-                printer,
-                "VmSize:\t{} kB\nVmRSS:\t{} kB\nRssAnon:\t{} kB\nRssFile:\t{} kB",
-                vsize, rss, anon, file
-            )?;
+            let shmem = vmar_ref.get_rss_counter(RssType::Shmem) * (PAGE_SIZE / 1024);
+            let rss = anon + file + shmem;
+            writeln!(printer, "VmSize:\t{:>8} kB", vsize)?;
+            writeln!(printer, "VmRSS:\t{:>8} kB", rss)?;
+            writeln!(printer, "RssAnon:\t{:>8} kB", anon)?;
+            writeln!(printer, "RssFile:\t{:>8} kB", file)?;
+            writeln!(printer, "RssShmem:\t{:>8} kB", shmem)?;
         }
 
         writeln!(
