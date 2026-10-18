@@ -368,12 +368,12 @@ impl StreamSocket {
         self.family == IpAddressFamily::IPv6 && !options.ipv6.v6only()
     }
 
-    /// Disconnects the socket, which is what `connect(AF_UNSPEC)` does.
+    /// Disconnects the socket, which is done by `connect(AF_UNSPEC)` and some `shutdown` calls.
     ///
     /// Like `tcp_disconnect` in Linux, a connection is reset and a listening socket stops
     /// listening, after which the socket can be used again as a new socket. The port is kept only
     /// if it is specified by `bind`, and the address is kept only if it is also specified by
-    /// `bind`. Blocked operations are woken up and fail like Linux.
+    /// `bind`. Blocked operations are woken up to see the new state.
     ///
     /// References:
     /// - <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L651-L656>
@@ -382,8 +382,6 @@ impl StreamSocket {
     fn disconnect(&self) {
         let mut state = self.write_updated_state();
         let options = self.options.read();
-
-        self.nr_disconnects.fetch_add(1, Ordering::Relaxed);
 
         if let State::Init(init_stream) = state.as_mut() {
             init_stream.disconnect();
@@ -464,7 +462,15 @@ impl StreamSocket {
         let mut state = self.write_updated_state();
 
         match state.as_mut() {
-            State::Init(init_stream) => init_stream.finish_last_connect(),
+            State::Init(init_stream) => {
+                init_stream.finish_last_connect()?;
+                // The connection attempt is aborted (e.g., by `shutdown`) after the socket is
+                // disconnected.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L739-L740>
+                Err(init_stream.test_and_clear_error().unwrap_or_else(|| {
+                    Error::with_message(Errno::ECONNABORTED, "the connection is aborted")
+                }))
+            }
             State::Connecting(_) => {
                 return_errno_with_message!(Errno::EAGAIN, "the connection is pending")
             }
@@ -678,6 +684,7 @@ impl Socket for StreamSocket {
 
     fn connect(&self, socket_addr: SocketAddr) -> Result<()> {
         if let SocketAddr::Unspec(_) = socket_addr {
+            self.nr_disconnects.fetch_add(1, Ordering::Relaxed);
             self.disconnect();
             return Ok(());
         }
@@ -757,8 +764,18 @@ impl Socket for StreamSocket {
                 connected_stream.shutdown(cmd, &self.pollee),
                 connected_stream.iface().clone(),
             ),
-            // TODO: shutdown listening stream
-            _ => return_errno_with_message!(Errno::EINVAL, "cannot shutdown"),
+            // Like Linux, shutting down the receiving half of a listening socket or a connecting
+            // socket disconnects it.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L938-L945>
+            State::Listen(_) if !cmd.shut_read() => return Ok(()),
+            State::Listen(_) | State::Connecting(_) => {
+                drop(state);
+                self.disconnect();
+                return Ok(());
+            }
+            State::Init(_) => {
+                return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected")
+            }
         };
 
         drop(state);

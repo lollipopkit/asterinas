@@ -372,6 +372,68 @@ FN_TEST(disconnect_blocked)
 }
 END_TEST()
 
+FN_TEST(shutdown_listening)
+{
+	struct sockaddr_in addr = loopback_addr;
+	char buf[2];
+	int sk, client, peer;
+
+	sk = new_listener(&addr);
+	client = new_tcp_socket();
+	TEST_SUCC(connect(client, (struct sockaddr *)&addr, sizeof(addr)));
+
+	// Shutting down only the sending half does nothing.
+	TEST_SUCC(shutdown(sk, SHUT_WR));
+	peer = TEST_SUCC(accept(sk, NULL, NULL));
+	TEST_SUCC(close(peer));
+	TEST_SUCC(close(client));
+
+	// Shutting down the receiving half disconnects the socket.
+	client = new_tcp_socket();
+	TEST_SUCC(connect(client, (struct sockaddr *)&addr, sizeof(addr)));
+	TEST_SUCC(shutdown(sk, SHUT_RD));
+	WAIT_EVENTS(client, POLLIN);
+	TEST_ERRNO(recv(client, buf, sizeof(buf), 0), ECONNRESET);
+	TEST_ERRNO(accept4(sk, NULL, NULL, SOCK_NONBLOCK), EINVAL);
+	TEST_ERRNO(shutdown(sk, SHUT_RDWR), ENOTCONN);
+	TEST_SUCC(close(client));
+
+	// The socket can listen again at the address specified by `bind`, but
+	// the port is not kept since it is not specified by `bind`.
+	TEST_SUCC(listen(sk, 1));
+	TEST_RES(getsockname(sk, (struct sockaddr *)&addr,
+			     &(socklen_t){ sizeof(addr) }),
+		 addr.sin_addr.s_addr == loopback_addr.sin_addr.s_addr &&
+			 addr.sin_port != 0);
+	TEST_SUCC(close(sk));
+
+	// A blocked `accept` fails after shutting down the socket.
+	addr = loopback_addr;
+	sk = new_listener(&addr);
+	{
+		struct blocked_op op = { .sk = sk };
+		pthread_t tid;
+
+		TEST_SUCC(pthread_create(&tid, NULL, blocked_accept, &op));
+		usleep(200 * 1000);
+		TEST_SUCC(shutdown(sk, SHUT_RDWR));
+		TEST_SUCC(pthread_join(tid, NULL));
+		TEST_RES(op.ret, op.ret == -1 && op.err == EINVAL);
+	}
+	TEST_SUCC(close(sk));
+}
+END_TEST()
+
+FN_TEST(shutdown_unconnected)
+{
+	int sk;
+
+	sk = new_tcp_socket();
+	TEST_ERRNO(shutdown(sk, SHUT_RDWR), ENOTCONN);
+	TEST_SUCC(close(sk));
+}
+END_TEST()
+
 FN_SETUP(cleanup)
 {
 	CHECK(close(listener));
