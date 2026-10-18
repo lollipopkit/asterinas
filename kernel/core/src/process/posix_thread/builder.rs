@@ -19,7 +19,7 @@ use crate::{
     process::{
         Credentials, NsProxy, Process, UserNamespace,
         posix_thread::{ThreadName, thread_local::SuppUserContext},
-        signal::{sig_mask::AtomicSigMask, sig_queues::SigQueues},
+        signal::{sig_mask::AtomicSigMask, sig_num::AtomicSigNum, sig_queues::SigQueues},
     },
     sched::{Nice, SchedPolicy},
     thread::{Thread, Tid, task},
@@ -207,6 +207,7 @@ impl PosixThreadBuilder {
                     tracee_status: Once::new(),
                     tracees: Once::new(),
                     exit_code: AtomicU32::new(0),
+                    parent_death_signal: AtomicSigNum::new_empty(),
                     personality: AtomicU32::new(0),
                 }
             };

@@ -147,8 +147,6 @@ pub struct Process {
     sig_dispositions: Mutex<Arc<Mutex<SigDispositions>>>,
     /// The process-level sigqueue.
     sig_queues: SigQueues,
-    /// The signal that the process should receive when parent process exits.
-    parent_death_signal: AtomicSigNum,
     /// The signal that should be sent to the parent when this process exits.
     exit_signal: AtomicSigNum,
     /// The ID of the execution domain, which increases on every `execve`.
@@ -323,7 +321,6 @@ impl Process {
                 has_child_subreaper: AtomicBool::new(false),
                 sig_dispositions: Mutex::new(sig_dispositions),
                 sig_queues: SigQueues::new(),
-                parent_death_signal: AtomicSigNum::new_empty(),
                 exit_signal: AtomicSigNum::new_empty(),
                 self_exec_id: AtomicU64::new(0),
                 parent_exec_id: AtomicU64::new(0),
@@ -856,24 +853,6 @@ impl Process {
     /// Swaps the dumpability while holding [`Self::credentials_update_lock`].
     pub(crate) fn swap_dumpable_locked(&self, dumpable: Dumpable) -> Dumpable {
         self.dumpable.swap(dumpable, Ordering::SeqCst)
-    }
-
-    /// Clears the parent death signal.
-    pub(crate) fn clear_parent_death_signal(&self) {
-        self.parent_death_signal.clear();
-    }
-
-    /// Sets the parent death signal as `signum`.
-    pub(crate) fn set_parent_death_signal(&self, sig_num: SigNum) {
-        self.parent_death_signal.set(sig_num);
-    }
-
-    /// Returns the parent death signal.
-    ///
-    /// The parent death signal is the signal will be sent to child processes
-    /// when the process exits.
-    pub(crate) fn parent_death_signal(&self) -> Option<SigNum> {
-        self.parent_death_signal.as_sig_num()
     }
 
     pub(crate) fn set_exit_signal(&self, sig_num: SigNum) {

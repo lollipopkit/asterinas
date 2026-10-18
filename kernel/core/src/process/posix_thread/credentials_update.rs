@@ -7,6 +7,7 @@ use core::{
 
 use aster_rights::ReadWriteOp;
 
+use super::PosixThread;
 use crate::{
     prelude::*,
     process::{
@@ -17,12 +18,13 @@ use crate::{
 /// The read-write credentials of the current thread.
 ///
 /// Like `commit_creds` in Linux, an update that changes the effective or filesystem IDs or
-/// gains permitted capabilities makes the process non-dumpable and clears its parent death
-/// signal when this is dropped.
+/// gains permitted capabilities makes the process non-dumpable and clears the parent death
+/// signal of the thread when this is dropped.
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/cred.c#L383-L401>
 pub(crate) struct CredentialsUpdate<'a> {
     credentials: Credentials<ReadWriteOp>,
+    thread: &'a PosixThread,
     process: &'a Process,
     old_ids: DumpabilityIds,
     old_dumpable: Dumpable,
@@ -60,7 +62,11 @@ impl DumpabilityIds {
 }
 
 impl<'a> CredentialsUpdate<'a> {
-    pub(super) fn new(credentials: Credentials<ReadWriteOp>, process: &'a Process) -> Self {
+    pub(super) fn new(
+        credentials: Credentials<ReadWriteOp>,
+        thread: &'a PosixThread,
+        process: &'a Process,
+    ) -> Self {
         let guard = process.credentials_update_lock().lock();
         let old_ids = DumpabilityIds::of(&credentials);
         // The credentials are updated in place, so the process becomes non-dumpable before any
@@ -72,6 +78,7 @@ impl<'a> CredentialsUpdate<'a> {
 
         Self {
             credentials,
+            thread,
             process,
             old_ids,
             old_dumpable,
@@ -94,7 +101,7 @@ impl Drop for CredentialsUpdate<'_> {
             .old_ids
             .changes_dumpability_to(&DumpabilityIds::of(&self.credentials))
         {
-            self.process.clear_parent_death_signal();
+            self.thread.clear_parent_death_signal();
         } else {
             self.process.swap_dumpable_locked(self.old_dumpable);
         }

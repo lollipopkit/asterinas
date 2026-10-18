@@ -12,7 +12,12 @@ use spin::Once;
 
 use super::{
     Credentials, Process,
-    signal::{sig_mask::AtomicSigMask, sig_num::SigNum, sig_queues::SigQueues, signals::Signal},
+    signal::{
+        sig_mask::AtomicSigMask,
+        sig_num::{AtomicSigNum, SigNum},
+        sig_queues::SigQueues,
+        signals::Signal,
+    },
 };
 use crate::{
     events::IoEvents,
@@ -118,6 +123,9 @@ pub struct PosixThread {
     /// Exit code of this thread.
     exit_code: AtomicU32,
 
+    /// The signal sent to the process when the parent thread exits.
+    parent_death_signal: AtomicSigNum,
+
     /// The personality value for this thread.
     personality: AtomicU32,
 }
@@ -180,6 +188,21 @@ impl PosixThread {
     /// Sets the signals blocked before waiting for some of them in `rt_sigtimedwait`.
     pub(crate) fn set_real_blocked(&self, real_blocked: SigMask) {
         self.real_blocked.store(real_blocked, Ordering::Relaxed);
+    }
+
+    /// Returns the signal sent to the process when the parent thread exits.
+    pub(crate) fn parent_death_signal(&self) -> Option<SigNum> {
+        self.parent_death_signal.as_sig_num()
+    }
+
+    /// Sets the signal sent to the process when the parent thread exits.
+    pub(crate) fn set_parent_death_signal(&self, sig_num: SigNum) {
+        self.parent_death_signal.set(sig_num);
+    }
+
+    /// Clears the signal sent to the process when the parent thread exits.
+    pub(crate) fn clear_parent_death_signal(&self) {
+        self.parent_death_signal.clear();
     }
 
     /// Returns whether the signal is blocked by the thread.
@@ -467,6 +490,7 @@ impl ContextPthreadAdminApi for Context<'_> {
     fn credentials_mut(&self) -> CredentialsUpdate<'_> {
         CredentialsUpdate::new(
             self.posix_thread.credentials.dup().restrict(),
+            self.posix_thread,
             &self.process,
         )
     }

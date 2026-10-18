@@ -13,7 +13,7 @@ use crate::{
     prelude::*,
     process::{
         TermStatus,
-        exit::{drop_after, exit_process},
+        exit::{drop_after, exit_process, send_parent_death_signals_on_thread_exit},
         pid_table,
         sigchld::{self, ChildSource},
         signal::constants::SIGCHLD,
@@ -68,6 +68,7 @@ fn exit_internal(
     let posix_process = posix_thread.process();
 
     let mut group_stop_done = None;
+    let was_first_alive;
     let is_last_thread = {
         let mut tasks = posix_process.tasks().lock();
         let has_exited_group = tasks.has_exited_group();
@@ -92,6 +93,12 @@ fn exit_internal(
         if current_thread.is_exited() {
             return;
         }
+        was_first_alive = tasks
+            .as_slice()
+            .iter()
+            .map(|task| task.as_thread().unwrap())
+            .find(|thread| !thread.is_exited())
+            .is_some_and(|thread| Arc::ptr_eq(thread, current_thread));
         current_thread.exit();
 
         let is_last_thread = tasks.remove_exited(&current_task);
@@ -108,6 +115,11 @@ fn exit_internal(
 
     if let Some(sig_num) = group_stop_done {
         posix_process.notify_parent_of_group_stop(sig_num);
+    }
+
+    // The children of the last thread are moved to the reaper process in `exit_process`.
+    if !is_last_thread {
+        send_parent_death_signals_on_thread_exit(was_first_alive, ctx);
     }
 
     // This is put after `current_thread.exit()`,
@@ -152,7 +164,7 @@ fn exit_internal(
     drop_after!(thread_local.borrow_ns_proxy_mut().remove());
 
     if is_last_thread {
-        exit_process(&posix_process);
+        exit_process(ctx);
     }
 }
 
