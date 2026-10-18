@@ -87,7 +87,7 @@ impl<T> RingBuffer<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `capacity` is not a power of two.
+    /// Panics if `capacity` is not a power of two (e.g., zero).
     pub fn new(capacity: usize) -> Self {
         assert!(
             capacity.is_power_of_two(),
@@ -213,6 +213,63 @@ impl<T> RingBuffer<T> {
     pub fn clear(&mut self) {
         self.tail.store(0, Ordering::Release);
         self.head.store(0, Ordering::Release);
+    }
+}
+
+impl<T: Pod> RingBuffer<T> {
+    /// Grows the ring buffer shared by `producer` and `consumer` to `new_capacity`.
+    ///
+    /// The items in the ring buffer are kept, and the head and tail counters are not changed.
+    /// Nothing is done if `new_capacity` is not greater than the current capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_capacity` is not a power of two, or if `producer` and `consumer` do not
+    /// belong to the same ring buffer.
+    pub fn grow(producer: &mut RbProducer<T>, consumer: &mut RbConsumer<T>, new_capacity: usize) {
+        assert!(
+            new_capacity.is_power_of_two(),
+            "capacity must be a power of two"
+        );
+        assert!(
+            Arc::ptr_eq(&producer.rb, &consumer.rb),
+            "the producer and the consumer must belong to the same ring buffer"
+        );
+
+        let old = &producer.rb;
+        if new_capacity <= old.capacity {
+            return;
+        }
+        let new = Self::new(new_capacity);
+
+        let head = old.head();
+        let tail = old.tail();
+        let mut pos = head;
+        while pos != tail {
+            let old_offset = pos.0 & (old.capacity - 1);
+            let new_offset = pos.0 & (new.capacity - 1);
+            let len = (tail - pos)
+                .0
+                .min(old.capacity - old_offset)
+                .min(new.capacity - new_offset);
+
+            let mut reader = old.segment.reader();
+            reader
+                .skip(old_offset * Self::T_SIZE)
+                .limit(len * Self::T_SIZE);
+            let mut writer = new.segment.writer();
+            writer.skip(new_offset * Self::T_SIZE);
+            writer.write(&mut reader);
+
+            pos += len;
+        }
+
+        new.head.store(head.0, Ordering::Relaxed);
+        new.tail.store(tail.0, Ordering::Relaxed);
+
+        let new = Arc::new(new);
+        consumer.rb = new.clone();
+        producer.rb = new;
     }
 }
 

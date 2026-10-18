@@ -80,10 +80,11 @@ impl UnixDatagramSocket {
     }
 
     fn new_raw(is_nonblocking: bool) -> Self {
+        let options = OptionSet::new();
         Self {
-            local_receiver: MessageReceiver::new(),
+            local_receiver: MessageReceiver::new(options.socket.send_buf() as usize),
             remote_queue: RwLock::new(None),
-            options: RwLock::new(OptionSet::new()),
+            options: RwLock::new(options),
             timeouts: SocketTimeouts::new(),
             peer_cred: None,
             is_write_shutdown: AtomicBool::new(false),
@@ -99,6 +100,13 @@ impl UnixDatagramSocket {
         flags: SendFlags,
         timeout: Option<Duration>,
     ) -> Result<usize> {
+        // Like Linux, a message must fit in the send buffer.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2123-L2126>
+        let send_buf = self.local_receiver.queue().send_buf();
+        if reader.sum_lens() > send_buf.saturating_sub(32) {
+            return_errno_with_message!(Errno::EMSGSIZE, "the message is too large");
+        }
+
         if self.is_write_shutdown.load(Ordering::Relaxed) {
             return_errno_with_message!(Errno::EPIPE, "the socket is shut down for writing");
         }
@@ -116,7 +124,7 @@ impl UnixDatagramSocket {
         let res = if self.is_nonblocking() || flags.contains(SendFlags::MSG_DONTWAIT) {
             queue.try_send(reader, &mut aux_data, &self.local_receiver)
         } else {
-            queue.block_send(timeout, || {
+            queue.block_send(self.local_receiver.queue(), timeout, || {
                 queue.try_send(reader, &mut aux_data, &self.local_receiver)
             })
         };
@@ -140,10 +148,17 @@ impl UnixDatagramSocket {
     }
 
     fn check_io_events(&self) -> IoEvents {
-        // POLLOUT should be reported as long as there is space in the socket's send buffer.
-        // Currently, we only limit the size of the receive buffer, not the send buffer. Therefore,
-        // POLLOUT is always reported.
-        let mut io_events = IoEvents::OUT;
+        // Like Linux, POLLOUT is reported if at most a quarter of the send buffer is used.
+        //
+        // TODO: Linux does not report POLLOUT if the receive queue of the connected peer is full
+        // and the peer is not connected to this socket. This requires the peer to notify this
+        // socket when its receive queue becomes not full.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L3482-L3495>
+        let mut io_events = if self.local_receiver.queue().is_writable() {
+            IoEvents::OUT
+        } else {
+            IoEvents::empty()
+        };
 
         io_events |= self.local_receiver.check_io_events();
 
@@ -387,6 +402,10 @@ impl SetSocketLevelOption for (&MessageReceiver, &SocketTimeouts) {
         // details.
 
         self.0.set_pass_cred(pass_cred);
+    }
+
+    fn set_send_buf(&self, send_buf: u32) {
+        self.0.queue().set_send_buf(send_buf as usize);
     }
 
     fn socket_timeouts(&self) -> Option<&SocketTimeouts> {

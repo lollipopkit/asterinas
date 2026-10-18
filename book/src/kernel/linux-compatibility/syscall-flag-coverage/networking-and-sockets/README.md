@@ -79,13 +79,9 @@ Supported functionality in SCML:
 ```
 
 Unsupported flags:
-* `MSG_CONFIRM`
 * `MSG_DONTROUTE`
-* `MSG_DONTWAIT`
 * `MSG_EOR`
 * `MSG_MORE`
-* `MSG_CONFIRM`
-* `MSG_NOSIGNAL`
 * `MSG_OOB`
 * `MSG_FASTOPEN`
 

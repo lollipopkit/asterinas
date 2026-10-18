@@ -148,6 +148,8 @@ impl OptionSet {
         RawTcpOption {
             keep_alive: self.socket.keep_alive().then_some(keep_alive_interval),
             is_nagle_enabled: !self.tcp.no_delay(),
+            recv_buf_len: self.socket.recv_buf() as usize,
+            send_buf_len: self.socket.send_buf() as usize,
         }
     }
 }
@@ -200,6 +202,14 @@ impl StreamSocket {
             if !raw_tcp_socket.nagle_enabled() {
                 options.tcp.set_no_delay(true);
             }
+
+            // Like Linux, the buffer sizes are inherited (see `sk_clone`).
+            options
+                .socket
+                .set_recv_buf(raw_tcp_socket.recv_capacity() as u32);
+            options
+                .socket
+                .set_send_buf(raw_tcp_socket.send_capacity() as u32);
 
             options.ipv6 = listener_options.ipv6;
 
@@ -848,7 +858,7 @@ impl Socket for StreamSocket {
         }
 
         let nr_disconnects = self.nr_disconnects.load(Ordering::Relaxed);
-        self.block_on_unless(
+        let result = self.block_on_unless(
             flags.contains(SendFlags::MSG_DONTWAIT),
             IoEvents::OUT,
             self.timeouts.send_timeout(),
@@ -856,9 +866,8 @@ impl Socket for StreamSocket {
                 self.check_not_disconnected(nr_disconnects)?;
                 self.try_send(reader, flags)
             },
-        )
-
-        // TODO: Trigger `SIGPIPE` if the error code is `EPIPE` and `MSG_NOSIGNAL` is not specified
+        );
+        flags.raise_sigpipe_on_epipe(result)
     }
 
     fn recvmsg(
@@ -1209,6 +1218,21 @@ impl State {
         bound_port.set_can_reuse(reuse_addr);
     }
 
+    /// Sets the buffer lengths, where `None` means that the length is not changed.
+    ///
+    /// The TCP buffers are allocated when the connection is created, and they cannot be resized
+    /// later. So the lengths only take effect for new connections, i.e., when connecting or
+    /// accepting new connections.
+    //
+    // TODO: Linux applies new buffer sizes to existing connections. Support this if the
+    // underlying TCP buffers can be resized.
+    fn set_buf_lens(&self, recv_buf_len: Option<usize>, send_buf_len: Option<usize>) {
+        match self {
+            State::Init(_) | State::Connecting(_) | State::Connected(_) => (),
+            State::Listen(listen_stream) => listen_stream.set_buf_lens(recv_buf_len, send_buf_len),
+        }
+    }
+
     fn set_keep_alive(&self, is_keep_alive_enabled: bool, keep_intvl: u32) -> NeedIfacePoll {
         let interval = is_keep_alive_enabled.then(|| Duration::from_secs(keep_intvl as u64));
 
@@ -1240,6 +1264,14 @@ impl SetSocketLevelOption for (&State, &TcpOptionSet, &SocketTimeouts) {
 
     fn set_keep_alive(&self, keep_alive: bool) -> NeedIfacePoll {
         self.0.set_keep_alive(keep_alive, self.1.keep_intvl())
+    }
+
+    fn set_send_buf(&self, send_buf: u32) {
+        self.0.set_buf_lens(None, Some(send_buf as usize));
+    }
+
+    fn set_recv_buf(&self, recv_buf: u32) {
+        self.0.set_buf_lens(Some(recv_buf as usize), None);
     }
 
     fn socket_timeouts(&self) -> Option<&SocketTimeouts> {

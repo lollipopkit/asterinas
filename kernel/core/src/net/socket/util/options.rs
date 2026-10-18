@@ -6,11 +6,12 @@ use core::{
     time::Duration,
 };
 
-use aster_bigtcp::socket::{
-    NeedIfacePoll, TCP_RECV_BUF_LEN, TCP_SEND_BUF_LEN, UDP_RECV_PAYLOAD_LEN, UDP_SEND_PAYLOAD_LEN,
-};
+use aster_bigtcp::socket::{NeedIfacePoll, TCP_RECV_BUF_LEN, TCP_SEND_BUF_LEN};
 
-use super::{LingerOption, SocketTimeout};
+use super::{
+    LingerOption, SocketTimeout,
+    buffer_size::{RMEM_DEFAULT, WMEM_DEFAULT, recv_buf_from_user, send_buf_from_user},
+};
 use crate::{
     net::socket::{
         netlink::NETLINK_DEFAULT_BUF_SIZE,
@@ -20,7 +21,7 @@ use crate::{
             SendTimeout, SocketOption, SocketType,
             macros::{sock_option_mut, sock_option_ref},
         },
-        unix::{CUserCred, UNIX_DATAGRAM_DEFAULT_BUF_SIZE, UNIX_STREAM_DEFAULT_BUF_SIZE},
+        unix::CUserCred,
     },
     prelude::*,
     process::{UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
@@ -48,8 +49,8 @@ impl Default for SocketOptionSet {
         Self {
             reuse_addr: false,
             broadcast: false,
-            send_buf: MIN_SENDBUF,
-            recv_buf: MIN_RECVBUF,
+            send_buf: WMEM_DEFAULT.get(),
+            recv_buf: RMEM_DEFAULT.get(),
             keep_alive: false,
             priority: 0,
             linger: LingerOption::default(),
@@ -70,30 +71,23 @@ impl SocketOptionSet {
     }
 
     /// Returns the default socket level options for udp socket.
+    ///
+    /// Like Linux, the default buffer sizes are `net.core.wmem_default` and
+    /// `net.core.rmem_default`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/sock.c#L3758-L3759>
     pub(in crate::net) fn new_udp() -> Self {
-        Self {
-            send_buf: UDP_SEND_PAYLOAD_LEN as u32,
-            recv_buf: UDP_RECV_PAYLOAD_LEN as u32,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Returns the default socket level options for unix stream socket.
     pub(in crate::net) fn new_unix_stream() -> Self {
-        Self {
-            send_buf: UNIX_STREAM_DEFAULT_BUF_SIZE as u32,
-            recv_buf: UNIX_STREAM_DEFAULT_BUF_SIZE as u32,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Returns the default socket level options for unix datagram socket.
     pub(in crate::net) fn new_unix_datagram() -> Self {
-        Self {
-            send_buf: UNIX_DATAGRAM_DEFAULT_BUF_SIZE as u32,
-            recv_buf: UNIX_DATAGRAM_DEFAULT_BUF_SIZE as u32,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Returns the default socket level options for netlink socket.
@@ -170,16 +164,6 @@ impl SocketOptionSet {
                 let is_listening = socket.is_listening();
                 socket_accept_conn.set(is_listening);
             }
-            socket_sendbuf_force @ SendBufForce => {
-                check_current_privileged()?;
-                let send_buf = self.send_buf();
-                socket_sendbuf_force.set(send_buf);
-            }
-            socket_recvbuf_force @ RecvBufForce => {
-                check_current_privileged()?;
-                let recv_buf = self.recv_buf();
-                socket_recvbuf_force.set(recv_buf);
-            }
             _socket_peer_groups @ PeerGroups => {
                 return_errno_with_message!(Errno::ENODATA, "the socket does not have peer groups");
             }
@@ -208,20 +192,14 @@ impl SocketOptionSet {
                 self.set_broadcast(*broadcast);
             }
             socket_send_buf @ SendBuf => {
-                let send_buf = socket_send_buf.get().unwrap();
-                if *send_buf <= MIN_SENDBUF {
-                    self.set_send_buf(MIN_SENDBUF);
-                } else {
-                    self.set_send_buf(*send_buf);
-                }
+                let send_buf = send_buf_from_user(*socket_send_buf.get().unwrap(), false);
+                self.set_send_buf(send_buf);
+                socket.set_send_buf(send_buf);
             }
             socket_recv_buf @ RecvBuf => {
-                let recv_buf = socket_recv_buf.get().unwrap();
-                if *recv_buf <= MIN_RECVBUF {
-                    self.set_recv_buf(MIN_RECVBUF);
-                } else {
-                    self.set_recv_buf(*recv_buf);
-                }
+                let recv_buf = recv_buf_from_user(*socket_recv_buf.get().unwrap(), false);
+                self.set_recv_buf(recv_buf);
+                socket.set_recv_buf(recv_buf);
             }
             socket_keepalive @ KeepAlive => {
                 let keep_alive = socket_keepalive.get().unwrap();
@@ -258,21 +236,15 @@ impl SocketOptionSet {
             }
             socket_sendbuf_force @ SendBufForce => {
                 check_current_privileged()?;
-                let send_buf = socket_sendbuf_force.get().unwrap();
-                if *send_buf <= MIN_SENDBUF {
-                    self.set_send_buf(MIN_SENDBUF);
-                } else {
-                    self.set_send_buf(*send_buf);
-                }
+                let send_buf = send_buf_from_user(*socket_sendbuf_force.get().unwrap(), true);
+                self.set_send_buf(send_buf);
+                socket.set_send_buf(send_buf);
             }
             socket_recvbuf_force @ RecvBufForce => {
                 check_current_privileged()?;
-                let recv_buf = socket_recvbuf_force.get().unwrap();
-                if *recv_buf <= MIN_RECVBUF {
-                    self.set_recv_buf(MIN_RECVBUF);
-                } else {
-                    self.set_recv_buf(*recv_buf);
-                }
+                let recv_buf = recv_buf_from_user(*socket_recvbuf_force.get().unwrap(), true);
+                self.set_recv_buf(recv_buf);
+                socket.set_recv_buf(recv_buf);
             }
             _ => return_errno_with_message!(
                 Errno::ENOPROTOOPT,
@@ -376,9 +348,6 @@ fn check_priority(priority: i32) -> Result<()> {
     check_current_privileged()
 }
 
-pub(crate) const MIN_SENDBUF: u32 = 2304;
-pub(crate) const MIN_RECVBUF: u32 = 2304;
-
 /// A trait used for getting socket level options on actual sockets.
 pub(in crate::net) trait GetSocketLevelOption {
     /// Returns the socket type.
@@ -416,6 +385,12 @@ pub(in crate::net) trait SetSocketLevelOption {
     }
     /// Sets whether receipt of the credentials of the sending process is enabled.
     fn set_pass_cred(&self, _pass_cred: bool) {}
+
+    /// Applies the send buffer size, which has been doubled like `SO_SNDBUF` in Linux.
+    fn set_send_buf(&self, _send_buf: u32) {}
+
+    /// Applies the receive buffer size, which has been doubled like `SO_RCVBUF` in Linux.
+    fn set_recv_buf(&self, _recv_buf: u32) {}
 
     /// Returns timeout values for blocking socket operations.
     fn socket_timeouts(&self) -> Option<&SocketTimeouts> {

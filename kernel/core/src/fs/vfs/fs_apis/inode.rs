@@ -17,7 +17,8 @@ use crate::{
     device::{Device, DeviceType},
     fs::{
         file::{
-            AccessMode, InodeMode, InodeType, PerOpenFileOps, Permission, StatusFlags, SyncMode,
+            AccessMode, InodeMode, InodeType, PerOpenFileOps, Permission, RwfFlags, StatusFlags,
+            SyncMode,
         },
         utils::DirentVisitor,
         vfs::path::{Dentry, Path},
@@ -353,6 +354,22 @@ pub trait FileOps {
         reader: &mut VmReader,
         status_flags: StatusFlags,
     ) -> Result<usize>;
+
+    /// Writes like [`write_at`], but with the flags of `pwritev2`.
+    ///
+    /// The caller has applied [`RwfFlags::NOWAIT`] to `status_flags` and handled the flags that
+    /// affect the offset or the synchronization. By default, the other flags are ignored.
+    ///
+    /// [`write_at`]: FileOps::write_at
+    fn write_at_with_flags(
+        &self,
+        offset: usize,
+        reader: &mut VmReader,
+        status_flags: StatusFlags,
+        _flags: RwfFlags,
+    ) -> Result<usize> {
+        self.write_at(offset, reader, status_flags)
+    }
 
     /// Reads directory entries from the given offset.
     fn readdir_at(&self, _offset: usize, _visitor: &mut dyn DirentVisitor) -> Result<usize> {

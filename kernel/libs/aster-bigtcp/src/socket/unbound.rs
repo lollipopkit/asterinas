@@ -5,10 +5,21 @@ use alloc::{boxed::Box, vec, vec::Vec};
 pub(super) type RawTcpSocket = smoltcp::socket::tcp::Socket<'static>;
 pub type RawUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
-pub(super) fn new_tcp_socket() -> Box<RawTcpSocket> {
+/// Creates a raw TCP socket with the specified buffer lengths.
+///
+/// The buffer lengths are limited by [`TCP_MAX_BUF_LEN`].
+pub(super) fn new_tcp_socket(recv_buf_len: usize, send_buf_len: usize) -> Box<RawTcpSocket> {
     let raw_tcp_socket = {
-        let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; TCP_RECV_BUF_LEN]);
-        let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; TCP_SEND_BUF_LEN]);
+        let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![
+            0u8;
+            recv_buf_len
+                .clamp(1, TCP_MAX_BUF_LEN)
+        ]);
+        let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![
+            0u8;
+            send_buf_len
+                .clamp(1, TCP_MAX_BUF_LEN)
+        ]);
         RawTcpSocket::new(rx_buffer, tx_buffer)
     };
     Box::new(raw_tcp_socket)
@@ -32,14 +43,6 @@ pub(super) fn new_udp_socket() -> Box<RawUdpSocket> {
     Box::new(raw_udp_socket)
 }
 
-pub(super) fn new_udp_recv_buffer() -> smoltcp::socket::udp::PacketBuffer<'static> {
-    let metadata = smoltcp::socket::udp::PacketMetadata::EMPTY;
-    smoltcp::socket::udp::PacketBuffer::new(
-        vec![metadata; UDP_METADATA_LEN],
-        vec![0u8; UDP_RECV_PAYLOAD_LEN],
-    )
-}
-
 // TCP socket buffer sizes:
 //
 // According to
@@ -51,12 +54,16 @@ pub(super) fn new_udp_recv_buffer() -> smoltcp::socket::udp::PacketBuffer<'stati
 // buffer and the MTU will cause the implementation of Nagle's algorithm in smoltcp to behave
 // abnormally (see <https://github.com/asterinas/asterinas/pull/1396>). So the socket buffer size
 // is increased from 64K to 128K.
-//
-// TODO: Consider allowing user programs to set the socket buffer length via `setsockopt` system calls.
 pub const TCP_RECV_BUF_LEN: usize = 65536 * 2;
 pub const TCP_SEND_BUF_LEN: usize = 65536 * 2;
 
+/// The maximum length of the TCP socket buffers.
+///
+/// The buffers are allocated when the socket is created, so their lengths are limited. This is
+/// twice the default `net.core.rmem_max` and `net.core.wmem_max` in Linux, which is the maximum
+/// buffer size that can be set without `CAP_NET_ADMIN`.
+const TCP_MAX_BUF_LEN: usize = 8 << 20;
+
 // UDP socket buffer sizes:
-pub const UDP_SEND_PAYLOAD_LEN: usize = 65536;
-pub const UDP_RECV_PAYLOAD_LEN: usize = 65536;
+const UDP_SEND_PAYLOAD_LEN: usize = 65536;
 const UDP_METADATA_LEN: usize = 256;

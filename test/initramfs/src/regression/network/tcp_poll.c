@@ -243,16 +243,15 @@ FN_TEST(poll_shutdown_readwrite)
 
 	int err = 0;
 	socklen_t errlen = sizeof(err);
-	// FIXME: This socket error should be `EPIPE`, but in Asterinas it is
-	// `ECONNRESET`. See the Linux implementation for details:
-	// <https://github.com/torvalds/linux/blob/848e076317446f9c663771ddec142d7c2eb4cb43/net/ipv4/tcp_input.c#L4553-L4555>.
-#ifdef __asterinas__
-	TEST_RES(getsockopt(sk_accept, SOL_SOCKET, SO_ERROR, &err, &errlen),
-		 errlen == sizeof(err) && err == ECONNRESET);
-#else
+	// The RST packet is received in the `CLOSE-WAIT` state, so the socket
+	// error is `EPIPE`. See the Linux implementation for details:
+	// <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp_input.c#L4900-L4915>.
 	TEST_RES(getsockopt(sk_connect, SOL_SOCKET, SO_ERROR, &err, &errlen),
 		 errlen == sizeof(err) && err == EPIPE);
-#endif
+	// The RST packet is sent in the `FIN-WAIT-2` state, so the socket error
+	// is `ECONNRESET`.
+	TEST_RES(getsockopt(sk_accept, SOL_SOCKET, SO_ERROR, &err, &errlen),
+		 errlen == sizeof(err) && err == ECONNRESET);
 }
 END_TEST()
 

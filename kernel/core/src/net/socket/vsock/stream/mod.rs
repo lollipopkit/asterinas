@@ -390,14 +390,14 @@ impl Socket for VsockStreamSocket {
             warn!("sending control message is not supported");
         }
 
-        self.block_on_unless(
+        let result = self.block_on_unless(
             flags.contains(SendFlags::MSG_DONTWAIT),
             IoEvents::OUT,
             None,
             || self.try_send(reader, flags),
-        )
-
-        // TODO: Trigger `SIGPIPE` if the error code is `EPIPE` and `MSG_NOSIGNAL` is not specified
+        );
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/vmw_vsock/af_vsock.c#L2327-L2328>
+        flags.raise_sigpipe_on_epipe(result)
     }
 
     fn recvmsg(

@@ -79,3 +79,33 @@ fn rb_write_read_all() {
     }
     assert!(prod.is_empty());
 }
+
+#[ktest]
+fn rb_grow() {
+    let rb = RingBuffer::<u8>::new(4);
+    let (mut prod, mut cons) = rb.split();
+
+    // Make the items wrap around.
+    prod.push_slice(&[1, 2, 3]).unwrap();
+    assert_eq!(cons.pop(), Some(1));
+    assert_eq!(cons.pop(), Some(2));
+    prod.push_slice(&[4, 5, 6]).unwrap();
+    assert!(prod.is_full());
+    let (head, tail) = (prod.head(), prod.tail());
+
+    RingBuffer::grow(&mut prod, &mut cons, 2);
+    assert_eq!(prod.capacity(), 4);
+
+    RingBuffer::grow(&mut prod, &mut cons, 16);
+    assert_eq!(prod.capacity(), 16);
+    assert_eq!(cons.capacity(), 16);
+    assert_eq!((prod.head(), prod.tail()), (head, tail));
+    assert_eq!((cons.head(), cons.tail()), (head, tail));
+    assert_eq!(prod.free_len(), 12);
+
+    prod.push_slice(&[7, 8]).unwrap();
+    let mut popped = [0u8; 6];
+    cons.pop_slice(&mut popped).unwrap();
+    assert_eq!(popped, [3, 4, 5, 6, 7, 8]);
+    assert!(cons.is_empty());
+}

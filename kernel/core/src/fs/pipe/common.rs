@@ -11,19 +11,12 @@ use crate::{
     dispatch_ioctl,
     events::IoEvents,
     fs::{
-        file::{AccessMode, PerOpenFileOps, SettableStatusFlags, StatusFlags},
+        file::{AccessMode, PerOpenFileOps, RwfFlags, SettableStatusFlags, StatusFlags},
         utils::{Endpoint, EndpointState},
         vfs::{inode::FileOps, path::Path},
     },
     prelude::*,
-    process::{
-        posix_thread::AsPosixThread,
-        signal::{
-            PollHandle, Pollable,
-            constants::SIGPIPE,
-            signals::user::{UserSignal, UserSignalKind},
-        },
-    },
+    process::signal::{PollHandle, Pollable, send_sigpipe_to_current},
     util::{
         ioctl::RawIoctl,
         ring_buffer::{ConsumerU8Ext, ProducerU8Ext, RbConsumer, RbProducer, RingBuffer},
@@ -37,11 +30,16 @@ use crate::{
 pub(in crate::fs) struct PipeHandle {
     inner: Arc<PipeObj>,
     access_mode: AccessMode,
+    is_named_pipe: bool,
 }
 
 impl PipeHandle {
-    fn new(inner: Arc<PipeObj>, access_mode: AccessMode) -> Box<Self> {
-        Box::new(Self { inner, access_mode })
+    fn new(inner: Arc<PipeObj>, access_mode: AccessMode, is_named_pipe: bool) -> Box<Self> {
+        Box::new(Self {
+            inner,
+            access_mode,
+            is_named_pipe,
+        })
     }
 
     fn try_read(&self, writer: &mut VmWriter) -> Result<usize> {
@@ -51,11 +49,11 @@ impl PipeHandle {
         self.inner.reader.try_read(writer)
     }
 
-    fn try_write(&self, reader: &mut VmReader) -> Result<usize> {
+    fn try_write(&self, reader: &mut VmReader, is_nosignal: bool) -> Result<usize> {
         // `InodeHandle` checks the access mode before calling methods in `PerOpenFileOps`.
         debug_assert!(self.access_mode.is_writable());
 
-        self.inner.writer.try_write(reader)
+        self.inner.writer.try_write(reader, is_nosignal)
     }
 
     fn bytes_to_read(&self) -> usize {
@@ -119,9 +117,19 @@ impl FileOps for PipeHandle {
 
     fn write_at(
         &self,
+        offset: usize,
+        reader: &mut VmReader,
+        status_flags: StatusFlags,
+    ) -> Result<usize> {
+        self.write_at_with_flags(offset, reader, status_flags, RwfFlags::empty())
+    }
+
+    fn write_at_with_flags(
+        &self,
         _offset: usize,
         reader: &mut VmReader,
         status_flags: StatusFlags,
+        flags: RwfFlags,
     ) -> Result<usize> {
         if !reader.has_remain() {
             // Even the peer endpoint has been closed, writing an empty buffer is
@@ -129,15 +137,23 @@ impl FileOps for PipeHandle {
             return Ok(0);
         }
 
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/pipe.c#L555-L559>
+        let is_nosignal = flags.contains(RwfFlags::NOSIGNAL);
         if status_flags.contains(StatusFlags::O_NONBLOCK) {
-            self.try_write(reader)
+            self.try_write(reader, is_nosignal)
         } else {
-            self.wait_events(IoEvents::OUT, None, || self.try_write(reader))
+            self.wait_events(IoEvents::OUT, None, || self.try_write(reader, is_nosignal))
         }
     }
 }
 
 impl PerOpenFileOps for PipeHandle {
+    fn supports_nowait(&self) -> bool {
+        // Like Linux, only anonymous pipes support `RWF_NOWAIT`.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/pipe.c#L1068-L1069>
+        !self.is_named_pipe
+    }
+
     fn check_seekable(&self) -> Result<()> {
         return_errno_with_message!(Errno::ESPIPE, "the inode is a FIFO file")
     }
@@ -239,7 +255,7 @@ impl Pipe {
                 }
 
                 let has_writer = pipe_obj.num_writer.load(Ordering::Relaxed) > 0;
-                let handle = PipeHandle::new(pipe_obj, access_mode);
+                let handle = PipeHandle::new(pipe_obj, access_mode, is_named_pipe);
 
                 // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/fs/pipe.c#L1166-L1175>
                 if is_named_pipe && !status_flags.contains(StatusFlags::O_NONBLOCK) && !has_writer {
@@ -262,7 +278,7 @@ impl Pipe {
                 }
 
                 let has_reader = pipe_obj.num_reader.load(Ordering::Relaxed) > 0;
-                let handle = PipeHandle::new(pipe_obj, access_mode);
+                let handle = PipeHandle::new(pipe_obj, access_mode, is_named_pipe);
 
                 // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/fs/pipe.c#L1184-L1195>
                 if is_named_pipe && !has_reader {
@@ -290,7 +306,7 @@ impl Pipe {
                     pipe_obj.writer.activate();
                 }
 
-                PipeHandle::new(pipe_obj, access_mode)
+                PipeHandle::new(pipe_obj, access_mode, is_named_pipe)
             }
         };
 
@@ -462,7 +478,7 @@ impl PipeWriter {
         }
     }
 
-    fn try_write(&self, reader: &mut VmReader) -> Result<usize> {
+    fn try_write(&self, reader: &mut VmReader, is_nosignal: bool) -> Result<usize> {
         let write = || {
             let mut producer = self.producer.lock();
             if reader.remain() <= PIPE_BUF && producer.free_len() < reader.remain() {
@@ -476,15 +492,8 @@ impl PipeWriter {
         if res.is_ok() {
             self.state.notify_write();
         }
-        if res.is_err_and(|e| e.error() == Errno::EPIPE)
-            && let Some(posix_thread) = current_thread!().as_posix_thread()
-        {
-            posix_thread.enqueue_signal(Box::new(UserSignal::new(
-                SIGPIPE,
-                UserSignalKind::Kill,
-                posix_thread.process().pid(),
-                posix_thread.credentials().ruid(),
-            )));
+        if !is_nosignal && res.is_err_and(|e| e.error() == Errno::EPIPE) {
+            send_sigpipe_to_current();
         }
 
         res

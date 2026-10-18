@@ -15,7 +15,7 @@ pub(crate) mod signals;
 
 use align_ext::AlignExt;
 use c_types::{siginfo_t, ucontext_t};
-use constants::{SI_KERNEL, SIGSEGV};
+use constants::{SI_KERNEL, SIGPIPE, SIGSEGV};
 use ostd::{
     arch::cpu::context::{FpuContext, UserContext},
     mm::VmIo,
@@ -37,11 +37,17 @@ use crate::{
     prelude::*,
     process::{
         TermStatus,
-        posix_thread::{ContextPthreadAdminApi, do_exit_group, ptrace::PtraceStopResult},
+        posix_thread::{
+            AsPosixThread, ContextPthreadAdminApi, do_exit_group, ptrace::PtraceStopResult,
+        },
         signal::{
             c_types::stack_t,
             constants::SIGKILL,
-            signals::{Signal, fault::FaultSignal},
+            signals::{
+                Signal,
+                fault::FaultSignal,
+                user::{UserSignal, UserSignalKind},
+            },
         },
     },
 };
@@ -49,6 +55,27 @@ use crate::{
 pub(crate) trait SignalContext {
     /// Sets signal handler arguments.
     fn set_arguments(&mut self, sig_num: SigNum, siginfo_addr: usize, ucontext_addr: usize);
+}
+
+/// Sends `SIGPIPE` to the current thread, which writes to a pipe or a stream socket that is
+/// broken.
+///
+/// Like Linux's `send_sig(SIGPIPE, current, 0)`, the signal is directed to the current thread and
+/// carries `SI_USER` with the PID and the real UID of the current process.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L1133-L1145>
+pub(crate) fn send_sigpipe_to_current() {
+    let current = current_thread!();
+    let Some(posix_thread) = current.as_posix_thread() else {
+        return;
+    };
+
+    posix_thread.enqueue_signal(Box::new(UserSignal::new(
+        SIGPIPE,
+        UserSignalKind::Kill,
+        posix_thread.process().pid(),
+        posix_thread.credentials().ruid(),
+    )));
 }
 
 /// Restarts the interrupted syscall, if any, because no user signal handler runs.

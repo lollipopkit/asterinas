@@ -7,8 +7,8 @@
 use core::fmt::Display;
 
 use super::{
-    AccessMode, FileCommon, InodeHandle, SettableStatusFlags, StatusFlags, file_table::FdFlags,
-    inode_handle::SeekFrom,
+    AccessMode, FileCommon, InodeHandle, RwfFlags, SettableStatusFlags, StatusFlags,
+    file_table::FdFlags, inode_handle::SeekFrom,
 };
 use crate::{
     fs::vfs::{inode::FallocMode, path::Path},
@@ -83,6 +83,57 @@ pub(crate) trait FileLike: Pollable + Send + Sync + Any {
     /// [`write`]: FileLike::write
     fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
         return_errno_with_message!(Errno::ESPIPE, "write_at is not supported");
+    }
+
+    /// Returns whether the file supports `RWF_NOWAIT` (`FMODE_NOWAIT` in Linux).
+    fn supports_nowait(&self) -> bool {
+        false
+    }
+
+    /// Reads like [`read`], but with the flags of `preadv2`.
+    ///
+    /// The flags have been checked by [`RwfFlags::from_raw_checked`]. By default, the flags are
+    /// ignored, so files that support [`RwfFlags::NOWAIT`] must override this method.
+    ///
+    /// [`read`]: FileLike::read
+    fn read_with_flags(&self, writer: &mut VmWriter, flags: RwfFlags) -> Result<usize> {
+        debug_assert!(!flags.contains(RwfFlags::NOWAIT) || self.supports_nowait());
+        self.read(writer)
+    }
+
+    /// Writes like [`write`], but with the flags of `pwritev2`.
+    ///
+    /// The flags have been checked by [`RwfFlags::from_raw_checked`]. By default, the flags are
+    /// ignored, so files that support [`RwfFlags::NOWAIT`] must override this method.
+    ///
+    /// [`write`]: FileLike::write
+    fn write_with_flags(&self, reader: &mut VmReader, flags: RwfFlags) -> Result<usize> {
+        debug_assert!(!flags.contains(RwfFlags::NOWAIT) || self.supports_nowait());
+        self.write(reader)
+    }
+
+    /// Reads like [`read_at`], but with the flags of `preadv2`.
+    ///
+    /// [`read_at`]: FileLike::read_at
+    fn read_at_with_flags(
+        &self,
+        offset: usize,
+        writer: &mut VmWriter,
+        flags: RwfFlags,
+    ) -> Result<usize> {
+        self.read_at(offset, writer)
+    }
+
+    /// Writes like [`write_at`], but with the flags of `pwritev2`.
+    ///
+    /// [`write_at`]: FileLike::write_at
+    fn write_at_with_flags(
+        &self,
+        offset: usize,
+        reader: &mut VmReader,
+        flags: RwfFlags,
+    ) -> Result<usize> {
+        self.write_at(offset, reader)
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {

@@ -97,6 +97,13 @@ impl ListenStream {
         first
     }
 
+    /// Sets the buffer lengths of new connections on all the listeners.
+    pub(super) fn set_buf_lens(&self, recv_buf_len: Option<usize>, send_buf_len: Option<usize>) {
+        for tcp_listener in self.tcp_listeners.iter() {
+            tcp_listener.set_buf_lens(recv_buf_len, send_buf_len);
+        }
+    }
+
     pub(super) fn into_listeners(self) -> Vec<TcpListener> {
         self.tcp_listeners
     }

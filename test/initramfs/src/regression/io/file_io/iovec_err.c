@@ -66,9 +66,9 @@ FN_TEST(preadv2_pwritev2_invalid_flags)
 	int fd;
 
 	fd = TEST_SUCC(open(file_path, O_RDWR | O_CREAT | O_TRUNC, 0600));
-	TEST_ERRNO(syscall(SYS_preadv2, fd, iov_long, 1, 0, 0, 0xf0),
+	TEST_ERRNO(syscall(SYS_preadv2, fd, iov_long, 1, 0, 0, 0x200),
 		   EOPNOTSUPP);
-	TEST_ERRNO(syscall(SYS_pwritev2, fd, iov_long, 1, 0, 0, 0xf0),
+	TEST_ERRNO(syscall(SYS_pwritev2, fd, iov_long, 1, 0, 0, 0x200),
 		   EOPNOTSUPP);
 	TEST_SUCC(close(fd));
 	TEST_SUCC(unlink(file_path));

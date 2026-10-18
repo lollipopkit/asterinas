@@ -4,7 +4,7 @@ use aster_rights::ReadDupOp;
 use takeable::Takeable;
 
 use super::{
-    connected::Connected,
+    connected::{Connected, EndConfig},
     init::Init,
     listener::{Backlog, Listener, get_backlog},
 };
@@ -144,12 +144,18 @@ impl OptionSet {
     /// Reference:
     /// <https://elixir.bootlin.com/linux/v6.18.6/source/net/unix/af_unix.c#L1765>
     /// <https://elixir.bootlin.com/linux/v6.18.6/source/include/net/sock.h#L543-L550>
-    pub(super) fn new_accepted(is_pass_cred: bool) -> Self {
+    pub(super) fn new_accepted(is_pass_cred: bool, send_buf: usize) -> Self {
         let mut result = Self::new();
         if is_pass_cred {
             result.socket.set_pass_cred(is_pass_cred);
         }
+        result.socket.set_send_buf(send_buf as u32);
         result
+    }
+
+    /// Returns the send buffer size.
+    pub(super) fn send_buf(&self) -> usize {
+        self.socket.send_buf() as usize
     }
 
     pub(super) fn apply_to_connected(&self, connected: &Connected) {
@@ -191,18 +197,25 @@ impl UnixStreamSocket {
         );
 
         let cred = SocketCred::<ReadDupOp>::new_current();
+        let (options_a, options_b) = (OptionSet::new(), OptionSet::new());
 
         let (conn_a, conn_b) = Connected::new_pair(
-            None,
-            None,
-            EndpointState::default(),
-            EndpointState::default(),
-            cred.dup().restrict(),
-            cred.restrict(),
+            EndConfig {
+                addr: None,
+                state: EndpointState::default(),
+                cred: cred.dup().restrict(),
+                send_buf: options_a.send_buf(),
+            },
+            EndConfig {
+                addr: None,
+                state: EndpointState::default(),
+                cred: cred.restrict(),
+                send_buf: options_b.send_buf(),
+            },
         );
         (
-            Self::new_connected(conn_a, OptionSet::new(), is_nonblocking, socket_type),
-            Self::new_connected(conn_b, OptionSet::new(), is_nonblocking, socket_type),
+            Self::new_connected(conn_a, options_a, is_nonblocking, socket_type),
+            Self::new_connected(conn_b, options_b, is_nonblocking, socket_type),
         )
     }
 
@@ -510,12 +523,22 @@ impl Socket for UnixStreamSocket {
         }
         let mut auxiliary_data = AuxiliaryData::from_control(control_messages)?;
 
-        self.block_on_unless(
+        let result = self.block_on_unless(
             flags.contains(SendFlags::MSG_DONTWAIT),
             IoEvents::OUT,
             self.timeouts.send_timeout(),
             || self.try_send(reader, &mut auxiliary_data, flags),
-        )
+        );
+
+        // Like Linux, `SOCK_SEQPACKET` sockets do not raise `SIGPIPE` since they send messages
+        // like datagram sockets.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2509-L2514>
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2233-L2236>
+        if self.is_seqpacket() {
+            result
+        } else {
+            flags.raise_sigpipe_on_epipe(result)
+        }
     }
 
     fn recvmsg(
@@ -609,6 +632,13 @@ impl SetSocketLevelOption for (&State, &SocketTimeouts) {
             }
             State::Listen(listener) => listener.set_pass_cred(pass_cred),
             State::Connected(connected) => connected.set_pass_cred(pass_cred),
+        }
+    }
+
+    fn set_send_buf(&self, send_buf: u32) {
+        // For other states, the send buffer size is applied when the socket is connected.
+        if let State::Connected(connected) = self.0 {
+            connected.set_send_buf(send_buf as usize);
         }
     }
 

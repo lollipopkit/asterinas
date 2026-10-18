@@ -3,6 +3,8 @@
 use aster_bigtcp::socket::ReceiveBehavior;
 use bitflags::bitflags;
 
+use crate::{prelude::*, process::signal::send_sigpipe_to_current};
+
 bitflags! {
     /// Flags passed to socket send operations.
     #[repr(C)]
@@ -24,13 +26,32 @@ bitflags! {
         const MSG_FASTOPEN  = 0x20000000;
 
         const SUPPORTED     = SendFlags::MSG_DONTWAIT.bits
-            | SendFlags::MSG_CONFIRM.bits;
+            | SendFlags::MSG_CONFIRM.bits
+            | SendFlags::MSG_NOSIGNAL.bits;
     }
 }
 
 impl SendFlags {
     pub(crate) const fn is_all_supported(self) -> bool {
         Self::SUPPORTED.contains(self)
+    }
+
+    /// Sends `SIGPIPE` to the current thread if the send operation fails with `EPIPE`, unless
+    /// `MSG_NOSIGNAL` is set.
+    ///
+    /// Like Linux, only stream sockets do this. Datagram and `SOCK_SEQPACKET` sockets return
+    /// `EPIPE` without the signal.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/stream.c#L189-L196>
+    pub(crate) fn raise_sigpipe_on_epipe<T>(self, result: Result<T>) -> Result<T> {
+        if !self.contains(SendFlags::MSG_NOSIGNAL)
+            && result
+                .as_ref()
+                .is_err_and(|err| err.error() == Errno::EPIPE)
+        {
+            send_sigpipe_to_current();
+        }
+        result
     }
 }
 

@@ -122,8 +122,7 @@ impl<E: Ext> TcpListener<E> {
                 return Err((bound_ports, ListenError::AddressInUse));
             }
 
-            let mut socket = new_tcp_socket();
-            option.apply(&mut socket);
+            let mut socket = option.new_socket();
             if let Err(err) = socket.listen(listen_endpoint(local_endpoint)) {
                 return Err((bound_ports, err.into()));
             }
@@ -181,6 +180,38 @@ impl<E: Ext> TcpListener<E> {
         };
 
         Some((accepted, remote_endpoint))
+    }
+
+    /// Sets the buffer lengths of new connections.
+    ///
+    /// The buffer length that is `None` is not changed. Connections that have received the SYN
+    /// packets are not affected.
+    ///
+    /// Polling the iface is _not_ required after this method succeeds.
+    pub fn set_buf_lens(&self, recv_buf_len: Option<usize>, send_buf_len: Option<usize>) {
+        let (old_recv_buf_len, old_send_buf_len) = {
+            let backlog = self.0.inner.backlog.lock();
+            (
+                backlog.socket.recv_capacity(),
+                backlog.socket.send_capacity(),
+            )
+        };
+
+        // The buffers are allocated without holding the lock.
+        let mut new_socket = new_tcp_socket(
+            recv_buf_len.unwrap_or(old_recv_buf_len),
+            send_buf_len.unwrap_or(old_send_buf_len),
+        );
+
+        let old_socket = {
+            let mut backlog = self.0.inner.backlog.lock();
+            // The listening socket is replaced as soon as it receives a SYN packet in `process`,
+            // so it is always in the listening state here.
+            RawTcpOption::inherit(&backlog.socket, &mut new_socket);
+            new_socket.listen(backlog.socket.listen_endpoint()).unwrap();
+            core::mem::replace(&mut backlog.socket, new_socket)
+        };
+        drop(old_socket);
     }
 
     /// Returns whether there is a TCP connection to accept.
@@ -273,8 +304,7 @@ impl<E: Ext> TcpListenerBg<E> {
         }
 
         let new_socket = {
-            let mut socket = new_tcp_socket();
-            RawTcpOption::inherit(&backlog.socket, &mut socket);
+            let mut socket = RawTcpOption::new_inherited(&backlog.socket);
             socket.listen(backlog.socket.listen_endpoint()).unwrap();
             socket
         };

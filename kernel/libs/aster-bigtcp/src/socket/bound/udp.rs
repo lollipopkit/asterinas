@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::{boxed::Box, collections::vec_deque::VecDeque, sync::Arc, vec};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use aster_softirq::BottomHalfDisabled;
 use ostd::sync::SpinLock;
 use smoltcp::{
     iface::Context,
-    socket::udp::{PacketBuffer, RecvError, UdpMetadata},
+    socket::udp::{RecvError, UdpMetadata},
     storage::SliceLike,
     wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpRepr, UdpRepr},
 };
@@ -20,11 +20,7 @@ use crate::{
     errors::udp::SendError,
     ext::Ext,
     iface::{BoundUdpPort, PacketSlice},
-    socket::{
-        RawUdpSocket,
-        event::SocketEvents,
-        unbound::{new_udp_recv_buffer, new_udp_socket},
-    },
+    socket::{RawUdpSocket, event::SocketEvents, unbound::new_udp_socket},
 };
 
 pub type UdpSocket<E> = Socket<UdpSocketInner, E>;
@@ -46,20 +42,39 @@ pub struct UdpSocketInner {
 /// datagrams are kept in their arrival order, and the queue length is limited for the socket as
 /// a whole.
 pub struct UdpRecvQueue {
-    buffer: SpinLock<PacketBuffer<'static>, BottomHalfDisabled>,
+    inner: SpinLock<RecvQueueInner, BottomHalfDisabled>,
+    /// The receive buffer size (`sk_rcvbuf` in Linux).
+    recv_buf: AtomicUsize,
+}
+
+struct RecvQueueInner {
+    datagrams: VecDeque<(UdpMetadata, Box<[u8]>)>,
+    /// The memory charged for the queued datagrams (`sk_rmem_alloc` in Linux).
+    mem_alloc: usize,
 }
 
 impl UdpRecvQueue {
-    /// Creates an empty receive queue.
-    pub fn new() -> Arc<Self> {
+    /// Creates an empty receive queue with the receive buffer size.
+    pub fn new(recv_buf: usize) -> Arc<Self> {
         Arc::new(Self {
-            buffer: SpinLock::new(new_udp_recv_buffer()),
+            inner: SpinLock::new(RecvQueueInner {
+                datagrams: VecDeque::new(),
+                mem_alloc: 0,
+            }),
+            recv_buf: AtomicUsize::new(recv_buf),
         })
+    }
+
+    /// Sets the receive buffer size.
+    ///
+    /// Datagrams that have been queued are kept even if they exceed the new size.
+    pub fn set_recv_buf(&self, recv_buf: usize) {
+        self.recv_buf.store(recv_buf, Ordering::Relaxed);
     }
 
     /// Returns whether there are datagrams to receive.
     pub fn can_recv(&self) -> bool {
-        !self.buffer.lock().is_empty()
+        !self.inner.lock().datagrams.is_empty()
     }
 
     /// Receives a datagram.
@@ -73,15 +88,16 @@ impl UdpRecvQueue {
     where
         CopyFn: FnOnce(&[u8], UdpMetadata) -> R,
     {
-        let mut buffer = self.buffer.lock();
+        let mut inner = self.inner.lock();
 
         let result = match behavior {
             ReceiveBehavior::Recv => {
-                let (meta, data) = buffer.dequeue().map_err(|_| RecvError::Exhausted)?;
-                copy_fn(data, meta)
+                let (meta, data) = inner.datagrams.pop_front().ok_or(RecvError::Exhausted)?;
+                inner.mem_alloc -= datagram_truesize(data.len());
+                copy_fn(&data, meta)
             }
             ReceiveBehavior::Peek => {
-                let (meta, data) = buffer.peek().map_err(|_| RecvError::Exhausted)?;
+                let (meta, data) = inner.datagrams.front().ok_or(RecvError::Exhausted)?;
                 copy_fn(data, *meta)
             }
         };
@@ -89,19 +105,48 @@ impl UdpRecvQueue {
         Ok(result)
     }
 
-    /// Queues a received datagram, which is dropped if the queue is full.
+    /// Queues a received datagram, which is dropped if the receive buffer is full.
+    ///
+    /// Like Linux, a datagram is dropped if the charged memory would exceed the receive buffer
+    /// size, unless the queue is empty.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L1677-L1695>
     fn enqueue(&self, ip_repr: &IpRepr, udp_repr: &UdpRepr, udp_payload: PacketSlice<'_>) {
+        let recv_buf = self.recv_buf.load(Ordering::Relaxed);
+        let truesize = datagram_truesize(udp_payload.len());
+
+        // The limit is checked before the datagram is copied, so that dropped datagrams are never
+        // allocated. The lock is held until the datagram is queued to keep the arrival order.
+        let mut inner = self.inner.lock();
+        if inner.mem_alloc + truesize > recv_buf
+            && (recv_buf > (i32::MAX >> 1) as usize || inner.mem_alloc != 0)
+        {
+            return;
+        }
+
         let meta = UdpMetadata {
             endpoint: IpEndpoint::new(ip_repr.src_addr(), udp_repr.src_port),
             local_address: Some(ip_repr.dst_addr()),
             meta: Default::default(),
         };
+        let mut data = vec![0u8; udp_payload.len()].into_boxed_slice();
+        udp_payload.copy_to_slice(&mut data);
 
-        let mut buffer = self.buffer.lock();
-        if let Ok(data) = buffer.enqueue(udp_payload.len(), meta) {
-            udp_payload.copy_to_slice(data);
-        }
+        inner.mem_alloc += truesize;
+        inner.datagrams.push_back((meta, data));
     }
+}
+
+/// Returns the memory charged to the receive buffer for a datagram.
+///
+/// This approximates `skb->truesize` in Linux with the payload length and the overhead of
+/// `SKB_TRUESIZE`, so that small datagrams consume the buffer like in Linux.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/skbuff.h#L273-L275>
+fn datagram_truesize(len: usize) -> usize {
+    const SKB_TRUESIZE_OVERHEAD: usize = 256 + 320;
+
+    len + SKB_TRUESIZE_OVERHEAD
 }
 
 /// The association that a UDP socket establishes by connecting.

@@ -1,3 +1,6 @@
+// Supported message send flags
+send_flags = MSG_DONTWAIT | MSG_CONFIRM | MSG_NOSIGNAL;
+
 struct sockaddr = {
     sa_family = AF_INET | AF_UNIX | AF_NETLINK | AF_VSOCK,
     ..
@@ -17,7 +20,7 @@ struct mmsg_hdr = {
 // Send message on a socket
 sendto(
     sockfd, buf, len,
-    flags = 0,
+    flags = <send_flags>,
     dest_addr = <sockaddr>,
     addrlen
 );
@@ -26,7 +29,7 @@ sendto(
 sendmsg(
     sockfd,
     msg = <msg_hdr>,
-    flags = 0
+    flags = <send_flags>
 );
 
 
@@ -35,5 +38,5 @@ sendmmsg(
     sockfd,
     mmsgs = [ <mmsg_hdr> ],
     mmsg_count,
-    flags = 0
+    flags = <send_flags>
 );

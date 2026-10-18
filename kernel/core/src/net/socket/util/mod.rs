@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+pub(crate) mod buffer_size;
 pub(super) mod datagram_common;
 pub(super) mod ioctl;
 mod linger_option;
