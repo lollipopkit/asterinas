@@ -358,3 +358,65 @@ FN_TEST(untraced_thread_exec)
 	TEST_ERRNO(waitpid(-1, &status, __WALL | WNOHANG), ECHILD);
 }
 END_TEST()
+
+static void tracee_clone_untraced_ptrace(void)
+{
+	pid_t child = CHECK(clone(child_exit_fn, child_stack + STACK_SIZE,
+				  CLONE_UNTRACED | CLONE_PTRACE | SIGCHLD,
+				  NULL));
+	wait_child_exited(child, 0);
+	_exit(0);
+}
+
+FN_TEST(clone_untraced_ptrace)
+{
+	SKIP_TEST_IF(read_yama_scope() == YAMA_SCOPE_NO_ATTACH);
+
+	pid_t pid = TEST_SUCC(
+		start_tracee(tracee_clone_untraced_ptrace, PTRACE_O_TRACEFORK));
+
+	// `CLONE_UNTRACED` suppresses the fork event, but `CLONE_PTRACE` still traces the child.
+	int status;
+	pid_t child = TEST_RES(waitpid(-1, &status, __WALL),
+			       _ret != pid && WIFSTOPPED(status) &&
+				       (status >> 8) == SIGSTOP);
+	TEST_SUCC(ptrace(PTRACE_CONT, child, 0, 0));
+	TEST_RES(waitpid(child, &status, __WALL), _ret == child &&
+							  WIFEXITED(status) &&
+							  WEXITSTATUS(status) ==
+								  0);
+
+	TEST_RES(waitpid(pid, &status, 0), _ret == pid && WIFSTOPPED(status) &&
+						   WSTOPSIG(status) == SIGCHLD);
+	TEST_SUCC(ptrace(PTRACE_CONT, pid, 0, 0));
+	TEST_RES(waitpid(pid, &status, 0), _ret == pid && WIFEXITED(status) &&
+						   WEXITSTATUS(status) == 0);
+}
+END_TEST()
+
+static void tracee_exit(void)
+{
+	_exit(3);
+}
+
+FN_TEST(waitid_exited_tracee_without_wexited)
+{
+	SKIP_TEST_IF(read_yama_scope() == YAMA_SCOPE_NO_ATTACH);
+
+	pid_t pid = TEST_SUCC(start_tracee(tracee_exit, 0));
+
+	siginfo_t info;
+	TEST_RES(waitid(P_PID, pid, &info, WEXITED | WNOWAIT),
+		 info.si_pid == pid && info.si_code == CLD_EXITED);
+
+	// The exited tracee is neither reported nor reaped without `WEXITED`.
+	TEST_ERRNO(waitid(P_PID, pid, &info, WSTOPPED | WNOHANG), ECHILD);
+	TEST_ERRNO(waitid(P_PID, pid, &info, WSTOPPED), ECHILD);
+	TEST_ERRNO(waitid(P_PID, pid, &info, WCONTINUED | WNOHANG), ECHILD);
+
+	TEST_RES(waitid(P_PID, pid, &info, WEXITED),
+		 info.si_pid == pid && info.si_code == CLD_EXITED &&
+			 info.si_status == 3);
+	TEST_ERRNO(waitid(P_PID, pid, &info, WEXITED | WNOHANG), ECHILD);
+}
+END_TEST()

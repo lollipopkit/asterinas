@@ -401,10 +401,11 @@ impl PosixThread {
         {
             tracees.remove(&self.tid());
         }
-        // The exit notification is deferred only for a zombie process,
-        // so there is no notification to cascade for a released thread.
+        // The exit notification is deferred only by `send_child_death_signal` when the whole
+        // process becomes a zombie, which is final. A thread released while its process is
+        // still alive (e.g., in `execve`) therefore never has a deferred notification.
         let is_exit_notify_deferred = self.detach_tracer();
-        debug_assert!(!is_exit_notify_deferred);
+        assert!(!is_exit_notify_deferred);
         drop(tracees);
 
         tracer.process().children_wait_queue().wake_all();
@@ -700,6 +701,8 @@ impl TraceeStatus {
         let tracer = state.tracer()?;
         let options = state.options;
 
+        // `CLONE_UNTRACED` only suppresses the event. `CLONE_PTRACE` still traces the child.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2495>
         let flags = clone_args.flags;
         let event = if flags.contains(CloneFlags::CLONE_UNTRACED) {
             None

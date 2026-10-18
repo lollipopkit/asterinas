@@ -206,9 +206,6 @@ fn try_wait_tracees(
             continue;
         }
 
-        // We have found at least one tracee matching `child_filter`.
-        fallback_result = WaitResult::MatchedButUnready;
-
         // Exit/death by signal is reported first to the tracer, then,
         // when the tracer consumes the waitpid(2) result, to the real
         // parent (to the real parent only when the whole multithreaded
@@ -230,6 +227,19 @@ fn try_wait_tracees(
                 //
                 // Also matches Linux behavior:
                 // <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/exit.c#L1486-L1487>.
+                //
+                // The ptrace-stop state of an exited tracee cannot change, so only an exit
+                // (or a continuation, as Linux accepts) remains to be waited for.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1536-L1543>
+                if wait_options.intersects(WaitOptions::WEXITED | WaitOptions::WCONTINUED) {
+                    fallback_result = WaitResult::MatchedButUnready;
+                }
+                continue;
+            }
+
+            // Without `WEXITED`, a reapable exited tracee is skipped as if it did not match.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1192-L1193>
+            if !wait_options.contains(WaitOptions::WEXITED) {
                 continue;
             }
 
@@ -248,6 +258,9 @@ fn try_wait_tracees(
             }
             return WaitResult::Found(WaitStatus::TraceeExit(thread, exit_code));
         }
+
+        // We have found at least one live tracee matching `child_filter`.
+        fallback_result = WaitResult::MatchedButUnready;
 
         // Waiting for ptrace-stops does not require `WaitOptions::WSTOPPED`.
         if let Some(sig_num) = tracee.wait_ptrace_stopped(wait_options) {
@@ -314,14 +327,22 @@ fn try_wait_children(
             continue;
         }
 
-        // We have found at least one child matching `child_filter`.
-        fallback_result = WaitResult::MatchedButUnready;
-
-        if child.main_thread().as_posix_thread().unwrap().is_traced() {
+        if let Some(tracer) = child.main_thread().as_posix_thread().unwrap().tracer() {
+            // A child traced by the current thread is handled as a tracee.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1494-L1507>
+            if !core::ptr::eq(tracer.as_posix_thread().unwrap(), ctx.posix_thread) {
+                fallback_result = WaitResult::MatchedButUnready;
+            }
             continue;
         }
 
         if child.status().is_zombie() {
+            // Without `WEXITED`, a zombie child is skipped as if it did not match.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1192-L1193>
+            if !wait_options.contains(WaitOptions::WEXITED) {
+                continue;
+            }
+
             let child = child.clone();
             if !wait_options.contains(WaitOptions::WNOWAIT) {
                 reap_zombie_child(
@@ -332,6 +353,9 @@ fn try_wait_children(
             }
             return WaitResult::Found(WaitStatus::Zombie(child));
         }
+
+        // We have found at least one live child matching `child_filter`.
+        fallback_result = WaitResult::MatchedButUnready;
 
         if !wait_options.intersects(WaitOptions::WSTOPPED | WaitOptions::WCONTINUED) {
             continue;

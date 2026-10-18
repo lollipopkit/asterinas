@@ -336,3 +336,32 @@ FN_SETUP(kill_stopped)
 			   WTERMSIG(status) == SIGKILL);
 }
 END_SETUP()
+
+FN_TEST(wait4_invalid_options)
+{
+	TEST_ERRNO(wait4(-1, &status, WEXITED, NULL), EINVAL);
+	TEST_ERRNO(wait4(-1, &status, WNOWAIT, NULL), EINVAL);
+}
+END_TEST()
+
+FN_TEST(waitid_without_wexited)
+{
+	siginfo_t info;
+	pid_t child = TEST_SUCC(fork());
+	if (child == 0) {
+		_exit(3);
+	}
+	TEST_RES(waitid(P_PID, child, &info, WEXITED | WNOWAIT),
+		 info.si_pid == child && info.si_code == CLD_EXITED);
+
+	// The zombie child is neither reported nor reaped without `WEXITED`.
+	TEST_ERRNO(waitid(P_PID, child, &info, WSTOPPED | WNOHANG), ECHILD);
+	TEST_ERRNO(waitid(P_PID, child, &info, WSTOPPED), ECHILD);
+	TEST_ERRNO(waitid(P_PID, child, &info, WCONTINUED | WNOHANG), ECHILD);
+
+	TEST_RES(waitid(P_PID, child, &info, WEXITED),
+		 info.si_pid == child && info.si_code == CLD_EXITED &&
+			 info.si_status == 3);
+	TEST_ERRNO(waitid(P_PID, child, &info, WEXITED | WNOHANG), ECHILD);
+}
+END_TEST()

@@ -15,23 +15,26 @@ pub(super) fn sys_wait4(
     rusage_addr: Vaddr,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1866-L1868>
     let wait_options = WaitOptions::from_bits(wait_options)
-        .ok_or_else(|| Error::with_message(Errno::EINVAL, "unknown wait option"))?;
+        .filter(|options| {
+            (WaitOptions::WNOHANG
+                | WaitOptions::WSTOPPED
+                | WaitOptions::WCONTINUED
+                | WaitOptions::WNOTHREAD
+                | WaitOptions::WCLONE
+                | WaitOptions::WALL)
+                .contains(*options)
+        })
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid wait options"))?
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1889>
+        | WaitOptions::WEXITED;
     debug!(
         "pid = {}, status_ptr = {}, wait_options: {:?}",
         wait_pid as i32, status_ptr, wait_options
     );
     debug!("wait4 current pid = {}", ctx.process.pid());
     let process_filter = ProcessFilter::from_id(wait_pid as _)?;
-
-    if wait_options.intersects(WaitOptions::WSTOPPED | WaitOptions::WCONTINUED)
-        && wait_options.contains(WaitOptions::WNOWAIT)
-    {
-        return_errno_with_message!(
-            Errno::EINVAL,
-            "WNOWAIT cannot be used toghther with WSTOPPED or WCONTINUED"
-        );
-    }
 
     let wait_status =
         do_wait(process_filter, wait_options, ctx).map_err(|err| match err.error() {
