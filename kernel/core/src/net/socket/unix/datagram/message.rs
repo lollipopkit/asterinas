@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use core::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 
-use ostd::sync::WaitQueue;
+use ostd::sync::{WaitQueue, Waiter};
 use spin::Once;
 
 use crate::{
@@ -15,8 +15,9 @@ use crate::{
             UnixSocketAddr,
             addr::{UnixSocketAddrBound, UnixSocketAddrKey},
             ctrl_msg::AuxiliaryData,
+            datagram::MAX_DGRAM_QLEN,
         },
-        util::{ControlMessage, RecvFlags, RecvOutput},
+        util::{ControlMessage, RecvFlags, RecvOutput, buffer_size::SKB_TRUESIZE_OVERHEAD},
     },
     prelude::*,
     process::signal::Pollee,
@@ -28,12 +29,20 @@ pub(super) struct MessageQueue {
     inner: Mutex<Option<Inner>>,
     is_pass_cred: AtomicBool,
     pollee: Pollee,
+    /// The send buffer size of the socket (`sk_sndbuf` in Linux).
+    send_buf: AtomicUsize,
+    /// The memory charged for the messages sent by the socket but not received yet
+    /// (`sk_wmem_alloc` in Linux).
+    wmem_alloc: AtomicUsize,
+    /// The wait queue for senders, which are woken up when a message is received from this
+    /// queue, or when the messages sent by this socket are received.
     send_wait_queue: WaitQueue,
+    /// The maximum length of the receive queue (`sk_max_ack_backlog` in Linux).
+    max_qlen: usize,
 }
 
 struct Inner {
     messages: VecDeque<Message>,
-    total_length: usize,
     is_shutdown: bool,
     /// The queue of the peer that the socket is connected to.
     peer: Option<Weak<MessageQueue>>,
@@ -46,12 +55,48 @@ impl Inner {
             .as_ref()
             .is_none_or(|peer| core::ptr::eq(peer.as_ptr(), Arc::as_ptr(source)))
     }
+
+    /// Returns whether the queue is too long for messages from the socket that owns `source`.
+    ///
+    /// Like Linux, the queue length is limited unless the socket sends to itself or to its peer
+    /// that is connected to it.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2250-L2256>
+    fn is_full_for(&self, this: &MessageQueue, source: &Arc<MessageQueue>) -> bool {
+        let is_peer = self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| core::ptr::eq(peer.as_ptr(), Arc::as_ptr(source)));
+        !core::ptr::eq(this, Arc::as_ptr(source)) && !is_peer && self.messages.len() > this.max_qlen
+    }
 }
 
 struct Message {
     bytes: Vec<u8>,
     aux: AuxiliaryData,
     src: UnixSocketAddr,
+    /// The queue of the sending socket, whose send buffer is charged for the message.
+    sender: Arc<MessageQueue>,
+}
+
+impl Message {
+    /// Returns the memory charged to the send buffer for the message.
+    ///
+    /// This approximates `skb->truesize` in Linux.
+    fn truesize(&self) -> usize {
+        self.bytes.len() + SKB_TRUESIZE_OVERHEAD
+    }
+}
+
+impl Drop for Message {
+    fn drop(&mut self) {
+        // Like `sock_wfree` in Linux, the send buffer is released when the message is received
+        // or discarded.
+        self.sender
+            .wmem_alloc
+            .fetch_sub(self.truesize(), Ordering::Relaxed);
+        self.sender.on_write_space();
+    }
 }
 
 impl MessageQueue {
@@ -68,6 +113,14 @@ impl MessageQueue {
         aux_data: &mut AuxiliaryData,
         source: &MessageReceiver,
     ) -> Result<usize> {
+        // Like Linux, the message is not sent until the send buffer is not full. Note that the
+        // message can make the used memory exceed the send buffer size.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/sock.c#L3007>
+        let sender = &source.queue;
+        if sender.wmem_alloc.load(Ordering::Relaxed) >= sender.send_buf.load(Ordering::Relaxed) {
+            return_errno_with_message!(Errno::EAGAIN, "the send buffer is full");
+        }
+
         let mut inner = self.inner.lock();
         let Some(inner) = inner.as_mut() else {
             return_errno_with_message!(Errno::ECONNREFUSED, "the target socket is closed");
@@ -86,16 +139,11 @@ impl MessageQueue {
             );
         }
 
+        if inner.is_full_for(self, sender) {
+            return_errno_with_message!(Errno::EAGAIN, "the receive queue is full");
+        }
+
         let len = reader.sum_lens();
-        if len > UNIX_DATAGRAM_DEFAULT_BUF_SIZE {
-            return_errno_with_message!(Errno::EMSGSIZE, "the message is too large");
-        }
-        if UNIX_DATAGRAM_DEFAULT_BUF_SIZE - inner.total_length < len {
-            return_errno_with_message!(
-                Errno::EAGAIN,
-                "the receive buffer does not have enough space"
-            );
-        }
 
         let msg = {
             let mut bytes = vec![0; len];
@@ -110,10 +158,17 @@ impl MessageQueue {
 
             let src = source.queue.addr();
 
-            Message { bytes, aux, src }
+            Message {
+                bytes,
+                aux,
+                src,
+                sender: sender.clone(),
+            }
         };
 
-        inner.total_length += msg.bytes.len();
+        sender
+            .wmem_alloc
+            .fetch_add(msg.truesize(), Ordering::Relaxed);
         inner.messages.push_back(msg);
 
         self.pollee.notify(IoEvents::IN);
@@ -135,16 +190,30 @@ impl MessageQueue {
             .is_some_and(|inner| inner.accepts_from(source))
     }
 
-    /// Blocks until the buffer is free and the `try_send` succeeds, or until interrupted.
-    pub(super) fn block_send<F, R>(&self, timeout: Option<Duration>, mut try_send: F) -> Result<R>
+    /// Blocks until the buffers are free and the `try_send` succeeds, or until interrupted.
+    ///
+    /// The send buffer of `sender` and the receive queue of this socket are waited for.
+    pub(super) fn block_send<F, R>(
+        &self,
+        sender: &MessageQueue,
+        timeout: Option<Duration>,
+        mut try_send: F,
+    ) -> Result<R>
     where
         F: FnMut() -> Result<R>,
     {
-        self.send_wait_queue
+        let (waiter, _) = Waiter::new_pair();
+        waiter
             .pause_until_or_timeout(
-                || match try_send() {
-                    Err(err) if err.error() == Errno::EAGAIN => None,
-                    result => Some(result),
+                || {
+                    self.send_wait_queue.enqueue(waiter.waker());
+                    if !core::ptr::eq(self, sender) {
+                        sender.send_wait_queue.enqueue(waiter.waker());
+                    }
+                    match try_send() {
+                        Err(err) if err.error() == Errno::EAGAIN => None,
+                        result => Some(result),
+                    }
                 },
                 timeout.as_ref(),
             )
@@ -152,6 +221,38 @@ impl MessageQueue {
                 Errno::ETIME => Error::with_message(Errno::EAGAIN, "the socket timeout expired"),
                 _ => err,
             })?
+    }
+
+    /// Returns the send buffer size.
+    pub(super) fn send_buf(&self) -> usize {
+        self.send_buf.load(Ordering::Relaxed)
+    }
+
+    /// Returns whether the socket is writable, i.e., at most a quarter of the send buffer is
+    /// used.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L591-L595>
+    pub(super) fn is_writable(&self) -> bool {
+        self.wmem_alloc.load(Ordering::Relaxed).saturating_mul(4)
+            <= self.send_buf.load(Ordering::Relaxed)
+    }
+
+    /// Sets the send buffer size.
+    pub(super) fn set_send_buf(&self, send_buf: usize) {
+        self.send_buf.store(send_buf, Ordering::Relaxed);
+        // Like Linux, wake up the senders since the buffer size may be increased.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/sock.c#L1352-L1353>
+        self.on_write_space();
+    }
+
+    /// Wakes up the senders and notifies `IoEvents::OUT` if the socket is writable.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L597-L610>
+    fn on_write_space(&self) {
+        if self.is_writable() {
+            self.send_wait_queue.wake_all();
+            self.pollee.notify(IoEvents::OUT);
+        }
     }
 }
 
@@ -166,10 +267,9 @@ pub(super) struct MessageReceiver {
 }
 
 impl MessageReceiver {
-    pub(super) fn new() -> MessageReceiver {
+    pub(super) fn new(send_buf: usize) -> MessageReceiver {
         let inner = Inner {
             messages: VecDeque::new(),
-            total_length: 0,
             is_shutdown: false,
             peer: None,
         };
@@ -179,7 +279,13 @@ impl MessageReceiver {
             inner: Mutex::new(Some(inner)),
             is_pass_cred: AtomicBool::new(false),
             pollee: Pollee::new(),
+            send_buf: AtomicUsize::new(send_buf),
+            wmem_alloc: AtomicUsize::new(0),
             send_wait_queue: WaitQueue::new(),
+            // Like Linux, the value is read when the socket is created, and a negative value
+            // is converted to a large unsigned value.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L1111>
+            max_qlen: MAX_DGRAM_QLEN.load(Ordering::Relaxed) as u32 as usize,
         };
 
         Self {
@@ -232,7 +338,6 @@ impl MessageReceiver {
         let behavior = flags.receive_behavior();
         let ctrl_msgs = if behavior.will_consume_data() {
             let mut message = inner.messages.pop_front().unwrap();
-            inner.total_length -= message.bytes.len();
 
             self.queue.pollee.invalidate();
             // A writer may still fail if the free space is not enough.
@@ -271,7 +376,6 @@ impl MessageReceiver {
         }
 
         inner.messages.clear();
-        inner.total_length = 0;
 
         self.queue.pollee.invalidate();
         self.queue.send_wait_queue.wake_all();
@@ -357,5 +461,3 @@ impl QueueTable {
         debug_assert!(old_queue.is_some());
     }
 }
-
-pub(in crate::net) const UNIX_DATAGRAM_DEFAULT_BUF_SIZE: usize = 65536;

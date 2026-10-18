@@ -27,6 +27,7 @@ sleep 0.2
 ./send_buf_full
 ./sendmmsg
 ./sigpipe
+./sock_buf_size
 ./socketpair
 ./socket_ioctl
 ./sockoption

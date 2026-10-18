@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use aster_rights::ReadOp;
 
 use super::{
-    connected::Connected,
+    connected::{Connected, EndConfig},
     listener::Listener,
     socket::{SHUT_READ_EVENTS, SHUT_WRITE_EVENTS},
 };
@@ -17,7 +17,7 @@ use crate::{
             addr::{UnixSocketAddr, UnixSocketAddrBound},
             cred::SocketCred,
         },
-        util::SockShutdownCmd,
+        util::{SockShutdownCmd, buffer_size::WMEM_DEFAULT},
     },
     prelude::*,
     process::signal::Pollee,
@@ -54,6 +54,7 @@ impl Init {
         peer_addr: UnixSocketAddrBound,
         pollee: Pollee,
         peer_cred: SocketCred,
+        send_buf: usize,
     ) -> (Connected, Connected) {
         let Init {
             addr,
@@ -65,12 +66,20 @@ impl Init {
 
         let cred = SocketCred::<ReadOp>::new_current();
         let (this_conn, peer_conn) = Connected::new_pair(
-            addr,
-            Some(peer_addr),
-            EndpointState::new(pollee, is_read_shutdown.into_inner()),
-            EndpointState::new(Pollee::new(), is_write_shutdown.into_inner()),
-            cred,
-            peer_cred,
+            EndConfig {
+                addr,
+                state: EndpointState::new(pollee, is_read_shutdown.into_inner()),
+                cred,
+                send_buf,
+            },
+            EndConfig {
+                addr: Some(peer_addr),
+                state: EndpointState::new(Pollee::new(), is_write_shutdown.into_inner()),
+                cred: peer_cred,
+                // Like Linux, the accepted socket has the default buffer sizes.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L1661>
+                send_buf: WMEM_DEFAULT.get() as usize,
+            },
         );
 
         (this_conn, peer_conn)

@@ -2,7 +2,7 @@
 
 use core::{
     num::Wrapping,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use spin::Once;
@@ -31,54 +31,60 @@ pub(super) struct Connected {
     inner: Endpoint<Inner>,
 }
 
+/// The configuration of one end of a pair of connected sockets.
+pub(super) struct EndConfig {
+    pub(super) addr: Option<UnixSocketAddrBound>,
+    pub(super) state: EndpointState,
+    pub(super) cred: SocketCred,
+    /// The send buffer size.
+    pub(super) send_buf: usize,
+}
+
 impl Connected {
-    pub(super) fn new_pair(
-        addr: Option<UnixSocketAddrBound>,
-        peer_addr: Option<UnixSocketAddrBound>,
-        state: EndpointState,
-        peer_state: EndpointState,
-        cred: SocketCred,
-        peer_cred: SocketCred,
-    ) -> (Connected, Connected) {
-        let (this_writer, peer_reader) = RingBuffer::new(UNIX_STREAM_DEFAULT_BUF_SIZE).split();
-        let (peer_writer, this_reader) = RingBuffer::new(UNIX_STREAM_DEFAULT_BUF_SIZE).split();
+    pub(super) fn new_pair(this: EndConfig, peer: EndConfig) -> (Connected, Connected) {
+        let (this_writer, peer_reader) =
+            RingBuffer::new(initial_buf_capacity(this.send_buf)).split();
+        let (peer_writer, this_reader) =
+            RingBuffer::new(initial_buf_capacity(peer.send_buf)).split();
 
         let this_inner = Inner {
             addr: Once::new(),
-            state,
+            state: this.state,
             reader: Mutex::new(this_reader),
             writer: Mutex::new(this_writer),
+            send_buf: AtomicUsize::new(this.send_buf),
             all_aux: Mutex::new(VecDeque::new()),
             has_aux: AtomicBool::new(false),
             is_pass_cred: AtomicBool::new(false),
-            cred,
+            cred: this.cred,
         };
         let peer_inner = Inner {
             addr: Once::new(),
-            state: peer_state,
+            state: peer.state,
             reader: Mutex::new(peer_reader),
             writer: Mutex::new(peer_writer),
+            send_buf: AtomicUsize::new(peer.send_buf),
             all_aux: Mutex::new(VecDeque::new()),
             has_aux: AtomicBool::new(false),
             is_pass_cred: AtomicBool::new(false),
-            cred: peer_cred,
+            cred: peer.cred,
         };
 
-        if let Some(addr) = addr.as_ref() {
+        if let Some(addr) = this.addr.as_ref() {
             this_inner.addr.call_once(|| addr.clone().into());
         }
-        if let Some(peer_addr) = peer_addr.as_ref() {
+        if let Some(peer_addr) = peer.addr.as_ref() {
             peer_inner.addr.call_once(|| peer_addr.clone().into());
         }
 
         let (this_inner, peer_inner) = Endpoint::new_pair(this_inner, peer_inner);
 
         let this = Connected {
-            addr,
+            addr: this.addr,
             inner: this_inner,
         };
         let peer = Connected {
-            addr: peer_addr,
+            addr: peer.addr,
             inner: peer_inner,
         };
 
@@ -297,20 +303,27 @@ impl Connected {
             }
         }
 
-        if is_seqpacket && reader.sum_lens() >= UNIX_STREAM_DEFAULT_BUF_SIZE {
+        let this_end = self.inner.this_end();
+        let send_limit = this_end.send_limit();
+
+        // Like Linux, a message must fit in the send buffer.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2123-L2126>
+        if is_seqpacket && reader.sum_lens() > send_limit.saturating_sub(32) {
             return_errno_with_message!(Errno::EMSGSIZE, "the message is too large");
         }
 
-        let this_end = self.inner.this_end();
+        self.reserve(reader.sum_lens(), send_limit);
+
         let need_pass_cred = this_end.is_pass_cred.load(Ordering::Relaxed)
             || self.inner.peer_end().is_pass_cred.load(Ordering::Relaxed);
 
         // Fast path: There are no auxiliary data to transmit.
         if aux_data.is_empty() && !is_seqpacket && !need_pass_cred {
             let mut writer = this_end.writer.lock();
-            let write_len = self
-                .inner
-                .write_with(move || writer.write_fallible(reader))?;
+            let write_len = self.inner.write_with(move || {
+                let max_len = writable_len(&writer, send_limit);
+                writer.write_fallible_with_max_len(reader, max_len)
+            })?;
             self.inner.notify_write();
             return Ok(write_len);
         }
@@ -326,10 +339,11 @@ impl Connected {
             let mut writer = this_end.writer.lock();
             let write_start = writer.tail();
             let write_res = self.inner.write_with(move || {
-                if is_seqpacket && writer.free_len() < reader.sum_lens() {
+                let max_len = writable_len(&writer, send_limit);
+                if is_seqpacket && max_len < reader.sum_lens() {
                     return Ok(0);
                 }
-                writer.write_fallible(reader)
+                writer.write_fallible_with_max_len(reader, max_len)
             });
             (write_start, write_res)
         } else {
@@ -357,6 +371,43 @@ impl Connected {
         self.inner.notify_write();
 
         Ok(write_len)
+    }
+
+    /// Grows the ring buffer if it is too small for `len` more bytes and the send buffer size
+    /// allows a larger one.
+    ///
+    /// The ring buffer is allocated on demand, so that a connection does not take the memory of
+    /// the whole send buffer until a writer fills the buffer.
+    fn reserve(&self, len: usize, send_limit: usize) {
+        let this_end = self.inner.this_end();
+
+        let (capacity, used_len) = {
+            let writer = this_end.writer.lock();
+            (writer.capacity(), writer.len())
+        };
+        if capacity >= send_limit || used_len.saturating_add(len) <= capacity {
+            return;
+        }
+
+        // Lock order: `reader` of the peer -> `writer` of this end
+        let mut reader = self.inner.peer_end().reader.lock();
+        let mut writer = this_end.writer.lock();
+        RingBuffer::grow(&mut writer, &mut reader, send_limit.next_power_of_two());
+    }
+
+    /// Sets the send buffer size.
+    pub(super) fn set_send_buf(&self, send_buf: usize) {
+        let this_end = self.inner.this_end();
+        this_end.send_buf.store(send_buf, Ordering::Relaxed);
+
+        // Like Linux, wake up the writers since the buffer size may be increased.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/core/sock.c#L1352-L1353>
+        this_end.state.cloned_pollee().notify(IoEvents::OUT);
+    }
+
+    /// Returns the send buffer size.
+    pub(super) fn send_buf(&self) -> usize {
+        self.inner.this_end().send_buf.load(Ordering::Relaxed)
     }
 
     pub(super) fn shutdown(&self, cmd: SockShutdownCmd) {
@@ -396,7 +447,9 @@ impl Connected {
             events |= IoEvents::IN;
         }
 
-        if !this_end.writer.lock().is_full() {
+        // Like Linux, the socket is writable if at most a quarter of the send buffer is used.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L591-L595>
+        if this_end.writer.lock().len().saturating_mul(4) <= this_end.send_limit() {
             events |= IoEvents::OUT;
         }
 
@@ -425,10 +478,25 @@ struct Inner {
     // Lock order: `reader` -> `all_aux` & `all_aux` -> `writer`
     reader: Mutex<RbConsumer<u8>>,
     writer: Mutex<RbProducer<u8>>,
+    /// The send buffer size (`sk_sndbuf` in Linux), which limits the bytes written by this end
+    /// but not read by the peer yet.
+    send_buf: AtomicUsize,
     all_aux: Mutex<VecDeque<RangedAuxiliaryData>>,
     has_aux: AtomicBool,
     is_pass_cred: AtomicBool,
     cred: SocketCred,
+}
+
+impl Inner {
+    /// Returns the maximum number of bytes written by this end but not read by the peer.
+    ///
+    /// The send buffer size is limited by [`UNIX_STREAM_MAX_BUF_SIZE`] since the ring buffer is
+    /// allocated as a whole.
+    fn send_limit(&self) -> usize {
+        self.send_buf
+            .load(Ordering::Relaxed)
+            .min(UNIX_STREAM_MAX_BUF_SIZE)
+    }
 }
 
 impl AsRef<EndpointState> for Inner {
@@ -443,4 +511,25 @@ struct RangedAuxiliaryData {
     end: Wrapping<usize>,   // exclusive
 }
 
-pub(in crate::net) const UNIX_STREAM_DEFAULT_BUF_SIZE: usize = 65536;
+/// Returns the number of bytes that can be written to `writer` within the send buffer.
+fn writable_len(writer: &RbProducer<u8>, send_limit: usize) -> usize {
+    send_limit
+        .saturating_sub(writer.len())
+        .min(writer.free_len())
+}
+
+/// Returns the initial capacity of a ring buffer.
+fn initial_buf_capacity(send_buf: usize) -> usize {
+    send_buf
+        .clamp(1, UNIX_STREAM_INIT_BUF_SIZE)
+        .next_power_of_two()
+}
+
+/// The maximum initial capacity of a ring buffer. It grows up to the send buffer size on demand.
+const UNIX_STREAM_INIT_BUF_SIZE: usize = 65536;
+
+/// The maximum capacity of a ring buffer.
+///
+/// This is twice the default `net.core.wmem_max` in Linux, which is the maximum send buffer size
+/// that can be set without `CAP_NET_ADMIN`.
+const UNIX_STREAM_MAX_BUF_SIZE: usize = 8 << 20;

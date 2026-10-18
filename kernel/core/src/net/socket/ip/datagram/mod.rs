@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use aster_bigtcp::wire::IpEndpoint;
+use aster_bigtcp::{socket::UdpRecvQueue, wire::IpEndpoint};
 use bound::BoundDatagram;
 use unbound::{BindOptions, UnboundDatagram};
 
@@ -41,6 +41,7 @@ pub(crate) struct DatagramSocket {
     // Lock order: `inner` first, `options` second
     inner: RwMutex<Inner<UnboundDatagram, BoundDatagram>>,
     options: RwLock<OptionSet>,
+    recv_queue: Arc<UdpRecvQueue>,
     timeouts: SocketTimeouts,
 
     pollee: Pollee,
@@ -64,10 +65,13 @@ impl OptionSet {
 
 impl DatagramSocket {
     pub(crate) fn new(is_nonblocking: bool) -> Arc<Self> {
-        let unbound_datagram = UnboundDatagram::new();
+        let options = OptionSet::new();
+        let recv_queue = UdpRecvQueue::new(options.socket.recv_buf() as usize);
+        let unbound_datagram = UnboundDatagram::new(recv_queue.clone());
         Arc::new(Self {
             inner: RwMutex::new(Inner::Unbound(unbound_datagram)),
-            options: RwLock::new(OptionSet::new()),
+            options: RwLock::new(options),
+            recv_queue,
             timeouts: SocketTimeouts::new(),
             pollee: Pollee::new(),
             common: new_socket_common(is_nonblocking),
@@ -309,7 +313,7 @@ impl Socket for DatagramSocket {
         // Deal with socket-level options
         let need_iface_poll = match options
             .socket
-            .set_option(option, &(&*inner, &self.timeouts))
+            .set_option(option, &(&*inner, &self.timeouts, self.recv_queue.as_ref()))
         {
             Err(err) if err.error() == Errno::ENOPROTOOPT => {
                 // Deal with IP-level options
@@ -355,13 +359,23 @@ impl GetSocketLevelOption for (&Inner<UnboundDatagram, BoundDatagram>, &SocketTi
     }
 }
 
-impl SetSocketLevelOption for (&Inner<UnboundDatagram, BoundDatagram>, &SocketTimeouts) {
+impl SetSocketLevelOption
+    for (
+        &Inner<UnboundDatagram, BoundDatagram>,
+        &SocketTimeouts,
+        &UdpRecvQueue,
+    )
+{
     fn set_reuse_addr(&self, reuse_addr: bool) {
         let Inner::Bound(bound) = self.0 else {
             return;
         };
 
         bound.set_can_reuse(reuse_addr);
+    }
+
+    fn set_recv_buf(&self, recv_buf: u32) {
+        self.2.set_recv_buf(recv_buf as usize);
     }
 
     fn socket_timeouts(&self) -> Option<&SocketTimeouts> {

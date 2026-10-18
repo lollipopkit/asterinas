@@ -71,7 +71,7 @@ impl Listener {
         let connected = self.backlog.pop_incoming()?;
 
         let peer_addr = connected.peer_addr().into();
-        let options = OptionSet::new_accepted(connected.is_pass_cred());
+        let options = OptionSet::new_accepted(connected.is_pass_cred(), connected.send_buf());
 
         let socket =
             UnixStreamSocket::new_connected(connected, options, is_nonblocking, socket_type);
@@ -315,6 +315,7 @@ impl Backlog {
             self.addr.clone(),
             pollee,
             self.listener_cred.dup().restrict(),
+            options.send_buf(),
         );
         options.apply_to_connected(&client_conn);
         if self.is_pass_cred.load(Ordering::Relaxed) {

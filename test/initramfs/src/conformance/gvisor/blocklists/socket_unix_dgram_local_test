@@ -1,6 +1,3 @@
 # TODO: Support `MSG_DONTWAIT`
 DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/*
 DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/*
-
-# TODO: Implement `SO_SNDBUF` behavior
-DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/*

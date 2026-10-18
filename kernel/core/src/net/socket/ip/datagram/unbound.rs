@@ -27,17 +27,17 @@ pub(super) struct UnboundDatagram {
     /// The local address specified by `bind`, which is kept after `connect(AF_UNSPEC)` releases
     /// the port.
     local_addr: Option<IpAddress>,
-    /// The receive queue, which is created when the socket is bound for the first time.
+    /// The receive queue of the socket.
     ///
     /// Like Linux, the received datagrams are kept after `connect(AF_UNSPEC)` releases the port.
-    recv_queue: Option<Arc<UdpRecvQueue>>,
+    recv_queue: Arc<UdpRecvQueue>,
 }
 
 impl UnboundDatagram {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(recv_queue: Arc<UdpRecvQueue>) -> Self {
         Self {
             local_addr: None,
-            recv_queue: None,
+            recv_queue,
         }
     }
 
@@ -47,14 +47,8 @@ impl UnboundDatagram {
     ) -> Self {
         Self {
             local_addr,
-            recv_queue: Some(recv_queue),
+            recv_queue,
         }
-    }
-
-    fn recv_queue(&mut self) -> Arc<UdpRecvQueue> {
-        self.recv_queue
-            .get_or_insert_with(UdpRecvQueue::new)
-            .clone()
     }
 
     /// Returns the local endpoint, whose port is always zero.
@@ -85,7 +79,7 @@ impl datagram_common::Unbound for UnboundDatagram {
             endpoint,
             options.can_reuse,
             locks,
-            self.recv_queue(),
+            self.recv_queue.clone(),
             pollee,
         )
     }
@@ -110,7 +104,7 @@ impl datagram_common::Unbound for UnboundDatagram {
             &self.local_endpoint(),
             false,
             locks,
-            self.recv_queue(),
+            self.recv_queue.clone(),
             pollee,
         )
     }
@@ -120,19 +114,12 @@ impl datagram_common::Unbound for UnboundDatagram {
         writer: &mut dyn MultiWrite,
         flags: RecvFlags,
     ) -> Result<(RecvOutput, Self::Endpoint)> {
-        match self.recv_queue.as_ref() {
-            Some(recv_queue) => recv_from_queue(recv_queue, writer, flags),
-            None => return_errno_with_message!(Errno::EAGAIN, "the socket is not bound"),
-        }
+        recv_from_queue(&self.recv_queue, writer, flags)
     }
 
     fn check_io_events(&self) -> IoEvents {
         let mut events = IoEvents::OUT;
-        if self
-            .recv_queue
-            .as_ref()
-            .is_some_and(|recv_queue| recv_queue.can_recv())
-        {
+        if self.recv_queue.can_recv() {
             events |= IoEvents::IN;
         }
         events

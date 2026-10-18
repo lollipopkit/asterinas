@@ -31,7 +31,7 @@ use crate::{
     socket::{
         event::SocketEvents,
         option::{RawTcpOption, RawTcpSetOption},
-        unbound::{RawTcpSocket, new_tcp_socket},
+        unbound::RawTcpSocket,
     },
     socket_table::ConnectionKey,
 };
@@ -342,9 +342,7 @@ impl<E: Ext> TcpConnection<E> {
         }
 
         let socket = {
-            let mut socket = new_tcp_socket();
-
-            option.apply(&mut socket);
+            let mut socket = option.new_socket();
 
             if let Err(err) = socket.connect(interface.context_mut(), remote_endpoint, bound.port())
             {
