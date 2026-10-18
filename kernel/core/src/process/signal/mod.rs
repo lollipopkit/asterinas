@@ -468,15 +468,17 @@ pub(crate) fn handle_user_signal(
     // Clone the FPU context.
     let supp = ctx.thread_local.supp_user_context();
     let fpu_context = supp.fpu().get();
+    #[cfg(not(target_arch = "x86_64"))]
     let fpu_context_bytes = fpu_context.as_bytes();
 
     cfg_select! {
         target_arch = "x86_64" => {
+            let fpu_image = crate::arch::signal::fpu_sigframe_image(&fpu_context);
             // Align the FPU context address to the 64-byte boundary so that the
             // user program can use the XSAVE/XRSTOR instructions at that address,
             // if necessary.
             let fpu_context_addr =
-                alloc_aligned_in_user_stack(stack_pointer, fpu_context_bytes.len(), 64);
+                alloc_aligned_in_user_stack(stack_pointer, fpu_image.len(), 64);
             let ucontext_addr = alloc_aligned_in_user_stack(
                 fpu_context_addr,
                 size_of::<ucontext_t>(),
@@ -529,7 +531,9 @@ pub(crate) fn handle_user_signal(
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    user_space.write_bytes(fpu_context_addr as _, &fpu_image[..])?;
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     user_space.write_bytes(fpu_context_addr as _, fpu_context_bytes)?;
     user_space.write_val(ucontext_addr as _, &ucontext)?;
 

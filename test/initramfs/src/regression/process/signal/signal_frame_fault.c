@@ -367,3 +367,130 @@ FN_TEST(sigreturn_with_bad_fpu_context)
 	TEST_SUCC(install_handler(SIGSEGV, SIG_DFL, 0));
 }
 END_TEST()
+
+// Byte offsets in the XSAVE area of a signal frame.
+#define FP_OFF_MXCSR 24
+#define FP_OFF_SW_BYTES 464
+#define FP_OFF_XSTATE_BV 512
+#define FP_OFF_XCOMP_BV 520
+#define FP_OFF_HDR_RESERVED 528
+
+#define FP_XSTATE_MAGIC1 0x46505853U
+#define FP_XSTATE_MAGIC2 0x46505845U
+
+struct fpx_sw_bytes {
+	uint32_t magic1;
+	uint32_t extended_size;
+	uint64_t xfeatures;
+	uint32_t xstate_size;
+	uint32_t padding[7];
+};
+
+enum fpu_corruption {
+	FPU_INTACT,
+	FPU_MXCSR_RESERVED,
+	FPU_XSTATE_BV_UNSUPPORTED,
+	FPU_XCOMP_BV_COMPACTED,
+	FPU_HDR_RESERVED,
+	FPU_NO_MAGIC1_HDR_RESERVED,
+};
+
+static volatile enum fpu_corruption fpu_corruption;
+static volatile int fpu_has_magic;
+
+static uint64_t xcr0(void)
+{
+	uint32_t eax, edx;
+
+	asm volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
+	return ((uint64_t)edx << 32) | eax;
+}
+
+static void corrupt_fpu_handler(int sig, siginfo_t *info, void *ctx)
+{
+	ucontext_t *uc = ctx;
+	unsigned char *fp = (unsigned char *)uc->uc_mcontext.fpregs;
+	struct fpx_sw_bytes *sw = (struct fpx_sw_bytes *)(fp + FP_OFF_SW_BYTES);
+	uint64_t bv, unsupported;
+
+	(void)sig;
+	(void)info;
+	fpu_has_magic = sw->magic1 == FP_XSTATE_MAGIC1 &&
+			*(uint32_t *)(fp + sw->xstate_size) == FP_XSTATE_MAGIC2;
+
+	switch (fpu_corruption) {
+	case FPU_INTACT:
+		break;
+	case FPU_MXCSR_RESERVED:
+		*(uint32_t *)(fp + FP_OFF_MXCSR) |= 1U << 31;
+		break;
+	case FPU_XSTATE_BV_UNSUPPORTED:
+		unsupported = ~xcr0() & ~(1ULL << 63);
+		bv = unsupported & -unsupported;
+		*(uint64_t *)(fp + FP_OFF_XSTATE_BV) |= bv;
+		break;
+	case FPU_XCOMP_BV_COMPACTED:
+		*(uint64_t *)(fp + FP_OFF_XCOMP_BV) |= 1ULL << 63;
+		break;
+	case FPU_HDR_RESERVED:
+		fp[FP_OFF_HDR_RESERVED] = 1;
+		break;
+	case FPU_NO_MAGIC1_HDR_RESERVED:
+		// Without the magic, only the legacy area is restored, so the
+		// XSAVE header is ignored.
+		sw->magic1 = 0;
+		fp[FP_OFF_HDR_RESERVED] = 1;
+		break;
+	}
+}
+
+static int sigreturn_with_fpu(enum fpu_corruption corruption)
+{
+	reset_records();
+	fpu_corruption = corruption;
+	fpu_has_magic = 0;
+	if (sigsetjmp(jmp_env, 1) == 0)
+		raise(SIGUSR1);
+	return sigsegv_count;
+}
+
+FN_TEST(sigreturn_with_invalid_xsave_image)
+{
+	TEST_SUCC(install_handler(SIGUSR1, corrupt_fpu_handler, SA_SIGINFO));
+	TEST_SUCC(install_handler(SIGSEGV, sigsegv_handler,
+				  SA_SIGINFO | SA_ONSTACK | SA_NODEFER));
+
+	// The frame carries the software-reserved bytes and the trailing magic.
+	TEST_RES(sigreturn_with_fpu(FPU_INTACT), _ret == 0 && fpu_has_magic);
+	TEST_RES(sigreturn_with_fpu(FPU_NO_MAGIC1_HDR_RESERVED), _ret == 0);
+
+	TEST_RES(sigreturn_with_fpu(FPU_MXCSR_RESERVED),
+		 _ret == 1 && sigsegv_code == SI_KERNEL &&
+			 sigsegv_mxcsr == DEFAULT_MXCSR);
+	TEST_RES(sigreturn_with_fpu(FPU_XSTATE_BV_UNSUPPORTED),
+		 _ret == 1 && sigsegv_code == SI_KERNEL);
+	TEST_RES(sigreturn_with_fpu(FPU_XCOMP_BV_COMPACTED),
+		 _ret == 1 && sigsegv_code == SI_KERNEL);
+	TEST_RES(sigreturn_with_fpu(FPU_HDR_RESERVED),
+		 _ret == 1 && sigsegv_code == SI_KERNEL);
+
+	TEST_SUCC(install_handler(SIGUSR1, SIG_DFL, 0));
+	TEST_SUCC(install_handler(SIGSEGV, SIG_DFL, 0));
+}
+END_TEST()
+
+static void sigreturn_with_invalid_mxcsr(void)
+{
+	install_handler(SIGUSR1, corrupt_fpu_handler, SA_SIGINFO);
+	fpu_corruption = FPU_MXCSR_RESERVED;
+	raise(SIGUSR1);
+}
+
+FN_TEST(sigreturn_with_invalid_xsave_image_kills)
+{
+	pid_t pid;
+	int status;
+
+	TEST_CHILD_KILLED_BY_SIGSEGV(sigreturn_with_invalid_mxcsr);
+}
+END_TEST()

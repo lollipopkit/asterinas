@@ -78,37 +78,37 @@ fn restore_sigframe(ctx: &Context, user_ctx: &mut UserContext) -> Result<()> {
 
     // Restore the FPU context.
     let fpu = ctx.thread_local.supp_user_context().fpu();
-    let mut fpu_context = FpuContext::new();
-    cfg_select! {
-        target_arch = "x86_64" => {
-            // A null FPU context address resets the FPU context. A bad one resets it and
-            // fails.
+    let fpu_context = cfg_select! {
+        target_arch = "x86_64" => {{
+            // A bad FPU context resets the FPU context and fails.
             // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/fpu/signal.c#L449-L492>
-            let fpu_context_addr = ucontext.uc_mcontext.fpu_context_addr();
-            if fpu_context_addr != 0 {
-                let res = ctx
-                    .user_space()
-                    .read_bytes(fpu_context_addr, fpu_context.as_bytes_mut());
-                if res.is_err() {
-                    fpu.set(FpuContext::new());
-                    res?;
-                }
+            let res = crate::arch::signal::read_fpu_sigframe(
+                &ctx.user_space(),
+                ucontext.uc_mcontext.fpu_context_addr(),
+            );
+            if res.is_err() {
+                fpu.set(FpuContext::new());
             }
-        }
-        target_arch = "aarch64" => {
+            res?
+        }}
+        target_arch = "aarch64" => {{
+            let mut fpu_context = FpuContext::new();
             let record = ucontext.uc_mcontext.fpsimd_record(fpu_context.as_bytes().len())?;
             fpu_context.as_bytes_mut().copy_from_slice(record);
-        }
-        any(target_arch = "riscv64", target_arch = "loongarch64") => {
+            fpu_context
+        }}
+        any(target_arch = "riscv64", target_arch = "loongarch64") => {{
             // In RISC-V/LoongArch64, the FPU context is placed directly after `ucontext_t` on the
             // signal stack.
+            let mut fpu_context = FpuContext::new();
             ctx.user_space().read_bytes(
                 sig_context_addr + size_of::<ucontext_t>(),
                 fpu_context.as_bytes_mut(),
             )?;
-        }
+            fpu_context
+        }}
         _ => compile_error!("unsupported target"),
-    }
+    };
     fpu.set(fpu_context);
 
     #[cfg(not(target_arch = "x86_64"))]
