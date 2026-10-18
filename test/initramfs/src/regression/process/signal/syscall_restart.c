@@ -12,6 +12,7 @@
 
 #define _GNU_SOURCE
 
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stddef.h>
@@ -51,6 +52,27 @@ static void sleep_ms(long ms)
 			       .tv_nsec = (ms % 1000) * 1000000 };
 
 	CHECK(nanosleep(&ts, NULL));
+}
+
+// Waits until the thread is blocked in an interruptible sleep, so an interruption hits the
+// syscall under test rather than the code before it.
+static void wait_until_sleeping(pid_t pid)
+{
+	char path[64], buf[512];
+
+	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+	for (int i = 0; i < 5000; ++i) {
+		int fd = CHECK(open(path, O_RDONLY));
+		ssize_t len = CHECK(read(fd, buf, sizeof(buf) - 1));
+		CHECK(close(fd));
+		buf[len] = '\0';
+
+		char *state = strrchr(buf, ')');
+		if (state != NULL && state[1] == ' ' && state[2] == 'S')
+			return;
+		sleep_ms(1);
+	}
+	CHECK_WITH(-1, _ret == 0);
 }
 
 static long timespec_ms(const struct timespec *ts)
@@ -306,6 +328,7 @@ static struct result do_run(const char *name, long (*op)(struct result *),
 
 	CHECK(read(sync_pipe[0], &byte, 1));
 	sleep_ms(INTERRUPT_AT_MS);
+	wait_until_sleeping(pid);
 
 	switch (how) {
 	case BY_STOP:
@@ -641,6 +664,7 @@ static int trace_restart(long (*op)(void), long nr, long restart_errno,
 		if (state == 1) {
 			// The tracee is in the syscall to interrupt.
 			sleep_ms(INTERRUPT_AT_MS);
+			wait_until_sleeping(pid);
 			CHECK(kill(pid, SIGUSR2));
 		}
 
