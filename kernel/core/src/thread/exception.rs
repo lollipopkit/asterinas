@@ -11,7 +11,7 @@ use crate::{
     process::{
         posix_thread::ContextPthreadAdminApi,
         signal::{
-            sig_action::SigAction,
+            sig_action::SigHandler,
             signals::{Signal, fault::FaultSignal},
         },
     },
@@ -83,8 +83,8 @@ fn generate_fault_signal(exception: CpuException, ctx: &Context, user_ctx: &User
     let mut sig_dispositions = sig_dispositions.lock();
 
     let is_blocked = ctx.posix_thread.has_signal_blocked(sig_num);
-    if is_blocked || matches!(sig_dispositions.get(sig_num), SigAction::Ign) {
-        sig_dispositions.set_default(sig_num);
+    if is_blocked || sig_dispositions.get(sig_num).handler == SigHandler::Ign {
+        sig_dispositions.reset_handler(sig_num);
     }
     if is_blocked {
         ctx.set_sig_mask(ctx.posix_thread.sig_mask() - sig_num);

@@ -646,9 +646,16 @@ fn clone_child_process(
 
     clone_pidfd(ctx, &child, clone_flags, clone_args.pidfd)?;
 
-    if let Some(sig) = clone_args.exit_signal {
-        child.set_exit_signal(sig);
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2443-L2454>
+    let (exit_signal, parent_exec_id) = if clone_flags.contains(CloneFlags::CLONE_PARENT) {
+        (process.exit_signal(), process.parent_exec_id())
+    } else {
+        (clone_args.exit_signal, process.self_exec_id())
     };
+    if let Some(sig) = exit_signal {
+        child.set_exit_signal(sig);
+    }
+    child.set_parent_exec_id(parent_exec_id);
 
     // This must be after all fallible steps, since a child that fails to be created never
     // exits and would not be reported to the audit hooks as exited.

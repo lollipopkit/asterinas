@@ -10,68 +10,75 @@ use super::{
 };
 use crate::prelude::*;
 
+/// A signal action.
+///
+/// Like `struct k_sigaction` in Linux, the flags, the mask, and the restorer are kept for every
+/// handler, including `SIG_DFL` and `SIG_IGN`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L4383-L4441>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SigAction {
+    pub(crate) handler: SigHandler,
+    pub(crate) flags: SigActionFlags,
+    pub(crate) restorer_addr: Vaddr,
+    pub(crate) mask: SigMask,
+}
+
+/// The handler of a signal action.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum SigAction {
+pub(crate) enum SigHandler {
+    /// The default action.
     #[default]
-    Dfl, // Default action
-    Ign, // Ignore this signal
-    User {
-        // User-given handler
-        handler_addr: usize,
-        flags: SigActionFlags,
-        restorer_addr: usize,
-        mask: SigMask,
-    },
+    Dfl,
+    /// Ignoring the signal.
+    Ign,
+    /// A user-given handler at the address.
+    User(Vaddr),
+}
+
+impl Default for SigAction {
+    fn default() -> Self {
+        Self {
+            handler: SigHandler::Dfl,
+            flags: SigActionFlags::empty(),
+            restorer_addr: 0,
+            mask: SigMask::new_empty(),
+        }
+    }
 }
 
 impl From<sigaction_t> for SigAction {
     fn from(input: sigaction_t) -> Self {
-        match input.handler_ptr {
-            SIG_DFL => SigAction::Dfl,
-            SIG_IGN => SigAction::Ign,
-            _ => {
-                let flags = SigActionFlags::from_bits_truncate(input.flags);
-                let mask = SigSet::from(input.mask);
-                SigAction::User {
-                    handler_addr: input.handler_ptr,
-                    flags,
-                    restorer_addr: input.restorer_ptr,
-                    mask,
-                }
-            }
+        let handler = match input.handler_ptr {
+            SIG_DFL => SigHandler::Dfl,
+            SIG_IGN => SigHandler::Ign,
+            handler_addr => SigHandler::User(handler_addr),
+        };
+
+        Self {
+            handler,
+            // Unknown flags are cleared so that user space can detect unsupported flags.
+            flags: SigActionFlags::from_bits_truncate(input.flags),
+            restorer_addr: input.restorer_ptr,
+            mask: SigSet::from(input.mask) - SIGKILL - SIGSTOP,
         }
     }
 }
 
 impl SigAction {
     pub(crate) fn as_c_type(&self) -> sigaction_t {
-        match self {
-            SigAction::Dfl => sigaction_t {
-                handler_ptr: SIG_DFL,
-                flags: 0,
-                restorer_ptr: 0,
-                mask: 0,
-                ..Default::default()
-            },
-            SigAction::Ign => sigaction_t {
-                handler_ptr: SIG_IGN,
-                flags: 0,
-                restorer_ptr: 0,
-                mask: 0,
-                ..Default::default()
-            },
-            SigAction::User {
-                handler_addr,
-                flags,
-                restorer_addr,
-                mask,
-            } => sigaction_t {
-                handler_ptr: *handler_addr,
-                flags: flags.as_u32(),
-                restorer_ptr: *restorer_addr,
-                mask: (*mask).into(),
-                ..Default::default()
-            },
+        let handler_ptr = match self.handler {
+            SigHandler::Dfl => SIG_DFL,
+            SigHandler::Ign => SIG_IGN,
+            SigHandler::User(handler_addr) => handler_addr,
+        };
+
+        sigaction_t {
+            handler_ptr,
+            flags: self.flags.as_u32(),
+            restorer_ptr: self.restorer_addr,
+            mask: self.mask.into(),
+            ..Default::default()
         }
     }
 
@@ -81,13 +88,13 @@ impl SigAction {
     ///  * the signal action is explicitly set to ignore the signals, or
     ///  * the signal action is default and the default action is to ignore the signals.
     pub(crate) fn will_ignore(&self, signum: SigNum) -> bool {
-        match self {
-            SigAction::Dfl => {
+        match self.handler {
+            SigHandler::Dfl => {
                 let default_action = SigDefaultAction::from_signum(signum);
                 matches!(default_action, SigDefaultAction::Ign)
             }
-            SigAction::Ign => true,
-            SigAction::User { .. } => false,
+            SigHandler::Ign => true,
+            SigHandler::User(_) => false,
         }
     }
 }
@@ -97,6 +104,7 @@ bitflags! {
         const SA_NOCLDSTOP  = 1;
         const SA_NOCLDWAIT  = 2;
         const SA_SIGINFO    = 4;
+        const SA_EXPOSE_TAGBITS = 0x00000800;
         const SA_ONSTACK    = 0x08000000;
         const SA_RESTART    = 0x10000000;
         const SA_NODEFER    = 0x40000000;
@@ -118,10 +126,6 @@ impl TryFrom<u32> for SigActionFlags {
 impl SigActionFlags {
     pub(crate) fn as_u32(&self) -> u32 {
         self.bits()
-    }
-
-    pub(crate) fn contains_unsupported_flag(&self) -> bool {
-        self.intersects(SigActionFlags::SA_NOCLDSTOP | SigActionFlags::SA_NOCLDWAIT)
     }
 }
 

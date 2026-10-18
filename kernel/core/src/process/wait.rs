@@ -10,7 +10,8 @@ use crate::{
     prelude::*,
     process::{
         ReapedChildrenStats, Uid, pid_table,
-        posix_thread::{AsPosixThread, PosixThread, ptrace::PtraceWaitStatus},
+        posix_thread::{AsPosixThread, ptrace::PtraceWaitStatus},
+        sigchld::ChildSource,
         signal::sig_num::SigNum,
         status::StopWaitStatus,
     },
@@ -128,46 +129,27 @@ pub(crate) enum WaitStatus {
 
 impl WaitStatus {
     pub(crate) fn pid(&self) -> Pid {
-        match self.source() {
-            WaitStatusSource::Process(process) => process.pid(),
-            WaitStatusSource::Thread(thread) => thread.tid(),
-        }
+        self.source().pid()
     }
 
     pub(crate) fn uid(&self) -> Uid {
-        match self.source() {
-            WaitStatusSource::Process(process) => process
-                .main_thread()
-                .as_posix_thread()
-                .unwrap()
-                .credentials()
-                .ruid(),
-            WaitStatusSource::Thread(thread) => thread.credentials().ruid(),
-        }
+        self.source().uid()
     }
 
     pub(crate) fn prof_clock(&self) -> &Arc<ProfClock> {
-        match self.source() {
-            WaitStatusSource::Process(process) => process.prof_clock(),
-            WaitStatusSource::Thread(thread) => thread.prof_clock(),
-        }
+        self.source().prof_clock()
     }
 
-    fn source(&self) -> WaitStatusSource<'_> {
+    fn source(&self) -> ChildSource<'_> {
         match self {
             WaitStatus::Zombie(process)
             | WaitStatus::Stop(process, _)
-            | WaitStatus::Continue(process) => WaitStatusSource::Process(process.as_ref()),
+            | WaitStatus::Continue(process) => ChildSource::Process(process.as_ref()),
             WaitStatus::TraceeExit(thread, _) | WaitStatus::TraceeStop(thread, _) => {
-                WaitStatusSource::Thread(thread.as_posix_thread().unwrap())
+                ChildSource::Thread(thread.as_posix_thread().unwrap())
             }
         }
     }
-}
-
-enum WaitStatusSource<'a> {
-    Process(&'a Process),
-    Thread(&'a PosixThread),
 }
 
 /// The result of trying to wait for a child/tracee state change.
@@ -379,6 +361,24 @@ fn reap_zombie_child(
     children_lock: &mut BTreeMap<Pid, Arc<Process>>,
     reaped_children_stats: &Mutex<ReapedChildrenStats>,
 ) -> ExitCode {
+    let child_process = release_zombie_child(child_pid, children_lock);
+
+    let (mut user_time, mut kernel_time) = child_process.reaped_children_stats().lock().get();
+    user_time += child_process.prof_clock().user_clock().read_time();
+    kernel_time += child_process.prof_clock().kernel_clock().read_time();
+    reaped_children_stats.lock().add(user_time, kernel_time);
+
+    child_process.status().exit_code()
+}
+
+/// Removes zombie child with `child_pid` from the process tree.
+///
+/// Unlike [`reap_zombie_child`], this does not account the resource usage of the child to the
+/// parent, which is the case when the child is reaped automatically.
+pub(super) fn release_zombie_child(
+    child_pid: Pid,
+    children_lock: &mut BTreeMap<Pid, Arc<Process>>,
+) -> Arc<Process> {
     let child_process = children_lock.remove(&child_pid).unwrap();
     assert!(child_process.status().is_zombie());
 
@@ -403,11 +403,7 @@ fn reap_zombie_child(
     // Remove the process group and the session from global table, if necessary
     let mut child_group_mut = child_process.process_group.lock();
     child_process.clear_old_group_and_session(&mut child_group_mut, &mut pid_table);
+    drop(child_group_mut);
 
-    let (mut user_time, mut kernel_time) = child_process.reaped_children_stats().lock().get();
-    user_time += child_process.prof_clock().user_clock().read_time();
-    kernel_time += child_process.prof_clock().kernel_clock().read_time();
-    reaped_children_stats.lock().add(user_time, kernel_time);
-
-    child_process.status().exit_code()
+    child_process
 }

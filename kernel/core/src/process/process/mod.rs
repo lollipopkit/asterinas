@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use core::{
-    sync::atomic::{AtomicBool, AtomicI16, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicI16, AtomicU32, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -14,8 +14,13 @@ use super::{
     posix_thread::{AsPosixThread, FIRST_POSIX_TID},
     process_vm::ProcessVmarGuard,
     rlimit::ResourceLimits,
+    sigchld::{self, ChildSource},
     signal::{
+        HandlePendingSignal,
+        constants::{CLD_CONTINUED, CLD_STOPPED, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU},
+        sig_action::SigDefaultAction,
         sig_disposition::SigDispositions,
+        sig_mask::SigSet,
         sig_num::{AtomicSigNum, SigNum},
         signals::Signal,
     },
@@ -146,6 +151,10 @@ pub struct Process {
     parent_death_signal: AtomicSigNum,
     /// The signal that should be sent to the parent when this process exits.
     exit_signal: AtomicSigNum,
+    /// The ID of the execution domain, which increases on every `execve`.
+    self_exec_id: AtomicU64,
+    /// The [`Self::self_exec_id`] of the parent when this process was created.
+    parent_exec_id: AtomicU64,
 
     // Time
     /// A profiling clock measures the user CPU time and kernel CPU time of the current process.
@@ -279,6 +288,8 @@ impl Process {
                 sig_queues: SigQueues::new(),
                 parent_death_signal: AtomicSigNum::new_empty(),
                 exit_signal: AtomicSigNum::new_empty(),
+                self_exec_id: AtomicU64::new(0),
+                parent_exec_id: AtomicU64::new(0),
                 prof_clock,
                 timer_manager,
                 start_time: Jiffies::elapsed(),
@@ -661,6 +672,7 @@ impl Process {
             return;
         }
 
+        self.prepare_signal(signal.num());
         self.sig_queues.enqueue(signal);
 
         for task in self.tasks.lock().as_slice() {
@@ -671,6 +683,36 @@ impl Process {
             // for simplicity we wake up all threads.
             // Reference: <https://elixir.bootlin.com/linux/v6.17/source/kernel/signal.c#L969>.
             posix_thread.wake_signalled_waker();
+        }
+    }
+
+    /// Applies the job control effects of generating a signal for this process.
+    ///
+    /// Generating a stop signal discards the pending `SIGCONT`, and generating `SIGCONT`
+    /// discards the pending stop signals and continues the stopped process, regardless of
+    /// whether `SIGCONT` is blocked, ignored, or caught.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L907-L959>
+    pub(in crate::process) fn prepare_signal(&self, sig_num: SigNum) {
+        let discarded = if sig_num == SIGCONT {
+            SigSet::from(SIGSTOP) + SIGTSTP + SIGTTIN + SIGTTOU
+        } else if SigDefaultAction::from_signum(sig_num) == SigDefaultAction::Stop {
+            SigSet::from(SIGCONT)
+        } else {
+            return;
+        };
+        if self.status.is_zombie() {
+            return;
+        }
+
+        let kept = SigSet::new_full() - discarded;
+        for task in self.tasks.lock().as_slice() {
+            let posix_thread = task.as_posix_thread().unwrap();
+            while posix_thread.dequeue_signal(&kept).is_some() {}
+        }
+
+        if sig_num == SIGCONT {
+            self.resume();
         }
     }
 
@@ -721,6 +763,25 @@ impl Process {
         self.exit_signal.as_sig_num()
     }
 
+    /// Returns the ID of the current execution domain.
+    pub(super) fn self_exec_id(&self) -> u64 {
+        self.self_exec_id.load(Ordering::Relaxed)
+    }
+
+    /// Enters a new execution domain on `execve`.
+    pub(super) fn increase_self_exec_id(&self) {
+        self.self_exec_id.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the ID of the parent's execution domain when this process was created.
+    pub(super) fn parent_exec_id(&self) -> u64 {
+        self.parent_exec_id.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_parent_exec_id(&self, exec_id: u64) {
+        self.parent_exec_id.store(exec_id, Ordering::Relaxed);
+    }
+
     // ******************* Status ********************
 
     /// Returns a reference to the process status.
@@ -739,14 +800,14 @@ impl Process {
     /// Stops the process.
     pub(crate) fn stop(&self, sig_num: SigNum) {
         if self.status.stop_status().stop(sig_num) {
-            self.wake_up_parent();
+            self.notify_parent_of_stop(CLD_STOPPED, sig_num.as_u8() as i32);
         }
     }
 
     /// Resumes the stopped process.
-    pub(crate) fn resume(&self) {
+    fn resume(&self) {
         if self.status.stop_status().resume() {
-            self.wake_up_parent();
+            self.notify_parent_of_stop(CLD_CONTINUED, SIGCONT.as_u8() as i32);
 
             // Note that the resume function is called by the thread which deals with SIGCONT,
             // since SIGCONT is handled by any thread in this process, we need to wake
@@ -766,6 +827,20 @@ impl Process {
     /// Gets and clears the stop status changes for the `wait` syscall.
     pub(super) fn wait_stopped_or_continued(&self, options: WaitOptions) -> Option<StopWaitStatus> {
         self.status.stop_status().wait(options)
+    }
+
+    /// Notifies the real parent of a job control stop or continuation.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2721-L2725>
+    /// and <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2939-L2944>
+    //
+    // TODO: Notify the tracer as well if it is not the real parent. This requires reporting
+    // group-stops to the tracer, which is not supported yet.
+    fn notify_parent_of_stop(&self, code: i32, status: i32) {
+        let parent = self.parent.lock().process().upgrade().unwrap();
+        let main_thread = self.main_thread();
+        let child = ChildSource::Thread(main_thread.as_posix_thread().unwrap());
+        sigchld::notify_parent_of_stop(child, &parent, code, status);
     }
 
     fn wake_up_parent(&self) {

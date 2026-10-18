@@ -11,11 +11,10 @@ use crate::{
     arch::cpu::SigContext,
     prelude::*,
     process::{Pid, Uid},
+    time::clock_t,
 };
 
 pub(crate) type sigset_t = u64;
-// FIXME: this type should be put at suitable place
-pub(crate) type clock_t = i64;
 
 #[padding_struct]
 #[repr(C)]
@@ -64,17 +63,28 @@ impl siginfo_t {
         self.siginfo_fields.common_mut().first = pid_uid;
     }
 
+    /// Sets the TID and the real UID of the current thread, like the ptrace-stop `siginfo_t`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2595-L2596>
     pub(crate) fn set_pid_uid_by(&mut self, ctx: &Context) {
-        self.set_pid_uid(ctx.process.pid(), ctx.posix_thread.credentials().ruid());
+        self.set_pid_uid(
+            ctx.posix_thread.tid(),
+            ctx.posix_thread.credentials().ruid(),
+        );
     }
 
     pub(crate) fn set_status(&mut self, status: i32) {
-        *self
-            .siginfo_fields
+        self.siginfo_fields
             .common_mut()
             .second
             .sigchild_mut()
-            .status_mut() = status;
+            .status = status;
+    }
+
+    pub(crate) fn set_utime_stime(&mut self, utime: clock_t, stime: clock_t) {
+        let sigchild = self.siginfo_fields.common_mut().second.sigchild_mut();
+        sigchild.utime = utime;
+        sigchild.stime = stime;
     }
 
     pub(crate) fn si_addr(&self) -> Vaddr {
@@ -158,10 +168,11 @@ impl sigval_t {
     }
 }
 
-#[pod_union]
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/uapi/asm-generic/siginfo.h#L59-L66>
+#[padding_struct]
 #[repr(C)]
-#[derive(Clone, Copy)]
-union siginfo_sigchild_t {
+#[derive(Clone, Copy, Pod)]
+struct siginfo_sigchild_t {
     status: i32,
     utime: clock_t,
     stime: clock_t,

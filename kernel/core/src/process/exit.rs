@@ -2,7 +2,12 @@
 
 use core::sync::atomic::Ordering;
 
-use super::{INIT_PROCESS_PID, Pid, Process, pid_table};
+use super::{
+    INIT_PROCESS_PID, Pid, Process, pid_table,
+    sigchld::{self, ChildSource},
+    signal::{constants::SIGCHLD, sig_num::SigNum},
+    wait::release_zombie_child,
+};
 use crate::{
     events::IoEvents,
     fs::cgroupfs::CgroupMembership,
@@ -40,11 +45,18 @@ pub(super) fn exit_process(current_process: &Process) {
     //
     // This must happen after `move_children_to_reaper_process`. See the comments in
     // `find_reaper_process` for details.
-    current_process.status().set_zombie();
+    //
+    // This must also happen while the children of the parent are locked, so that the parent
+    // cannot reap the process before we decide whether it should be reaped automatically.
+    with_parent_children(current_process, |parent_and_siblings| {
+        current_process.status().set_zombie();
 
-    current_process.pidfile_pollee.notify(IoEvents::IN);
+        current_process.pidfile_pollee.notify(IoEvents::IN);
 
-    send_child_death_signal(current_process);
+        if let Some((parent, siblings)) = parent_and_siblings {
+            notify_parent_of_death(current_process, parent, siblings);
+        }
+    });
 
     // Remove the process from the cgroup.
     let mut cgroup_guard = CgroupMembership::write_lock();
@@ -159,6 +171,25 @@ fn move_process_children(
         let mut parent = child_process.parent.lock();
         reaper_process_children.insert(child_process.pid(), child_process.clone());
         parent.set_process(reaper_process);
+        drop(parent);
+
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L689-L702>
+        child_process.set_exit_signal(SIGCHLD);
+        if child_process.status().is_zombie()
+            && child_process
+                .main_thread()
+                .as_posix_thread()
+                .unwrap()
+                .tracer()
+                .is_none()
+        {
+            notify_and_maybe_reap(
+                child_process,
+                reaper_process,
+                reaper_process_children,
+                false,
+            );
+        }
     }
 
     Ok(children)
@@ -185,22 +216,96 @@ fn send_parent_death_signal(children: &BTreeMap<Pid, Arc<Process>>) {
 ///
 /// If the process is traced by a tracer in another process, the tracer is notified instead,
 /// and the parent will be notified when the tracer reaps or detaches the process.
-pub(super) fn send_child_death_signal(current_process: &Process) {
-    let Some(parent) = current_process.parent().lock().process().upgrade() else {
-        return;
-    };
+pub(super) fn send_child_death_signal(process: &Process) {
+    with_parent_children(process, |parent_and_siblings| {
+        if let Some((parent, siblings)) = parent_and_siblings {
+            notify_parent_of_death(process, parent, siblings);
+        }
+    });
+}
 
-    if current_process
-        .main_thread()
-        .as_posix_thread()
-        .unwrap()
-        .ptrace_defer_exit_notify(&parent)
+/// Runs `f` with the parent of `process` and the locked children of the parent.
+///
+/// While `f` runs, the parent of `process` cannot change. If `process` has no parent (i.e., it is
+/// the init process), `f` gets `None`.
+fn with_parent_children(
+    process: &Process,
+    f: impl FnOnce(Option<(&Arc<Process>, &mut BTreeMap<Pid, Arc<Process>>)>),
+) {
+    loop {
+        let Some(parent) = process.parent().lock().process().upgrade() else {
+            return f(None);
+        };
+
+        // Lock order: children of process -> parent of process
+        let mut siblings = parent.children().lock();
+        if !core::ptr::eq(
+            process.parent().lock().process().as_ptr(),
+            Arc::as_ptr(&parent),
+        ) {
+            // The parent has exited and moved `process` to a reaper concurrently.
+            continue;
+        }
+
+        // The parent clears its children only after moving them to a reaper, which updates the
+        // parent of `process`. So the children must still be present.
+        return f(Some((&parent, siblings.as_mut().unwrap())));
+    }
+}
+
+/// Notifies the parent of the death of `process`, which is a zombie child of `parent`.
+fn notify_parent_of_death(
+    process: &Process,
+    parent: &Arc<Process>,
+    siblings: &mut BTreeMap<Pid, Arc<Process>>,
+) {
+    if !siblings
+        .get(&process.pid())
+        .is_some_and(|child| core::ptr::eq(child.as_ref(), process))
     {
+        // The process has been reaped concurrently.
         return;
     }
 
-    if let Some(signal) = current_process.exit_signal().map(KernelSignal::new) {
-        parent.enqueue_signal(Box::new(signal));
-    };
-    parent.children_wait_queue().wake_all();
+    let main_thread = process.main_thread();
+    let main_posix_thread = main_thread.as_posix_thread().unwrap();
+    if main_posix_thread.ptrace_defer_exit_notify(parent) {
+        return;
+    }
+
+    let is_traced = main_posix_thread.tracer().is_some();
+    notify_and_maybe_reap(process, parent, siblings, is_traced);
+}
+
+/// Notifies `parent` of the death of `process` and reaps it if `parent` does not care.
+fn notify_and_maybe_reap(
+    process: &Process,
+    parent: &Arc<Process>,
+    siblings: &mut BTreeMap<Pid, Arc<Process>>,
+    is_traced: bool,
+) {
+    let autoreap = sigchld::notify_parent_of_death(
+        ChildSource::Process(process),
+        process.status().exit_code(),
+        parent,
+        child_death_signal(process, parent),
+        is_traced,
+    );
+
+    if autoreap {
+        release_zombie_child(process.pid(), siblings);
+    }
+}
+
+/// Returns the signal that notifies `parent` of the death of `process`.
+fn child_death_signal(process: &Process, parent: &Process) -> Option<SigNum> {
+    let sig = process.exit_signal();
+
+    // If the parent has executed a new program, it may not expect a custom exit signal.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2271-L2278>
+    if sig != Some(SIGCHLD) && process.parent_exec_id() != parent.self_exec_id() {
+        return Some(SIGCHLD);
+    }
+
+    sig
 }

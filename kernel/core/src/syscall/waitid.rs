@@ -6,12 +6,10 @@ use super::SyscallReturn;
 use crate::{
     prelude::*,
     process::{
-        ProcessFilter, WaitOptions, WaitStatus, do_wait,
+        ProcessFilter, WaitOptions, WaitStatus, decode_exit_code, do_wait,
         signal::{
             c_types::siginfo_t,
-            constants::{
-                CLD_CONTINUED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, CLD_TRAPPED, SIGCHLD, SIGCONT,
-            },
+            constants::{CLD_CONTINUED, CLD_STOPPED, CLD_TRAPPED, SIGCHLD, SIGCONT},
         },
     },
 };
@@ -26,6 +24,8 @@ pub(super) fn sys_waitid(
 ) -> Result<SyscallReturn> {
     // FIXME: what does rusage use for?
     let process_filter = ProcessFilter::from_which_and_id(which, upid as _, ctx)?;
+    // The upper bits are ignored since `options` is an `int`.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1825-L1826>
     let wait_options = WaitOptions::from_bits(options as u32)
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid options"))?;
 
@@ -69,28 +69,11 @@ pub(super) fn sys_waitid(
 }
 
 fn calculate_si_code_and_si_status(wait_status: &WaitStatus) -> (i32, i32) {
-    let parse_exit_code = |exit_code: u32| {
-        const NORMAL_EXIT_MASK: u32 = 0xff;
-
-        // If the process exits normally, the lowest 8 bits of `status_code`
-        // will be zero. In this case, we return the actual exit code by
-        // shifting the `status_code` right by 8 bits.
-        if (exit_code & NORMAL_EXIT_MASK) == 0 {
-            (CLD_EXITED, (exit_code >> 8) as i32)
-        } else {
-            (CLD_KILLED, exit_code as i32)
-        }
-    };
-
-    // TODO: Add supports for `CLD_DUMPED`.
     match wait_status {
-        WaitStatus::Zombie(process) => {
-            let exit_code = process.status().exit_code();
-            parse_exit_code(exit_code)
-        }
+        WaitStatus::Zombie(process) => decode_exit_code(process.status().exit_code()),
         WaitStatus::Stop(_process, signum) => (CLD_STOPPED, signum.as_u8() as i32),
         WaitStatus::Continue(_) => (CLD_CONTINUED, SIGCONT.as_u8() as i32),
-        WaitStatus::TraceeExit(_, exit_code) => parse_exit_code(*exit_code),
+        WaitStatus::TraceeExit(_, exit_code) => decode_exit_code(*exit_code),
         WaitStatus::TraceeStop(_, status) => (CLD_TRAPPED, status.to_waitid_si_status()),
     }
 }

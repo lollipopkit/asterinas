@@ -26,7 +26,7 @@ pub(crate) use pause::{Pause, PauseReason, with_sigmask_changed};
 pub(crate) use pending::{DequeuedSignal, HandlePendingSignal};
 pub(crate) use poll::{PollAdaptor, Pollee, Poller};
 pub use poll::{PollHandle, Pollable};
-use sig_action::{SigAction, SigActionFlags, SigDefaultAction};
+use sig_action::{SigAction, SigActionFlags, SigDefaultAction, SigHandler};
 use sig_mask::SigMask;
 use sig_num::SigNum;
 pub(crate) use sig_stack::{SigStack, SigStackFlags, SigStackStatus};
@@ -125,23 +125,25 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
     };
 
     let sig_num = signal.num();
-    match sig_action {
-        SigAction::Ign => {
+    let SigAction {
+        handler,
+        flags,
+        restorer_addr,
+        mask,
+    } = sig_action;
+    match handler {
+        SigHandler::Ign => {
             debug!("Ignore signal {:?}", sig_num);
         }
-        SigAction::User {
-            handler_addr,
-            flags,
-            restorer_addr,
-            mask,
-        } => {
+        SigHandler::User(handler_addr) => {
             if flags.contains(SigActionFlags::SA_RESETHAND) {
                 // In Linux, SA_RESETHAND corresponds to SA_ONESHOT,
                 // which means the user handler will be executed only once and then reset to the default.
-                // Reference: <https://elixir.bootlin.com/linux/v6.0.9/source/kernel/signal.c#L2761>.
+                // Only the handler is reset, so the flags and the mask are kept.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L3026-L3027>
                 let sig_dispositions = ctx.process.sig_dispositions().lock();
                 let mut sig_dispositions = sig_dispositions.lock();
-                sig_dispositions.set_default(sig_num);
+                sig_dispositions.reset_handler(sig_num);
             }
 
             if let Some(orig_syscall_ret) = syscall_restart
@@ -182,7 +184,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                 do_exit_group(TermStatus::Killed(SIGSEGV), ctx, user_ctx);
             }
         }
-        SigAction::Dfl if ctx.process.is_init_process() && !signal.is_forced() => {
+        SigHandler::Dfl if ctx.process.is_init_process() && !signal.is_forced() => {
             // From Linux man pages "kill(2)":
             // "The only signals that can be sent to process ID 1, the init process, are those for
             // which init has explicitly installed signal handlers."
@@ -190,7 +192,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
             // Forced signals are exceptions. Otherwise, init would fault again forever.
             // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/signal.c#L1314-L1319>
         }
-        SigAction::Dfl => {
+        SigHandler::Dfl => {
             let sig_default_action = SigDefaultAction::from_signum(sig_num);
             debug!("sig_default_action = {:?}", sig_default_action);
 
@@ -206,7 +208,8 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                 }
                 SigDefaultAction::Ign => {}
                 SigDefaultAction::Stop => ctx.process.stop(sig_num),
-                SigDefaultAction::Cont => ctx.process.resume(),
+                // The process has been continued when `SIGCONT` was generated.
+                SigDefaultAction::Cont => {}
             }
         }
     }
@@ -302,10 +305,6 @@ pub(crate) fn handle_user_signal(
     debug!("flags = {:?}", flags);
     debug!("restorer_addr = 0x{:x}", restorer_addr);
     debug!("mask = {:?}, mask_to_restore = {:?}", mask, mask_to_restore);
-
-    if flags.contains_unsupported_flag() {
-        warn!("Unsupported signal flags: {:?}", flags);
-    }
 
     if !flags.contains(SigActionFlags::SA_NODEFER) {
         // Add the current signal to `mask`.
