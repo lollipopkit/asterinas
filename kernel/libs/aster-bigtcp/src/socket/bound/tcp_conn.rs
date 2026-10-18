@@ -629,6 +629,49 @@ impl<E: Ext> TcpConnection<E> {
         iface.update_next_poll_at_ms(&self.0, poll_at);
     }
 
+    /// Disconnects the connection like `tcp_disconnect` in Linux.
+    ///
+    /// The connection is reset unless it is already closed (including the TIME-WAIT state, which
+    /// is kept in the background). Returns whether the user should see a connection reset error,
+    /// which is the case if the connection is still open or a reset has not been reported.
+    ///
+    /// Polling the iface is _always_ required after this method returns. Like [`Self::close`]
+    /// and [`Self::reset`], this method can be called before dropping the TCP connection.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp.c#L3369-L3389>
+    pub fn disconnect(&self) -> bool {
+        let mut iface = self.iface().common().interface();
+        let mut socket = self.0.inner.lock();
+
+        socket.is_recv_shut = true;
+
+        let is_reset = match socket.state() {
+            State::Closed | State::TimeWait | State::Listen => false,
+            // Linux reports a reset only if the FIN has not been sent. smoltcp does not expose
+            // this, so a reset is reported if some data or the FIN are not acknowledged.
+            State::Closing | State::LastAck => {
+                let has_unacked = socket.send_queue() > 0;
+                socket.abort();
+                has_unacked
+            }
+            State::SynSent
+            | State::SynReceived
+            | State::Established
+            | State::CloseWait
+            | State::FinWait1
+            | State::FinWait2 => {
+                socket.abort();
+                true
+            }
+        };
+        let is_reset = core::mem::take(&mut socket.is_rst_closed) || is_reset;
+
+        let poll_at = socket.poll_at(iface.context_mut());
+        iface.update_next_poll_at_ms(&self.0, poll_at);
+
+        is_reset
+    }
+
     /// Calls `f` with an immutable reference to the associated [`RawTcpSocket`].
     //
     // NOTE: If a mutable reference is required, add a method above that correctly updates the next

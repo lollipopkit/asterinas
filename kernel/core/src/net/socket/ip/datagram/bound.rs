@@ -11,7 +11,7 @@ use crate::{
     net::{
         iface::{Iface, UdpSocket},
         socket::{
-            ip::common::select_source,
+            ip::common::{BindLocks, select_source},
             util::{RecvFlags, RecvOutput, SendFlags, datagram_common},
         },
     },
@@ -45,16 +45,6 @@ struct ConnectedSource {
     addr: IpAddress,
     /// The index of the bigtcp socket on the iface that owns `addr`.
     socket_index: usize,
-}
-
-/// Whether the local address and the local port are specified by `bind`.
-///
-/// These correspond to `SOCK_BINDADDR_LOCK` and `SOCK_BINDPORT_LOCK` in Linux, which decide what
-/// is kept after `connect(AF_UNSPEC)`.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct BindLocks {
-    pub(super) addr: bool,
-    pub(super) port: bool,
 }
 
 impl BoundDatagram {

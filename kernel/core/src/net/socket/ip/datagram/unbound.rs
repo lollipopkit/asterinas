@@ -5,14 +5,14 @@ use aster_bigtcp::{
     wire::{IpAddress, IpEndpoint},
 };
 
-use super::{
-    bound::{BindLocks, BoundDatagram},
-    observer::DatagramObserver,
-};
+use super::{bound::BoundDatagram, observer::DatagramObserver};
 use crate::{
     events::IoEvents,
     net::socket::{
-        ip::{addr::UNSPECIFIED_LOCAL_ENDPOINT, common::bind_ports},
+        ip::{
+            addr::UNSPECIFIED_LOCAL_ENDPOINT,
+            common::{BindLocks, bind_ports},
+        },
         util::datagram_common,
     },
     prelude::*,
@@ -57,10 +57,7 @@ impl datagram_common::Unbound for UnboundDatagram {
         pollee: &Pollee,
         options: BindOptions,
     ) -> Result<Self::Bound> {
-        let locks = BindLocks {
-            addr: !endpoint.addr.is_unspecified(),
-            port: endpoint.port != 0,
-        };
+        let locks = BindLocks::from_bind(endpoint);
         new_bound(endpoint, options.can_reuse, locks, pollee)
     }
 
