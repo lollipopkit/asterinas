@@ -155,6 +155,58 @@ FN_TEST(tcp_broadcast_bind)
 }
 END_TEST()
 
+static int new_tcp(int reuse)
+{
+	int sk;
+
+	sk = socket(AF_INET, SOCK_STREAM, 0);
+	if (sk < 0)
+		return sk;
+
+	CHECK(setsockopt(sk, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)));
+
+	return sk;
+}
+
+FN_TEST(tcp_broadcast_fallback_ports)
+{
+	int sk1, sk2, sk3;
+
+	// Like Linux, falling back to the interface address when connecting
+	// does not check bind conflicts. Then the port at that address is held
+	// by both sockets, and is released after both sockets are closed.
+	sk1 = TEST_SUCC(new_tcp(0));
+	sk2 = TEST_SUCC(new_tcp(0));
+	TEST_SUCC(CALL_SOCKADDR_OP(bind, sk1, broadcast_port2));
+	TEST_SUCC(CALL_SOCKADDR_OP(bind, sk2, localhost_port2));
+	TEST_ERRNO(CALL_SOCKADDR_OP(connect, sk1, localhost_port1),
+		   ECONNREFUSED);
+	TEST_SOCK_NAME(sk1, localhost_port2);
+
+	sk3 = TEST_SUCC(new_tcp(0));
+	TEST_ERRNO(CALL_SOCKADDR_OP(bind, sk3, localhost_port2), EADDRINUSE);
+	TEST_SUCC(close(sk2));
+	TEST_ERRNO(CALL_SOCKADDR_OP(bind, sk3, localhost_port2), EADDRINUSE);
+	TEST_SUCC(close(sk1));
+	TEST_SUCC(CALL_SOCKADDR_OP(bind, sk3, localhost_port2));
+	TEST_SUCC(close(sk3));
+
+	// The port can be reused if all the sockets enable `SO_REUSEADDR`.
+	sk1 = TEST_SUCC(new_tcp(1));
+	sk2 = TEST_SUCC(new_tcp(1));
+	TEST_SUCC(CALL_SOCKADDR_OP(bind, sk1, broadcast_port2));
+	TEST_SUCC(CALL_SOCKADDR_OP(bind, sk2, localhost_port2));
+	TEST_ERRNO(CALL_SOCKADDR_OP(connect, sk1, localhost_port1),
+		   ECONNREFUSED);
+	sk3 = TEST_SUCC(new_tcp(1));
+	TEST_SUCC(CALL_SOCKADDR_OP(bind, sk3, localhost_port2));
+
+	TEST_SUCC(close(sk3));
+	TEST_SUCC(close(sk2));
+	TEST_SUCC(close(sk1));
+}
+END_TEST()
+
 FN_TEST(tcp_broadcast_listen)
 {
 	int sk1, sk2;
