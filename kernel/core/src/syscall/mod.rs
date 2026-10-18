@@ -11,8 +11,10 @@
     expect(dead_code)
 )]
 
+pub(crate) use arch::SYS_RESTART_SYSCALL;
 pub(crate) use clock_gettime::ClockId;
 use ostd::arch::cpu::context::UserContext;
+pub(crate) use restart_syscall::RestartBlock;
 pub(crate) use timer_create::create_timer_for_clock;
 
 use crate::{cpu::LinuxAbi, prelude::*};
@@ -127,6 +129,7 @@ mod recvfrom;
 mod recvmsg;
 mod removexattr;
 mod rename;
+mod restart_syscall;
 mod rmdir;
 mod rt_sigaction;
 mod rt_sigpending;

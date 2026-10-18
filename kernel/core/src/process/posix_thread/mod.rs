@@ -367,6 +367,15 @@ pub(crate) trait ContextPthreadAdminApi {
     /// It should not be called more than once per system call.
     fn save_and_set_sig_mask(&self, sig_mask: SigMask);
 
+    /// Restores the signal mask saved by [`Self::save_and_set_sig_mask`] unless the current
+    /// syscall is interrupted by a signal.
+    ///
+    /// If the syscall is interrupted, the saved signal mask is restored after the signal is
+    /// handled.
+    //
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/sched/signal.h#L549-L555>
+    fn restore_saved_sig_mask_unless(&self, is_interrupted: bool);
+
     /// Gets the read-write credentials of the current thread.
     ///
     /// The process stays non-dumpable while the returned value is alive, see
@@ -392,6 +401,16 @@ impl ContextPthreadAdminApi for Context<'_> {
         sig_mask_saved.set(Some(self.posix_thread.sig_mask()));
 
         self.set_sig_mask(sig_mask);
+    }
+
+    fn restore_saved_sig_mask_unless(&self, is_interrupted: bool) {
+        if is_interrupted {
+            return;
+        }
+
+        if let Some(sig_mask) = self.thread_local.sig_mask_saved().take() {
+            self.set_sig_mask(sig_mask);
+        }
     }
 
     fn credentials_mut(&self) -> CredentialsUpdate<'_> {

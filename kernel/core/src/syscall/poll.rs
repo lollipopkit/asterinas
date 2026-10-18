@@ -4,7 +4,7 @@ use core::{cell::Cell, mem::offset_of, time::Duration};
 
 use ostd::mm::VmIo;
 
-use super::SyscallReturn;
+use super::{SyscallReturn, restart_syscall::RestartBlock};
 use crate::{
     events::IoEvents,
     fs::file::{
@@ -12,7 +12,12 @@ use crate::{
         file_table::{FileDesc, FileTable},
     },
     prelude::*,
-    process::{ResourceType, signal::Poller},
+    process::{
+        ResourceType,
+        posix_thread::{ContextPthreadAdminApi, Personality},
+        signal::Poller,
+    },
+    time::clocks::MonotonicClock,
 };
 
 pub(super) fn sys_poll(
@@ -21,21 +26,101 @@ pub(super) fn sys_poll(
     timeout: i32,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let timeout = if timeout >= 0 {
+    let end_time = if timeout >= 0 {
         Some(Duration::from_millis(timeout as _))
     } else {
         None
     };
+    let end_time = poll_select_end_time(end_time);
 
-    do_sys_poll(fds, nfds, timeout, ctx)
+    do_restartable_poll(fds, nfds, end_time, ctx).map(SyscallReturn::Return)
 }
 
+/// Polls and continues via `restart_syscall` with the same end time if interrupted.
+//
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/select.c#L1042-L1091>
+fn do_restartable_poll(
+    fds: Vaddr,
+    nfds: u32,
+    end_time: Option<Duration>,
+    ctx: &Context,
+) -> Result<isize> {
+    match do_sys_poll(fds, nfds, end_time, ctx) {
+        Ok(num_revents) => Ok(num_revents as _),
+        Err(err) if err.error() == Errno::ERESTARTNOHAND => {
+            Err(RestartBlock::set(ctx, move |ctx| {
+                do_restartable_poll(fds, nfds, end_time, ctx)
+            }))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Converts a timeout to the end time on the monotonic clock.
+///
+/// A zero timeout is converted to a zero end time, which means not to wait at all.
+//
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/select.c#L271-L286>
+pub(super) fn poll_select_end_time(timeout: Option<Duration>) -> Option<Duration> {
+    timeout.map(|timeout| {
+        if timeout.is_zero() {
+            Duration::ZERO
+        } else {
+            MonotonicClock::get().read_time().saturating_add(timeout)
+        }
+    })
+}
+
+/// Finishes a `poll`-family or `select`-family syscall that has a user-provided timeout.
+///
+/// This restores the saved signal mask unless the syscall is interrupted, and writes the
+/// remaining time back using `write_remaining` if `end_time` is not `None`. If the remaining time
+/// cannot be written back, the interrupted syscall cannot be restarted and returns `EINTR`.
+//
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/select.c#L295-L365>
+pub(super) fn poll_select_finish<T, E>(
+    end_time: Option<Duration>,
+    write_remaining: impl FnOnce(Duration) -> core::result::Result<(), E>,
+    res: Result<T>,
+    ctx: &Context,
+) -> Result<T> {
+    let is_interrupted = res
+        .as_ref()
+        .is_err_and(|err| err.error() == Errno::ERESTARTNOHAND);
+    ctx.restore_saved_sig_mask_unless(is_interrupted);
+
+    let Some(end_time) = end_time else {
+        return res;
+    };
+
+    let is_sticky = Personality::from_bits_truncate(ctx.posix_thread.personality())
+        .contains(Personality::STICKY_TIMEOUTS);
+    if !is_sticky {
+        // No update for zero timeout.
+        if end_time.is_zero() {
+            return res;
+        }
+
+        if write_remaining(remaining_time(end_time)).is_ok() {
+            return res;
+        }
+    }
+
+    if is_interrupted {
+        return_errno_with_message!(Errno::EINTR, "the timeout cannot be updated for restarting");
+    }
+    res
+}
+
+/// Polls the file descriptors until `end_time` on the monotonic clock.
+///
+/// If interrupted by a signal, this method fails with `ERESTARTNOHAND`.
 pub(super) fn do_sys_poll(
     fds: Vaddr,
     nfds: u32,
-    timeout: Option<Duration>,
+    end_time: Option<Duration>,
     ctx: &Context,
-) -> Result<SyscallReturn> {
+) -> Result<usize> {
     if nfds as u64
         > ctx
             .process
@@ -68,6 +153,7 @@ pub(super) fn do_sys_poll(
         poll_fds
     };
 
+    let timeout = end_time.map(remaining_time);
     debug!(
         "poll_fds = {:?}, nfds = {}, timeout = {:?}",
         poll_fds, nfds, timeout
@@ -86,10 +172,19 @@ pub(super) fn do_sys_poll(
         write_addr += size_of::<c_pollfd>();
     }
 
-    let num_revents = result?;
-    Ok(SyscallReturn::Return(num_revents as _))
+    result
 }
 
+/// Returns the remaining time until `end_time` on the monotonic clock.
+pub(super) fn remaining_time(end_time: Duration) -> Duration {
+    end_time.saturating_sub(MonotonicClock::get().read_time())
+}
+
+/// Polls the file descriptors with the timeout.
+///
+/// If interrupted by a signal, this method fails with `ERESTARTNOHAND`.
+//
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/select.c#L936-L939>
 pub(super) fn do_poll(
     poll_fds: &[PollFd],
     timeout: Option<&Duration>,
@@ -116,6 +211,9 @@ pub(super) fn do_poll(
             // We should return zero if the timeout expires
             // before any file descriptors are ready.
             Err(err) if err.error() == Errno::ETIME => return Ok(0),
+            Err(err) if err.error() == Errno::EINTR => {
+                return_errno_with_message!(Errno::ERESTARTNOHAND, "poll is interrupted by a signal")
+            }
             Err(err) => return Err(err),
         };
 

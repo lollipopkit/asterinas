@@ -546,6 +546,10 @@ impl mcontext_t {
     pub(crate) fn fpu_context_addr(&self) -> Vaddr;
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn set_fpu_context_addr(&mut self, addr: Vaddr);
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn set_fpsimd_record(&mut self, record: &[u8]);
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn fpsimd_record(&self, expected_size: usize) -> Result<&[u8]>;
 }
 
 #[repr(C)]

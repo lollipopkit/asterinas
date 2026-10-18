@@ -72,6 +72,7 @@ fi
 ./signal/signal_fd
 ./signal/signalfd_siginfo
 ./signal/signal_test2
+./signal/syscall_restart
 
 if [ "$(uname -m)" = "x86_64" ]; then
     ./signal/fault_signals

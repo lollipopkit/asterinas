@@ -47,28 +47,42 @@ pub(crate) trait SignalContext {
     fn set_arguments(&mut self, sig_num: SigNum, siginfo_addr: usize, ucontext_addr: usize);
 }
 
-/// Handles a pending signal (and pending ptrace traps) for the current process.
-pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
-    if !deliver_pending_signal(user_ctx, ctx) {
-        // No user signal handler runs, so the interrupted syscall is restarted.
-        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/signal.c#L343-L359>
-        if let Some(orig_syscall_ret) = syscall_to_restart(user_ctx, ctx) {
-            restart_syscall(user_ctx, orig_syscall_ret);
-        }
+/// Restarts the interrupted syscall, if any, because no user signal handler runs.
+//
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/signal.c#L343-L359>
+pub(crate) fn restart_interrupted_syscall(user_ctx: &mut UserContext, ctx: &Context) {
+    let Some((errno, orig_syscall_ret)) = syscall_to_restart(user_ctx, ctx) else {
+        return;
+    };
+
+    restart_syscall(user_ctx, ctx, orig_syscall_ret);
+    if errno == Errno::ERESTART_RESTARTBLOCK {
+        user_ctx.set_syscall_num(crate::syscall::SYS_RESTART_SYSCALL as usize);
     }
 }
 
-/// Returns the original syscall return value (i.e., the syscall number on most
-/// architectures) if the current syscall is interrupted and can be restarted.
+/// Returns the restart errno and the original syscall return value (i.e., the syscall number on
+/// x86-64 and the first argument on other architectures) if the current syscall is interrupted
+/// and may be restarted.
 //
 // The check is done after ptrace-stops, so that the tracer can see or change the return value.
-fn syscall_to_restart(user_ctx: &UserContext, ctx: &Context) -> Option<usize> {
-    ctx.thread_local
-        .orig_syscall_ret()
-        .filter(|_| user_ctx.syscall_ret() == -(Errno::ERESTARTSYS as i32) as usize)
+fn syscall_to_restart(user_ctx: &UserContext, ctx: &Context) -> Option<(Errno, usize)> {
+    const RESTART_ERRNOS: [Errno; 4] = [
+        Errno::ERESTARTSYS,
+        Errno::ERESTARTNOINTR,
+        Errno::ERESTARTNOHAND,
+        Errno::ERESTART_RESTARTBLOCK,
+    ];
+
+    let orig_syscall_ret = ctx.thread_local.orig_syscall_ret()?;
+    let syscall_ret = user_ctx.syscall_ret();
+    RESTART_ERRNOS
+        .into_iter()
+        .find(|errno| syscall_ret == -(*errno as i32) as usize)
+        .map(|errno| (errno, orig_syscall_ret))
 }
 
-fn restart_syscall(user_ctx: &mut UserContext, orig_syscall_ret: usize) {
+fn restart_syscall(user_ctx: &mut UserContext, ctx: &Context, orig_syscall_ret: usize) {
     #[cfg(target_arch = "x86_64")]
     const SYSCALL_INSTR_LEN: usize = 2; // syscall
     #[cfg(target_arch = "riscv64")]
@@ -80,13 +94,23 @@ fn restart_syscall(user_ctx: &mut UserContext, orig_syscall_ret: usize) {
 
     user_ctx.set_syscall_ret(orig_syscall_ret);
     user_ctx.set_instruction_pointer(user_ctx.instruction_pointer() - SYSCALL_INSTR_LEN);
+
+    // The restored first argument may look like a restart errno. Forget the syscall so that it
+    // is not restarted again. On x86-64, the restored value is the syscall number, which cannot.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/riscv/kernel/signal.c#L512-L513>
+    #[cfg(not(target_arch = "x86_64"))]
+    ctx.thread_local.set_orig_syscall_ret(None);
+    #[cfg(target_arch = "x86_64")]
+    let _ = ctx;
 }
 
-/// Takes pending ptrace traps and delivers a pending signal.
+/// Handles a pending signal (and pending ptrace traps) for the current process.
 ///
-/// Returns whether a user signal handler is set up (or the thread is exiting),
-/// in which case the interrupted syscall has been handled.
-fn deliver_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> bool {
+/// Returns whether a user signal handler is set up (or the thread is exiting), in which case the
+/// interrupted syscall has been handled. Otherwise, the caller should call
+/// [`restart_interrupted_syscall`] once no more signals are to be handled (e.g., after the
+/// thread is continued from a stop).
+pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> bool {
     // FIXME: This function may handle or suppress only one signal per trap, delaying
     // other pending unmasked signals until the next trap. Consider a looped scan.
     //
@@ -180,11 +204,16 @@ fn deliver_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> bool {
                 sig_dispositions.reset_handler(sig_num);
             }
 
-            if let Some(orig_syscall_ret) = syscall_to_restart(user_ctx, ctx) {
-                if flags.contains(SigActionFlags::SA_RESTART) {
-                    restart_syscall(user_ctx, orig_syscall_ret);
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/signal.c#L263-L283>
+            if let Some((errno, orig_syscall_ret)) = syscall_to_restart(user_ctx, ctx) {
+                let should_restart = match errno {
+                    Errno::ERESTARTNOINTR => true,
+                    Errno::ERESTARTSYS => flags.contains(SigActionFlags::SA_RESTART),
+                    _ => false,
+                };
+                if should_restart {
+                    restart_syscall(user_ctx, ctx, orig_syscall_ret);
                 } else {
-                    // We should never return `ERESTARTSYS` to the userspace.
                     user_ctx.set_syscall_ret(-(Errno::EINTR as i32) as usize);
                 }
             }
@@ -436,7 +465,16 @@ pub(crate) fn handle_user_signal(
             );
             let fpu_context_addr = (ucontext_addr as usize) + size_of::<ucontext_t>();
         }
-        any(target_arch = "loongarch64", target_arch = "aarch64") => {
+        target_arch = "aarch64" => {
+            // The FP/SIMD state is a record in the reserved area of `uc_mcontext`.
+            ucontext.uc_mcontext.set_fpsimd_record(fpu_context_bytes);
+            let ucontext_addr = alloc_aligned_in_user_stack(
+                stack_pointer,
+                size_of::<ucontext_t>(),
+                align_of::<ucontext_t>(),
+            );
+        }
+        target_arch = "loongarch64" => {
             // FIXME: Allocate the FPU context.
             // Example: <https://elixir.bootlin.com/linux/v6.15.7/source/arch/loongarch/kernel/signal.c#L848>
             let ucontext_addr = alloc_aligned_in_user_stack(
@@ -453,6 +491,7 @@ pub(crate) fn handle_user_signal(
         }
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     user_space.write_bytes(fpu_context_addr as _, fpu_context_bytes)?;
     user_space.write_val(ucontext_addr as _, &ucontext)?;
 

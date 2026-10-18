@@ -6,7 +6,7 @@ use ostd::mm::VmIo;
 
 use super::{
     SyscallReturn,
-    poll::{PollFd, do_poll},
+    poll::{PollFd, do_poll, poll_select_end_time, poll_select_finish, remaining_time},
 };
 use crate::{
     events::IoEvents,
@@ -23,34 +23,42 @@ pub(super) fn sys_select(
     timeval_addr: Vaddr,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let timeout = if timeval_addr == 0 {
+    let user_space = ctx.user_space();
+
+    let end_time = if timeval_addr == 0 {
         None
     } else {
-        let timeval = ctx
-            .user_space()
-            .read_val::<timeval_t>(timeval_addr)?
-            .normalize();
-        Some(Duration::try_from(timeval)?)
+        let timeval = user_space.read_val::<timeval_t>(timeval_addr)?.normalize();
+        poll_select_end_time(Some(Duration::try_from(timeval)?))
     };
 
-    do_sys_select(
+    let res = do_sys_select(
         nfds,
         readfds_addr,
         writefds_addr,
         exceptfds_addr,
-        timeout,
+        end_time,
         ctx,
-    )
+    );
+
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/select.c#L700-L731>
+    let write_remaining =
+        |remaining: Duration| user_space.write_val(timeval_addr, &timeval_t::from(remaining));
+    let num_revents = poll_select_finish(end_time, write_remaining, res, ctx)?;
+    Ok(SyscallReturn::Return(num_revents as _))
 }
 
+/// Selects the file descriptors until `end_time` on the monotonic clock.
+///
+/// If interrupted by a signal, this method fails with `ERESTARTNOHAND`.
 pub(super) fn do_sys_select(
     nfds: RawFileDesc,
     readfds_addr: Vaddr,
     writefds_addr: Vaddr,
     exceptfds_addr: Vaddr,
-    timeout: Option<Duration>,
+    end_time: Option<Duration>,
     ctx: &Context,
-) -> Result<SyscallReturn> {
+) -> Result<usize> {
     if nfds < 0 || nfds as usize > FD_SETSIZE {
         return_errno_with_message!(Errno::EINVAL, "nfds is negative or exceeds the FD_SETSIZE");
     }
@@ -69,6 +77,7 @@ pub(super) fn do_sys_select(
     let mut writefds = get_fdset(writefds_addr)?;
     let mut exceptfds = get_fdset(exceptfds_addr)?;
 
+    let timeout = end_time.map(remaining_time);
     debug!(
         "nfds = {}, readfds = {:?}, writefds = {:?}, exceptfds = {:?}, timeout = {:?}",
         nfds, readfds, writefds, exceptfds, timeout
@@ -83,11 +92,6 @@ pub(super) fn do_sys_select(
         ctx,
     )?;
 
-    // FIXME: The Linux select() and pselect6() system call
-    // modifies its timeout argument to reflect the amount of time not slept.
-    // However, the glibc wrapper function hides this behavior.
-    // Maybe we should follow the Linux behavior.
-
     let set_fdset = |fdset_addr: Vaddr, fdset: Option<FdSet>| -> Result<()> {
         if let Some(fdset) = fdset {
             debug_assert!(fdset_addr != 0);
@@ -99,7 +103,7 @@ pub(super) fn do_sys_select(
     set_fdset(writefds_addr, writefds)?;
     set_fdset(exceptfds_addr, exceptfds)?;
 
-    Ok(SyscallReturn::Return(num_revents as _))
+    Ok(num_revents)
 }
 
 fn do_select(

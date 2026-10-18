@@ -151,7 +151,14 @@ pub enum Errno {
 
     EHWPOISON = 133, /* Memory page has hardware error */
 
-    ERESTARTSYS = 512, /* Restart of an interrupted system call. For kernel internal use only. */
+    // Kernel-internal errnos that are never left for user space to see.
+    // Tracers can still observe them at syscall-exit-stops.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/errno.h#L8-L18>
+    ERESTARTSYS = 512, /* Restart the syscall if no handler runs or the handler has SA_RESTART */
+    ERESTARTNOINTR = 513, /* Always restart the syscall */
+    ERESTARTNOHAND = 514, /* Restart the syscall if no handler runs */
+    #[expect(non_camel_case_types)]
+    ERESTART_RESTARTBLOCK = 516, /* Restart via `restart_syscall` if no handler runs */
 }
 
 /// error used in this crate
