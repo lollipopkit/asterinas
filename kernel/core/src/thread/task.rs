@@ -98,11 +98,18 @@ pub(crate) fn create_new_user_task(
                 }
 
                 // The trap is taken in `handle_pending_signal`.
-                is_handled |= handle_pending_signal(user_ctx, &ctx);
+                let has_handler = handle_pending_signal(user_ctx, &ctx);
+                is_handled |= has_handler;
 
-                if current_thread.is_exited()
-                    || (!ctx.posix_thread.ptrace_has_pending_trap() && !is_group_stopped())
-                {
+                if current_thread.is_exited() {
+                    break;
+                }
+                // As Linux, signal frames are set up until no signal with a handler is pending.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/entry/common.c#L49-L66>
+                if has_handler {
+                    continue;
+                }
+                if !ctx.posix_thread.ptrace_has_pending_trap() && !is_group_stopped() {
                     break;
                 }
             }
