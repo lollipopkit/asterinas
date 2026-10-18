@@ -139,15 +139,30 @@ impl StopStatus {
     ///
     /// Each thread in `threads` is paired with whether it should participate in the group stop.
     /// The group stop completes when all the participating threads have called
-    /// [`Self::participate`].
+    /// [`Self::participate`]. Returns whether the group stop starts.
     ///
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2643-L2696>
     pub(super) fn stop<'a>(
         &self,
         sig_num: SigNum,
         threads: impl Iterator<Item = (&'a PosixThread, bool)>,
-    ) {
+    ) -> bool {
         let mut group_stop = self.group_stop.lock();
+
+        let mut count = 0;
+        for (thread, participates) in threads {
+            thread
+                .group_stop_pending()
+                .store(participates, Ordering::Relaxed);
+            if participates {
+                count += 1;
+            }
+        }
+        // If every thread is exiting or will be killed, no group stop starts, like Linux, where
+        // no thread can get `JOBCTL_STOP_PENDING`.
+        if count == 0 {
+            return false;
+        }
 
         // A traced thread may initiate a new group stop when the previous one has completed. Do
         // not report the new one to the real parent in such case.
@@ -156,16 +171,9 @@ impl StopStatus {
         }
         group_stop.signal = Some(sig_num);
         self.is_stopped.store(true, Ordering::Relaxed);
+        group_stop.count = count;
 
-        group_stop.count = 0;
-        for (thread, participates) in threads {
-            thread
-                .group_stop_pending()
-                .store(participates, Ordering::Relaxed);
-            if participates {
-                group_stop.count += 1;
-            }
-        }
+        true
     }
 
     /// Makes `thread` participate in the group stop in progress, if it has yet to.

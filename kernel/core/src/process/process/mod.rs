@@ -861,10 +861,15 @@ impl Process {
                 (posix_thread, participates)
             })
             .collect::<Vec<_>>();
-        self.status.stop_status().stop(sig_num, threads.into_iter());
+        if !self.status.stop_status().stop(sig_num, threads.into_iter()) {
+            return;
+        }
 
         for task in tasks.as_slice() {
             let posix_thread = task.as_posix_thread().unwrap();
+            if !posix_thread.group_stop_pending().load(Ordering::Relaxed) {
+                continue;
+            }
             posix_thread.ptrace_notify_group_stop(sig_num);
             posix_thread.wake_signalled_waker();
         }
