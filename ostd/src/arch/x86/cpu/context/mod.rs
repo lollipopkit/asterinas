@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use core::arch::x86_64::{_fxrstor64, _fxsave64, _xrstor64, _xsave64};
 
 use bitflags::bitflags;
-use ostd_pod::{FromZeros, IntoBytes};
+use ostd_pod::{FromZeros, IntoBytes, Pod};
 use spin::Once;
 use x86::bits64::segmentation::{rdfsbase, rdgsbase, swapgs, wrfsbase, wrgsbase};
 use x86_64::registers::{
@@ -586,6 +586,10 @@ cpu_context_impl_getter_setter!(
 /// The FPU context of user task.
 ///
 /// This could be used for saving both legacy and modern state format.
+///
+/// The context always holds a state that the CPU accepts, so loading it never faults. A state
+/// supplied by user space must be validated with [`FpuContext::try_from_fxsave_image`] or
+/// [`FpuContext::try_from_xsave_image`].
 #[derive(Debug)]
 pub struct FpuContext {
     xsave_area: Box<XSaveArea>,
@@ -639,10 +643,104 @@ impl FpuContext {
         &self.xsave_area.as_bytes()[..self.area_size]
     }
 
-    /// Returns the FPU context as a mutable byte slice.
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.xsave_area.as_mut_bytes()[..self.area_size]
     }
+
+    /// Returns the size in bytes of the FPU context, i.e., the length of [`Self::as_bytes`].
+    ///
+    /// The FPU context is in the standard XSAVE format if the size is larger than
+    /// [`FXSAVE_AREA_SIZE`]. Otherwise, it is in the legacy FXSAVE format.
+    pub fn size() -> usize {
+        XSAVE_AREA_SIZE.get().copied().unwrap_or(FXSAVE_AREA_SIZE)
+    }
+
+    /// Returns the XSTATE features that the FPU context holds.
+    pub fn user_features() -> u64 {
+        XSTATE_USER_FEATURES
+            .get()
+            .copied()
+            .unwrap_or(XFEATURE_MASK_FPSSE)
+    }
+
+    /// Creates an FPU context from a legacy FXSAVE image, initializing the other states.
+    ///
+    /// This fails if the image would make `FXRSTOR` fault.
+    pub fn try_from_fxsave_image(
+        image: &[u8; FXSAVE_AREA_SIZE],
+    ) -> Result<Self, InvalidFpuStateError> {
+        let fxsave_area = FxSaveArea::from_bytes(image);
+        check_mxcsr(fxsave_area.mxcsr)?;
+
+        let mut context = Self::new();
+        context.xsave_area.fxsave_area = fxsave_area;
+        if XSAVE_AREA_SIZE.is_completed() {
+            context.xsave_area.features = XFEATURE_MASK_FPSSE & Self::user_features();
+        }
+        Ok(context)
+    }
+
+    /// Creates an FPU context from a standard-format XSAVE image of [`Self::size`] bytes.
+    ///
+    /// Only the states in `features` are taken from the image, and the other states are
+    /// initialized, as `XRSTOR` with `features` as the requested-feature bitmap followed by
+    /// initializing the remaining states does.
+    ///
+    /// This fails if the image would make `XRSTOR` fault, i.e., if the MXCSR has reserved bits
+    /// set, if `XSTATE_BV` has features that are not enabled, or if the rest of the XSAVE header
+    /// (including `XCOMP_BV`) is not zero.
+    //
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/fpu/signal.c#L243-L263>,
+    // <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/fpu/xstate.c#L431-L453>
+    pub fn try_from_xsave_image(image: &[u8], features: u64) -> Result<Self, InvalidFpuStateError> {
+        if !XSAVE_AREA_SIZE.is_completed() || image.len() != Self::size() {
+            return Err(InvalidFpuStateError);
+        }
+
+        let mut context = Self::new();
+        context.as_bytes_mut().copy_from_slice(image);
+
+        let area = &mut context.xsave_area;
+        let user_features = Self::user_features();
+        if area.features & !user_features != 0 || area.compaction != 0 || area.reserved != [0; 6] {
+            return Err(InvalidFpuStateError);
+        }
+        // `XRSTOR` loads the MXCSR if the SSE or AVX state is requested.
+        if features & XFEATURE_MASK_SSE_AVX != 0 {
+            check_mxcsr(area.fxsave_area.mxcsr)?;
+        }
+
+        let features = features & user_features;
+        area.features &= features;
+        // Initializing the SSE or AVX state also initializes the MXCSR.
+        if user_features & !features & XFEATURE_MASK_SSE_AVX != 0 {
+            area.fxsave_area.mxcsr = MXCSR_DEFAULT;
+        }
+        Ok(context)
+    }
+}
+
+/// An error indicating that an FPU state image is invalid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidFpuStateError;
+
+/// The size in bytes of the legacy FXSAVE area.
+pub const FXSAVE_AREA_SIZE: usize = size_of::<FxSaveArea>();
+
+/// Checks that the MXCSR has no reserved bits set, which would make `FXRSTOR`/`XRSTOR` fault.
+//
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/fpu/xstate.c#L1342-L1344>
+fn check_mxcsr(mxcsr: u32) -> Result<(), InvalidFpuStateError> {
+    if mxcsr
+        & !MXCSR_FEATURE_MASK
+            .get()
+            .copied()
+            .unwrap_or(MXCSR_DEFAULT_MASK)
+        != 0
+    {
+        return Err(InvalidFpuStateError);
+    }
+    Ok(())
 }
 
 impl Default for FpuContext {
@@ -701,7 +799,7 @@ impl XSaveArea {
         // tag-word semantics). The `fninit` instruction clears all x87 registers, so the
         // abridged tag must be initialized to 0 to represent an empty register set.
         xsave_area.fxsave_area.tag = 0;
-        xsave_area.fxsave_area.mxcsr = 0x1F80;
+        xsave_area.fxsave_area.mxcsr = MXCSR_DEFAULT;
         xsave_area.features = features;
 
         xsave_area
@@ -738,8 +836,26 @@ static XSTATE_MAX_FEATURES: Once<u64> = Once::new();
 /// X87 | SSE | AVX | OPMASK | ZMM_HI256 | HI16_ZMM
 const XFEATURE_MASK_USER_RESTORE: u64 = 0b1110_0111;
 
-/// The real size in bytes of the XSAVE area containing all states enabled by XCRO | IA32_XSS.
+/// The XSTATE features saved and restored for user space.
+static XSTATE_USER_FEATURES: Once<u64> = Once::new();
+
+/// X87 | SSE
+const XFEATURE_MASK_FPSSE: u64 = 0b11;
+
+/// SSE | AVX
+const XFEATURE_MASK_SSE_AVX: u64 = 0b110;
+
+/// The size in bytes of the standard-format XSAVE area containing all states enabled by `XCR0`.
 static XSAVE_AREA_SIZE: Once<usize> = Once::new();
+
+/// The initial value of the MXCSR.
+const MXCSR_DEFAULT: u32 = 0x1F80;
+
+/// The MXCSR bits that can be set without faulting.
+static MXCSR_FEATURE_MASK: Once<u32> = Once::new();
+
+/// The MXCSR feature mask if the processor reports none.
+const MXCSR_DEFAULT_MASK: u32 = 0xFFBF;
 
 /// The max size in bytes of the XSAVE area.
 const MAX_XSAVE_AREA_SIZE: usize = 4096;
@@ -749,6 +865,7 @@ pub(in crate::arch) fn enable_essential_features() {
 
     if has_extensions(IsaExtensions::XSAVE) {
         XSTATE_MAX_FEATURES.call_once(|| super::cpuid::query_xstate_max_features().unwrap());
+        XSTATE_USER_FEATURES.call_once(|| XCr0::read().bits() & XFEATURE_MASK_USER_RESTORE);
         XSAVE_AREA_SIZE.call_once(|| {
             let xsave_area_size = super::cpuid::query_xsave_area_size().unwrap() as usize;
             assert!(xsave_area_size <= MAX_XSAVE_AREA_SIZE);
@@ -768,4 +885,15 @@ pub(in crate::arch) fn enable_essential_features() {
             core::arch::asm!("fninit");
         }
     }
+
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/fpu/init.c#L96-L117>
+    MXCSR_FEATURE_MASK.call_once(|| {
+        let mut fxsave_area = FxSaveArea::new_zeroed();
+        // SAFETY: The FXSAVE area is valid and aligned to 16 bytes.
+        unsafe { _fxsave64(fxsave_area.as_mut_bytes().as_mut_ptr()) };
+        match fxsave_area.mxcsr_mask {
+            0 => MXCSR_DEFAULT_MASK,
+            mask => mask,
+        }
+    });
 }

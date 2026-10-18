@@ -8,13 +8,7 @@ use ostd::{arch::cpu::context::UserContext, task::Task};
 
 use crate::{
     prelude::*,
-    process::{
-        posix_thread::ContextPthreadAdminApi,
-        signal::{
-            sig_action::SigHandler,
-            signals::{Signal, fault::FaultSignal},
-        },
-    },
+    process::signal::{force_signal, signals::fault::FaultSignal},
     thread::kernel_thread::AsKernelThread,
     vm::vmar::{PageFaultInfo, Vmar},
 };
@@ -68,29 +62,13 @@ pub(crate) trait ToFaultSignal {
 
 /// Generates a fault signal for the current thread.
 ///
-/// The fault signal is forced: if it is blocked or ignored, it is unblocked and its disposition is
-/// reset to the default. Otherwise, the thread would return to the faulting instruction and fault
-/// again forever.
-///
-/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/signal.c#L1294-L1312>
+/// The fault signal is forced. Otherwise, the thread would return to the faulting instruction and
+/// fault again forever.
 fn generate_fault_signal(exception: CpuException, ctx: &Context, user_ctx: &UserContext) {
     let Some(signal) = exception.to_fault_signal(user_ctx) else {
         panic!("`{:?}` cannot be handled via signals", exception);
     };
-    let sig_num = signal.num();
-
-    let sig_dispositions = ctx.process.sig_dispositions().lock();
-    let mut sig_dispositions = sig_dispositions.lock();
-
-    let is_blocked = ctx.posix_thread.has_signal_blocked(sig_num);
-    if is_blocked || sig_dispositions.get(sig_num).handler == SigHandler::Ign {
-        sig_dispositions.reset_handler(sig_num);
-    }
-    if is_blocked {
-        ctx.set_sig_mask(ctx.posix_thread.sig_mask() - sig_num);
-    }
-
-    ctx.posix_thread.enqueue_signal(Box::new(signal));
+    force_signal(ctx, signal);
 }
 
 pub(super) fn page_fault_handler(info: &CpuException) -> Result<(), ()> {

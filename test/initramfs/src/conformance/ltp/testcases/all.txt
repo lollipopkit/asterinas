@@ -1568,7 +1568,7 @@ signal02
 signal03
 signal04
 signal05
-# signal06
+signal06
 
 signalfd01
 signalfd02

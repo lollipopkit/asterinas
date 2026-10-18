@@ -5,6 +5,7 @@ C_OBJS_FILTER += \
 	fault_signals \
 	sigaltstack \
 	signal_fpu \
+	signal_frame_fault \
 	signal_rflags_df \
 	signal_test \
 	sigtrap

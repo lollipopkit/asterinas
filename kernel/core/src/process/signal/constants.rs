@@ -108,6 +108,7 @@ pub(crate) const SEGV_MAPERR: i32 = 1;
 pub(crate) const SEGV_ACCERR: i32 = 2;
 pub(crate) const SEGV_BNDERR: i32 = 3;
 pub(crate) const SEGV_PKUERR: i32 = 4;
+pub(crate) const SEGV_CPERR: i32 = 10;
 
 pub(crate) const BUS_ADRALN: i32 = 1;
 pub(crate) const BUS_ADRERR: i32 = 2;
