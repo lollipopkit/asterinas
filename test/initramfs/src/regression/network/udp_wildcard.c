@@ -416,6 +416,28 @@ FN_TEST(connect_any)
 }
 END_TEST()
 
+FN_TEST(send_confirm)
+{
+	struct sockaddr_in addr = any_addr;
+	struct sockaddr_in sender_addr = loopback_addr;
+	struct sockaddr_in to;
+	int sk, sender;
+
+	sk = new_bound_udp_socket(&addr, 0);
+	sender = new_bound_udp_socket(&sender_addr, 0);
+	to = with_port(loopback_addr, addr.sin_port);
+
+	// `MSG_CONFIRM` only confirms the next hop, and the datagram is sent as usual.
+	TEST_RES(sendto(sender, "a", 1, MSG_CONFIRM, (struct sockaddr *)&to,
+			sizeof(to)),
+		 _ret == 1);
+	RECV_FROM(sk, sender_addr, 'a');
+
+	TEST_SUCC(close(sender));
+	TEST_SUCC(close(sk));
+}
+END_TEST()
+
 FN_TEST(auto_bind_any)
 {
 	struct sockaddr_in name, local_addr;

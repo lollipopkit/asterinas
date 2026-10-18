@@ -7,6 +7,7 @@ use alloc::{
 use core::{
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use aster_softirq::BottomHalfDisabled;
@@ -42,6 +43,9 @@ pub struct TcpConnectionInner<E: Ext> {
     socket: SpinLock<RawTcpSocketExt<E>, BottomHalfDisabled>,
     poll_key: PollKey,
     connection_key: ConnectionKey,
+    /// Whether the next outgoing packet should confirm that the next hop is reachable, like
+    /// `sk->sk_dst_pending_confirm` in Linux.
+    pending_confirm: AtomicBool,
 }
 
 pub struct RawTcpSocketExt<E: Ext> {
@@ -245,6 +249,7 @@ impl<E: Ext> TcpConnectionInner<E> {
             socket: SpinLock::new(socket_ext),
             poll_key,
             connection_key,
+            pending_confirm: AtomicBool::new(false),
         }
     }
 
@@ -710,6 +715,51 @@ impl<E: Ext> TcpConnectionBg<E> {
     pub(crate) const fn connection_key(&self) -> &ConnectionKey {
         &self.inner.connection_key
     }
+
+    /// Returns and clears whether the next outgoing packet should confirm the next hop.
+    pub(crate) fn take_pending_confirm(&self) -> bool {
+        self.inner.pending_confirm.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Returns whether processing an incoming segment acknowledges something new.
+///
+/// This is `FLAG_FORWARD_PROGRESS` in Linux, which confirms that the peer is reachable. Here, new
+/// data are acknowledged if the send queue becomes shorter, and our SYN or FIN is acknowledged if
+/// the state changes accordingly.
+///
+/// TODO: Linux also confirms the peer on duplicate ACKs (i.e., ACKs that acknowledge nothing new
+/// and carry no data or window updates), but smoltcp does not expose `snd_una` to distinguish
+/// them from old ACKs and window updates.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp_input.c#L4432-L4433>
+fn is_forward_progress(
+    old_state: State,
+    new_state: State,
+    old_send_queue: usize,
+    new_send_queue: usize,
+    is_rst: bool,
+) -> bool {
+    if is_rst {
+        return false;
+    }
+
+    if new_send_queue < old_send_queue {
+        return true;
+    }
+
+    match (old_state, new_state) {
+        // Our SYN is acknowledged.
+        (State::SynSent | State::SynReceived, new_state) => !matches!(
+            new_state,
+            State::Closed | State::Listen | State::SynSent | State::SynReceived
+        ),
+        // Our FIN is acknowledged.
+        (State::FinWait1, State::FinWait2 | State::TimeWait)
+        | (State::Closing, State::TimeWait)
+        | (State::LastAck, State::Closed) => true,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -772,6 +822,7 @@ impl<E: Ext> TcpConnectionBg<E> {
 
         let old_state = socket.state();
         let old_recv_queue = socket.recv_queue();
+        let old_send_queue = socket.send_queue();
         let is_rst = tcp_repr.control == TcpControl::Rst;
         // For TCP, receiving an ACK packet can free up space in the queue, allowing more packets
         // to be queued.
@@ -781,6 +832,18 @@ impl<E: Ext> TcpConnectionBg<E> {
             None => TcpProcessResult::Processed,
             Some((ip_repr, tcp_repr)) => TcpProcessResult::ProcessedWithReply(ip_repr, tcp_repr),
         };
+
+        // Like Linux, the confirmation is sent with the next packet of the connection.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/net/sock.h#L2283-L2287>
+        if is_forward_progress(
+            old_state,
+            socket.state(),
+            old_send_queue,
+            socket.send_queue(),
+            is_rst,
+        ) {
+            self.inner.pending_confirm.store(true, Ordering::Relaxed);
+        }
 
         let (state_events, became_dead) =
             socket.check_state(self, old_state, old_recv_queue, is_rst);
@@ -845,5 +908,53 @@ impl<E: Ext> TcpConnectionBg<E> {
         iface.update_next_poll_at_ms(self, poll_at);
 
         (reply, became_dead)
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn forward_progress() {
+        use State::*;
+
+        // New data are acknowledged.
+        assert!(is_forward_progress(
+            Established,
+            Established,
+            100,
+            50,
+            false
+        ));
+        // Nothing new is acknowledged.
+        assert!(!is_forward_progress(
+            Established,
+            Established,
+            100,
+            100,
+            false
+        ));
+        assert!(!is_forward_progress(Established, CloseWait, 0, 0, false));
+
+        // Our SYN is acknowledged.
+        assert!(is_forward_progress(SynSent, Established, 0, 0, false));
+        assert!(is_forward_progress(SynReceived, Established, 0, 0, false));
+        assert!(is_forward_progress(SynReceived, CloseWait, 0, 0, false));
+        assert!(!is_forward_progress(SynSent, SynReceived, 0, 0, false));
+        assert!(!is_forward_progress(SynSent, Closed, 0, 0, false));
+
+        // Our FIN is acknowledged.
+        assert!(is_forward_progress(FinWait1, FinWait2, 0, 0, false));
+        assert!(is_forward_progress(FinWait1, TimeWait, 0, 0, false));
+        assert!(is_forward_progress(Closing, TimeWait, 0, 0, false));
+        assert!(is_forward_progress(LastAck, Closed, 0, 0, false));
+        assert!(!is_forward_progress(FinWait1, Closing, 0, 0, false));
+
+        // A reset acknowledges nothing.
+        assert!(!is_forward_progress(LastAck, Closed, 0, 0, true));
+        assert!(!is_forward_progress(Established, Closed, 100, 0, true));
     }
 }

@@ -424,6 +424,7 @@ impl<E: Ext> PollContext<'_, E> {
         Some(TxPacketWithDst {
             packet,
             dst_addr: reply_ip_repr.dst_addr(),
+            confirm_neighbor: false,
         })
     }
 
@@ -442,6 +443,7 @@ impl<E: Ext> PollContext<'_, E> {
         Some(TxPacketWithDst {
             packet,
             dst_addr: ip_repr.dst_addr(),
+            confirm_neighbor: false,
         })
     }
 
@@ -464,7 +466,11 @@ impl<E: Ext> PollContext<'_, E> {
             dst_addr = IpAddress::Ipv4(Ipv4Address::BROADCAST);
         }
 
-        Some(TxPacketWithDst { packet, dst_addr })
+        Some(TxPacketWithDst {
+            packet,
+            dst_addr,
+            confirm_neighbor: false,
+        })
     }
 
     fn copy_payload(phy: &dyn PollPhy, payload: &[u8]) -> Option<TxPacket<ApplicationLayer>> {
@@ -561,6 +567,10 @@ impl<E: Ext> PollContext<'_, E> {
                     None
                 });
 
+            if let Some(packet) = tx_packet.as_mut() {
+                packet.confirm_neighbor = socket.take_pending_confirm();
+            }
+
             if *became_dead {
                 self.actions
                     .push(SocketTableAction::DelTcpConn(*socket.connection_key()));
@@ -643,6 +653,10 @@ impl<E: Ext> PollContext<'_, E> {
                 // the payload and call `process_udp` after releasing the socket lock.
                 deferred = Some((ip_repr.clone(), *udp_repr, udp_payload.to_vec()));
             });
+
+            if let Some(packet) = tx_packet.as_mut() {
+                packet.confirm_neighbor = socket.take_pending_confirm();
+            }
 
             if let Some((ip_repr, udp_repr, payload)) = deferred {
                 let _ =

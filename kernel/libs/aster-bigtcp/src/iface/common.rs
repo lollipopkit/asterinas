@@ -51,6 +51,9 @@ pub struct IfaceCommon<E: Ext> {
 pub(super) struct TxPacketWithDst {
     pub(super) packet: TxPacket<NetworkLayer>,
     pub(super) dst_addr: IpAddress,
+    /// Whether the packet confirms that the next hop is reachable, like
+    /// `skb->dst_pending_confirm` in Linux.
+    pub(super) confirm_neighbor: bool,
 }
 
 pub(super) enum PhyProcessResult {

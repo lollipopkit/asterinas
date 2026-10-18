@@ -206,7 +206,7 @@ impl BoundDatagram {
         &self,
         reader: &mut dyn MultiRead,
         remote: &IpEndpoint,
-        _flags: SendFlags,
+        flags: SendFlags,
     ) -> Result<(usize, &Arc<Iface>)> {
         let len = reader.sum_lens();
         if len > MAX_UDP_PAYLOAD_LEN {
@@ -220,9 +220,15 @@ impl BoundDatagram {
         let mut data = vec![0u8; len];
         reader.read(&mut VmWriter::from(data.as_mut_slice()))?;
 
-        let result = bound_socket.send(len, *remote, source_addr, |socket_buffer| {
-            socket_buffer.copy_from_slice(&data)
-        });
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/ip_output.c#L1195-L1196>
+        let confirm_neighbor = flags.contains(SendFlags::MSG_CONFIRM);
+        let result = bound_socket.send(
+            len,
+            *remote,
+            source_addr,
+            confirm_neighbor,
+            |socket_buffer| socket_buffer.copy_from_slice(&data),
+        );
 
         match result {
             Ok(()) => Ok((len, bound_socket.iface())),

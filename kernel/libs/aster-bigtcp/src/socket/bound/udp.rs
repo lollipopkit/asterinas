@@ -34,6 +34,8 @@ pub struct UdpSocketInner {
     socket: SpinLock<Box<RawUdpSocket>, BottomHalfDisabled>,
     recv_queue: Arc<UdpRecvQueue>,
     need_dispatch: AtomicBool,
+    /// Whether the next outgoing packet should confirm that the next hop is reachable.
+    pending_confirm: AtomicBool,
     connection: SpinLock<Option<UdpConnection>, BottomHalfDisabled>,
 }
 
@@ -225,6 +227,11 @@ impl<E: Ext> UdpSocketBg<E> {
     pub(crate) fn need_dispatch(&self) -> bool {
         self.inner.need_dispatch.load(Ordering::Relaxed)
     }
+
+    /// Returns and clears whether the next outgoing packet should confirm the next hop.
+    pub(crate) fn take_pending_confirm(&self) -> bool {
+        self.inner.pending_confirm.swap(false, Ordering::Relaxed)
+    }
 }
 
 impl<E: Ext> UdpSocket<E> {
@@ -270,6 +277,7 @@ impl<E: Ext> UdpSocket<E> {
             socket: SpinLock::new(socket),
             recv_queue,
             need_dispatch: AtomicBool::new(false),
+            pending_confirm: AtomicBool::new(false),
             connection: SpinLock::new(None),
         };
 
@@ -317,12 +325,16 @@ impl<E: Ext> UdpSocket<E> {
     /// If `source_addr` is `None`, the address that the socket is bound at is used as the source
     /// address. It must not be `None` if the socket is bound at the unspecified address.
     ///
+    /// If `confirm_neighbor` is true, the next outgoing packet confirms that the next hop is
+    /// reachable, which is what `MSG_CONFIRM` does in Linux.
+    ///
     /// Polling the iface is _always_ required after this method succeeds.
     pub fn send<F, R>(
         &self,
         size: usize,
         remote_endpoint: IpEndpoint,
         source_addr: Option<IpAddress>,
+        confirm_neighbor: bool,
         f: F,
     ) -> Result<R, SendError>
     where
@@ -342,6 +354,10 @@ impl<E: Ext> UdpSocket<E> {
         };
         let buffer = socket.send(size, meta)?;
         let result = f(buffer);
+
+        if confirm_neighbor {
+            self.0.inner.pending_confirm.store(true, Ordering::Relaxed);
+        }
 
         self.0
             .inner
