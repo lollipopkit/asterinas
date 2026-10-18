@@ -112,24 +112,25 @@ impl UdpRecvQueue {
     ///
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L1677-L1695>
     fn enqueue(&self, ip_repr: &IpRepr, udp_repr: &UdpRepr, udp_payload: PacketSlice<'_>) {
-        let meta = UdpMetadata {
-            endpoint: IpEndpoint::new(ip_repr.src_addr(), udp_repr.src_port),
-            local_address: Some(ip_repr.dst_addr()),
-            meta: Default::default(),
-        };
-        // The datagram is copied without holding the lock.
-        let mut data = vec![0u8; udp_payload.len()].into_boxed_slice();
-        udp_payload.copy_to_slice(&mut data);
-
         let recv_buf = self.recv_buf.load(Ordering::Relaxed);
-        let truesize = datagram_truesize(data.len());
+        let truesize = datagram_truesize(udp_payload.len());
 
+        // The limit is checked before the datagram is copied, so that dropped datagrams are never
+        // allocated. The lock is held until the datagram is queued to keep the arrival order.
         let mut inner = self.inner.lock();
         if inner.mem_alloc + truesize > recv_buf
             && (recv_buf > (i32::MAX >> 1) as usize || inner.mem_alloc != 0)
         {
             return;
         }
+
+        let meta = UdpMetadata {
+            endpoint: IpEndpoint::new(ip_repr.src_addr(), udp_repr.src_port),
+            local_address: Some(ip_repr.dst_addr()),
+            meta: Default::default(),
+        };
+        let mut data = vec![0u8; udp_payload.len()].into_boxed_slice();
+        udp_payload.copy_to_slice(&mut data);
 
         inner.mem_alloc += truesize;
         inner.datagrams.push_back((meta, data));
