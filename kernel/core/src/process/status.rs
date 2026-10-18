@@ -2,6 +2,7 @@
 
 //! The process status.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use ostd::sync::SpinLock;
@@ -147,21 +148,20 @@ impl StopStatus {
         sig_num: SigNum,
         threads: impl Iterator<Item = (&'a PosixThread, bool)>,
     ) -> bool {
-        let mut group_stop = self.group_stop.lock();
+        // If every thread is exiting or will be killed, no group stop starts and the state of
+        // any group stop in progress is kept, like Linux, where no thread can get
+        // `JOBCTL_STOP_PENDING`.
+        let threads = threads.collect::<Vec<_>>();
+        let count = threads.iter().filter(|(_, participates)| *participates).count();
+        if count == 0 {
+            return false;
+        }
 
-        let mut count = 0;
+        let mut group_stop = self.group_stop.lock();
         for (thread, participates) in threads {
             thread
                 .group_stop_pending()
                 .store(participates, Ordering::Relaxed);
-            if participates {
-                count += 1;
-            }
-        }
-        // If every thread is exiting or will be killed, no group stop starts, like Linux, where
-        // no thread can get `JOBCTL_STOP_PENDING`.
-        if count == 0 {
-            return false;
         }
 
         // A traced thread may initiate a new group stop when the previous one has completed. Do

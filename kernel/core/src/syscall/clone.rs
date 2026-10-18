@@ -97,7 +97,14 @@ impl TryFrom<Clone3Args> for CloneArgs {
         // This checks arguments only for the `clone3()` system call.
         // Reference: <https://elixir.bootlin.com/linux/v6.16.9/source/kernel/fork.c#L2843-L2869>.
 
-        let flags = CloneFlags::from_bits(value.flags as u32)
+        // TODO: Support the `clone3`-only flags above bit 31 (`CLONE_CLEAR_SIGHAND`,
+        // `CLONE_INTO_CGROUP`, etc.). They are rejected rather than silently ignored.
+        //
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2992-L3010>
+        let flags = u32::try_from(value.flags)
+            .ok()
+            .and_then(CloneFlags::from_bits)
+            .filter(|flags| !flags.contains(CloneFlags::CLONE_DETACHED))
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clone flags"))?;
         let exit_signal = SigNum::try_from_raw(value.exit_signal)
             .map_err(|_| Error::with_message(Errno::EINVAL, "invalid exit signal"))?;
