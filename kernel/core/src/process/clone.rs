@@ -130,10 +130,8 @@ impl CloneArgs {
     ) -> Result<Self> {
         const FLAG_MASK: u64 = 0xff;
         let flags = CloneFlags::from(raw_flags & !FLAG_MASK);
-        let exit_signal = match (raw_flags & FLAG_MASK) as u8 {
-            0 => None,
-            sig_num => SigNum::try_from(sig_num).ok(),
-        };
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2731-L2732>
+        let exit_signal = SigNum::try_from_raw(raw_flags & FLAG_MASK)?;
 
         // Disambiguate the `parent_tid` parameter. The field is used
         // both for `CLONE_PIDFD` and `CLONE_PARENT_SETTID`, so at

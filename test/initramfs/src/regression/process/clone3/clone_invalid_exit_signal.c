@@ -3,9 +3,7 @@
 #define _GNU_SOURCE
 
 #include <linux/sched.h>
-#include <sys/wait.h>
 #include <sys/syscall.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 #include "../../common/test.h"
@@ -15,20 +13,11 @@ static pid_t sys_clone3(struct clone_args *args)
 	return syscall(SYS_clone3, args, sizeof(struct clone_args));
 }
 
-FN_TEST(clone_normalizes_invalid_exit_signal)
+FN_TEST(clone_rejects_invalid_exit_signal)
 {
-	int status;
-	long pid;
-
-	pid = TEST_SUCC(syscall(SYS_clone, 255UL, 0UL, 0UL, 0UL, 0UL));
-
-	if (pid == 0) {
-		_exit(EXIT_SUCCESS);
-	}
-
-	TEST_RES(waitpid(pid, &status, 0),
-		 _ret == pid && WIFEXITED(status) &&
-			 WEXITSTATUS(status) == EXIT_SUCCESS);
+	// Like `clone3`, `clone` rejects invalid exit signals.
+	TEST_ERRNO(syscall(SYS_clone, 65UL, 0UL, 0UL, 0UL, 0UL), EINVAL);
+	TEST_ERRNO(syscall(SYS_clone, 255UL, 0UL, 0UL, 0UL, 0UL), EINVAL);
 }
 END_TEST()
 
