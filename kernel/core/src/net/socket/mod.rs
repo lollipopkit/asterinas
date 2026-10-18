@@ -248,28 +248,43 @@ pub(crate) trait Socket: private::SocketPrivate + Send + Sync {
     fn common(&self) -> &FileCommon;
 }
 
+/// Receives one message from a socket into all the buffers, like `read(2)` and `readv(2)`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/socket.c#L1201-L1220>
+pub(crate) fn read_socket(socket: &dyn Socket, writer: &mut dyn MultiWrite) -> Result<usize> {
+    if writer.is_empty() {
+        // Linux always returns `Ok(0)` in this case, so we follow it.
+        return Ok(0);
+    }
+
+    // TODO: Set correct flags
+    socket
+        .recvmsg(writer, RecvFlags::empty())
+        .map(|(output, _)| output.len())
+}
+
+/// Sends all the buffers to a socket as one message, like `write(2)` and `writev(2)`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/socket.c#L1222-L1243>
+pub(crate) fn write_socket(socket: &dyn Socket, reader: &mut dyn MultiRead) -> Result<usize> {
+    let audit_target = check_connect(socket, None)?;
+    // TODO: Set correct flags
+    let sent_bytes = socket.sendmsg(
+        reader,
+        MessageHeader::new(None, Vec::new()),
+        SendFlags::empty(),
+    )?;
+    audit_connect(audit_target);
+    Ok(sent_bytes)
+}
+
 impl<T: Socket + 'static> FileLike for T {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
-        if !writer.has_avail() {
-            // Linux always returns `Ok(0)` in this case, so we follow it.
-            return Ok(0);
-        }
-
-        // TODO: Set correct flags
-        self.recvmsg(writer, RecvFlags::empty())
-            .map(|(output, _)| output.len())
+        read_socket(self, writer)
     }
 
     fn write(&self, reader: &mut VmReader) -> Result<usize> {
-        let audit_target = check_connect(self, None)?;
-        // TODO: Set correct flags
-        let sent_bytes = self.sendmsg(
-            reader,
-            MessageHeader::new(None, Vec::new()),
-            SendFlags::empty(),
-        )?;
-        audit_connect(audit_target);
-        Ok(sent_bytes)
+        write_socket(self, reader)
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {

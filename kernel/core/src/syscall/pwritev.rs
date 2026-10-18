@@ -4,8 +4,9 @@ use super::SyscallReturn;
 use crate::{
     fs,
     fs::file::file_table::{RawFileDesc, get_file_fast},
+    net::socket::write_socket,
     prelude::*,
-    util::VmReaderArray,
+    util::{MultiRead, VmReaderArray},
 };
 
 pub(super) fn sys_writev(
@@ -149,6 +150,24 @@ fn do_sys_writev(
 
     let user_space = ctx.user_space();
     let mut reader_array = VmReaderArray::from_user_io_vecs(&user_space, io_vec_ptr, io_vec_count)?;
+
+    // Like Linux, a socket sends all the buffers as one message, unless there are no data.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/read_write.c#L1048-L1050>
+    if let Some(socket) = file.as_socket() {
+        if reader_array.sum_lens() == 0 {
+            return Ok(0);
+        }
+        let sent_len =
+            write_socket(socket, &mut reader_array).map_err(|err| match err.error() {
+                Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+                _ => err,
+            })?;
+        if sent_len > 0 {
+            fs::vfs::notify::on_modify(&file);
+        }
+        return Ok(sent_len);
+    }
+
     for reader in reader_array.readers_mut() {
         debug_assert!(reader.has_remain());
 

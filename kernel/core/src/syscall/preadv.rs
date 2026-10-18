@@ -4,6 +4,7 @@ use super::SyscallReturn;
 use crate::{
     fs,
     fs::file::file_table::{RawFileDesc, get_file_fast},
+    net::socket::read_socket,
     prelude::*,
     util::VmWriterArray,
 };
@@ -153,6 +154,19 @@ fn do_sys_readv(
 
     let user_space = ctx.user_space();
     let mut writer_array = VmWriterArray::from_user_io_vecs(&user_space, io_vec_ptr, io_vec_count)?;
+
+    // Like Linux, a socket receives one message into all the buffers.
+    if let Some(socket) = file.as_socket() {
+        let recv_len = read_socket(socket, &mut writer_array).map_err(|err| match err.error() {
+            Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+            _ => err,
+        })?;
+        if recv_len > 0 {
+            fs::vfs::notify::on_access(&file);
+        }
+        return Ok(recv_len);
+    }
+
     for writer in writer_array.writers_mut() {
         debug_assert!(writer.has_avail());
 
