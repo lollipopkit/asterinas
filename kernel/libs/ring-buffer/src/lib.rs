@@ -87,7 +87,7 @@ impl<T> RingBuffer<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `capacity` is not a power of two.
+    /// Panics if `capacity` is not a power of two (e.g., zero).
     pub fn new(capacity: usize) -> Self {
         assert!(
             capacity.is_power_of_two(),
