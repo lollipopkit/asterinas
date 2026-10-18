@@ -228,6 +228,10 @@ impl<T: Pod> RingBuffer<T> {
     /// belong to the same ring buffer.
     pub fn grow(producer: &mut RbProducer<T>, consumer: &mut RbConsumer<T>, new_capacity: usize) {
         assert!(
+            new_capacity.is_power_of_two(),
+            "capacity must be a power of two"
+        );
+        assert!(
             Arc::ptr_eq(&producer.rb, &consumer.rb),
             "the producer and the consumer must belong to the same ring buffer"
         );
