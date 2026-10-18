@@ -645,7 +645,7 @@ static int trace_restart(long (*op)(void), long nr, long restart_errno,
 		}
 
 		CHECK_WITH(waitpid(pid, &status, 0), _ret == pid);
-		if (WIFEXITED(status))
+		if (WIFEXITED(status) || WIFSIGNALED(status))
 			break;
 		CHECK_WITH(status, WIFSTOPPED(status));
 
@@ -659,8 +659,12 @@ static int trace_restart(long (*op)(void), long nr, long restart_errno,
 		in_syscall = !in_syscall;
 		long orig_rax = CHECK(ptrace(PTRACE_PEEKUSER, pid,
 					     USER_REG_OFFSET(orig_rax), 0));
+		// `rax` can hold a negative errno, so failures are detected via `errno`.
+		errno = 0;
 		long rax =
 			ptrace(PTRACE_PEEKUSER, pid, USER_REG_OFFSET(rax), 0);
+		int peek_errno = errno;
+		CHECK_WITH(peek_errno, _ret == 0);
 
 		if (state == 0 && in_syscall && orig_rax == nr)
 			state = 1;
@@ -670,7 +674,8 @@ static int trace_restart(long (*op)(void), long nr, long restart_errno,
 			state = 3;
 	}
 
-	return state == 3 && WEXITSTATUS(status) == EXIT_SUCCESS;
+	return state == 3 && WIFEXITED(status) &&
+	       WEXITSTATUS(status) == EXIT_SUCCESS;
 }
 
 FN_TEST(restart_seen_by_tracer)
