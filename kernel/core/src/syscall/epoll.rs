@@ -107,13 +107,6 @@ fn do_epoll_pwait2(
     sigmask_size: usize,
     ctx: &Context,
 ) -> Result<usize> {
-    let max_events = {
-        if max_events <= 0 || max_events as usize > EP_MAX_EVENTS {
-            return_errno_with_message!(Errno::EINVAL, "max_events is not valid");
-        }
-        max_events as usize
-    };
-
     if sigmask_addr != 0 {
         let user_space = ctx.user_space();
         let sigmask_ptr = {
@@ -123,6 +116,29 @@ fn do_epoll_pwait2(
         let sigmask = sigmask_ptr.read_val()?;
         ctx.save_and_set_sig_mask(sigmask);
     }
+
+    let res = do_epoll_wait(epfd, events_addr, max_events, timeout, ctx);
+
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/eventpoll.c#L2843-L2862>
+    let is_interrupted = res.as_ref().is_err_and(|err| err.error() == Errno::EINTR);
+    ctx.restore_saved_sig_mask_unless(is_interrupted);
+
+    res
+}
+
+fn do_epoll_wait(
+    epfd: RawFileDesc,
+    events_addr: Vaddr,
+    max_events: i32,
+    timeout: Option<Duration>,
+    ctx: &Context,
+) -> Result<usize> {
+    let max_events = {
+        if max_events <= 0 || max_events as usize > EP_MAX_EVENTS {
+            return_errno_with_message!(Errno::EINVAL, "max_events is not valid");
+        }
+        max_events as usize
+    };
 
     let mut file_table = ctx.thread_local.borrow_file_table_mut();
     let file = get_file_fast!(&mut file_table, epfd.try_into()?);

@@ -14,7 +14,9 @@ use super::{
     Credentials, Dumpable, Pid, Process, pid_table,
     posix_thread::{AsPosixThread, PosixThreadBuilder},
     rlimit::ResourceLimits,
-    signal::{constants::SIGCHLD, sig_disposition::SigDispositions, sig_num::SigNum},
+    signal::{
+        HandlePendingSignal, constants::SIGCHLD, sig_disposition::SigDispositions, sig_num::SigNum,
+    },
 };
 use crate::{
     context::current_userspace,
@@ -291,6 +293,12 @@ pub(crate) fn clone_child(
     clone_args: CloneArgs,
 ) -> Result<Tid> {
     clone_args.check(ctx)?;
+
+    // Deliver the pending signals before the clone happens, and then restart the clone.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2095-L2112>
+    if ctx.has_pending() {
+        return_errno_with_message!(Errno::ERESTARTNOINTR, "clone is interrupted by a signal");
+    }
 
     if clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
         let child_task = clone_child_task(ctx, parent_context, clone_args)?;

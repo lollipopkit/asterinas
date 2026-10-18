@@ -19,6 +19,10 @@ impl LinuxAbi for UserContext {
         self.x8()
     }
 
+    fn set_syscall_num(&mut self, num: usize) {
+        self.set_x8(num);
+    }
+
     fn syscall_ret(&self) -> usize {
         self.x0()
     }

@@ -26,10 +26,15 @@ pub(super) fn sys_rt_sigsuspend(
     let sigmask = sigmask_ptr.read_val()?;
     ctx.save_and_set_sig_mask(sigmask);
 
-    // Wait until receiving any signal
+    // Wait until receiving any signal. The error must be `EINTR`.
     let waiter = Waiter::new_pair().0;
-    waiter.pause_until(|| None::<()>)?;
+    let _ = waiter.pause_until(|| None::<()>);
 
-    // This syscall should always return `Err(EINTR)`. This path should never be reached.
-    unreachable!("rt_sigsuspend always return EINTR");
+    // Restart the syscall unless a user signal handler runs. The saved signal mask is restored
+    // after the signal is handled.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L4913-L4925>
+    return_errno_with_message!(
+        Errno::ERESTARTNOHAND,
+        "rt_sigsuspend is interrupted by a signal"
+    );
 }

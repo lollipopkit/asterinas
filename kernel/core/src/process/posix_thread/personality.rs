@@ -9,6 +9,7 @@ use super::PosixThread;
 bitflags! {
     pub(crate) struct Personality: u32 {
         const ADDR_NO_RANDOMIZE = 0x0040000;
+        const STICKY_TIMEOUTS = 0x4000000;
     }
 }
 

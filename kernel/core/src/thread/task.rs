@@ -16,7 +16,9 @@ use crate::{
     prelude::*,
     process::{
         posix_thread::{AsPosixThread, FIRST_POSIX_TID, ThreadLocal, ptrace::PtraceStopResult},
-        signal::{HandlePendingSignal, PauseReason, handle_pending_signal},
+        signal::{
+            HandlePendingSignal, PauseReason, handle_pending_signal, restart_interrupted_syscall,
+        },
     },
     syscall::handle_syscall,
     thread::{AsThread, exception::handle_exception},
@@ -73,7 +75,7 @@ pub(crate) fn create_new_user_task(
         let is_group_stopped = || ctx.process.is_stopped() && !ctx.posix_thread.is_traced();
 
         let handle_signals = |user_ctx: &mut UserContext| {
-            handle_pending_signal(user_ctx, &ctx);
+            let mut is_handled = handle_pending_signal(user_ctx, &ctx);
 
             // Handle signals while the thread is stopped
             // FIXME: Currently, we handle all signals when the process is stopped.
@@ -93,7 +95,14 @@ pub(crate) fn create_new_user_task(
                 } else {
                     break;
                 }
-                handle_pending_signal(user_ctx, &ctx);
+                is_handled |= handle_pending_signal(user_ctx, &ctx);
+            }
+
+            // The restart decision is deferred until the thread is continued, so that a user
+            // signal handler that runs after a stop can still interrupt the syscall, as in Linux.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/signal.c#L333-L359>
+            if !is_handled {
+                restart_interrupted_syscall(user_ctx, &ctx);
             }
         };
 

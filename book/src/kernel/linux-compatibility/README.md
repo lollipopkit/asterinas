@@ -239,7 +239,7 @@ which are summarized in the table below.
 | 216     | remap_file_pages       | ❌             | N/A |
 | 217     | getdents64             | ✅             | 💯 |
 | 218     | set_tid_address        | ✅             | 💯 |
-| 219     | restart_syscall        | ❌             | N/A |
+| 219     | restart_syscall        | ✅             | 💯 |
 | 220     | semtimedop             | ✅             | [⚠️](syscall-flag-coverage/inter-process-communication/#semop-and-semtimedop) |
 | 221     | fadvise64              | ✅             | [⚠️](syscall-flag-coverage/file-descriptor-and-io-control/#fadvise64) |
 | 222     | timer_create           | ✅             | [⚠️](syscall-flag-coverage/signals-and-timers/#timer_create) |

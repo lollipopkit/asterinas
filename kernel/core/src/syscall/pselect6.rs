@@ -6,6 +6,7 @@ use ostd::mm::VmIo;
 
 use super::{
     SyscallReturn,
+    poll::{poll_select_end_time, poll_select_finish},
     rt_sigprocmask::{RequireFullSize, UserSigSetPtr},
     select::do_sys_select,
 };
@@ -27,9 +28,9 @@ pub(super) fn sys_pselect6(
 ) -> Result<SyscallReturn> {
     let user_space = ctx.user_space();
 
-    let timeout = if timespec_addr != 0 {
+    let end_time = if timespec_addr != 0 {
         let time_spec = user_space.read_val::<timespec_t>(timespec_addr)?;
-        Some(Duration::try_from(time_spec)?)
+        poll_select_end_time(Some(Duration::try_from(time_spec)?))
     } else {
         None
     };
@@ -46,14 +47,20 @@ pub(super) fn sys_pselect6(
         }
     }
 
-    do_sys_select(
+    let res = do_sys_select(
         nfds,
         readfds_addr,
         writefds_addr,
         exceptfds_addr,
-        timeout,
+        end_time,
         ctx,
-    )
+    );
+
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/select.c#L739-L772>
+    let write_remaining =
+        |remaining: Duration| user_space.write_val(timespec_addr, &timespec_t::from(remaining));
+    let num_revents = poll_select_finish(end_time, write_remaining, res, ctx)?;
+    Ok(SyscallReturn::Return(num_revents as _))
 }
 
 // Reference: <https://elixir.bootlin.com/linux/v6.19.8/source/fs/select.c#L763-L772>

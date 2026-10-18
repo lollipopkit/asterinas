@@ -6,7 +6,7 @@ use ostd::mm::VmIo;
 
 use super::{
     SyscallReturn,
-    poll::do_sys_poll,
+    poll::{do_sys_poll, poll_select_end_time, poll_select_finish},
     rt_sigprocmask::{RequireFullSize, UserSigSetPtr},
 };
 use crate::{prelude::*, process::posix_thread::ContextPthreadAdminApi, time::timespec_t};
@@ -21,9 +21,9 @@ pub(super) fn sys_ppoll(
 ) -> Result<SyscallReturn> {
     let user_space = ctx.user_space();
 
-    let timeout = if timespec_addr != 0 {
+    let end_time = if timespec_addr != 0 {
         let time_spec = user_space.read_val::<timespec_t>(timespec_addr)?;
-        Some(Duration::try_from(time_spec)?)
+        poll_select_end_time(Some(Duration::try_from(time_spec)?))
     } else {
         None
     };
@@ -37,14 +37,11 @@ pub(super) fn sys_ppoll(
         ctx.save_and_set_sig_mask(sigmask);
     }
 
-    do_sys_poll(fds, nfds, timeout, ctx)
+    let res = do_sys_poll(fds, nfds, end_time, ctx);
 
-    // TODO: Write back the remaining time to `timespec_addr`.
-    //
-    // The ppoll system call should write back the remaining time,
-    // yet the function counterpart in libc hides this behavior to
-    // make the API more portable across different UNIX-like OSes.
-    // For the maximized Linux compatibility, we should follow Linux's behavior.
-    // But this cannot be readily achieved given how our internal synchronization primitives
-    // such as `Pause` and `WaitTimeout` work.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/select.c#L1092-L1114>
+    let write_remaining =
+        |remaining: Duration| user_space.write_val(timespec_addr, &timespec_t::from(remaining));
+    let num_revents = poll_select_finish(end_time, write_remaining, res, ctx)?;
+    Ok(SyscallReturn::Return(num_revents as _))
 }

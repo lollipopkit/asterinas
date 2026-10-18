@@ -20,6 +20,10 @@ pub(super) fn sys_rt_sigreturn(ctx: &Context, user_ctx: &mut UserContext) -> Res
         sig_context_addr
     );
 
+    // Always make any pending restarted syscalls return `EINTR`.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/signal_64.c#L56-L57>
+    ctx.thread_local.set_restart_block(None);
+
     let ucontext = ctx.user_space().read_val::<ucontext_t>(sig_context_addr)?;
 
     // Restore general-purpose registers.

@@ -7,10 +7,10 @@ use ostd::mm::VmIo;
 use crate::{
     prelude::*,
     process::posix_thread::futex::{
-        FutexFlags, FutexOp, FutexVisibility, futex_op_and_flags_from_u32, futex_requeue,
-        futex_wait, futex_wait_bitset, futex_wake, futex_wake_bitset, futex_wake_op,
+        FUTEX_BITSET_MATCH_ANY, FutexFlags, FutexOp, FutexVisibility, futex_op_and_flags_from_u32,
+        futex_requeue, futex_wait_bitset, futex_wake, futex_wake_bitset, futex_wake_op,
     },
-    syscall::SyscallReturn,
+    syscall::{SyscallReturn, restart_syscall::RestartBlock},
     time::{
         clocks::{MonotonicClock, RealTimeClock},
         timer::Timeout,
@@ -34,7 +34,7 @@ pub(super) fn sys_futex(
         futex_op, futex_flags, futex_addr, futex_val
     );
 
-    let get_futex_timeout = |timeout_addr: Vaddr| -> Result<Option<ManagedTimeout<'static>>> {
+    let get_futex_deadline = |timeout_addr: Vaddr| -> Result<Option<FutexDeadline>> {
         if timeout_addr == 0 {
             return Ok(None);
         }
@@ -51,48 +51,36 @@ pub(super) fn sys_futex(
             return_errno_with_message!(Errno::ENOSYS, "FUTEX_WAIT cannot use CLOCK_REALTIME");
         }
 
-        let timeout = {
-            // For `FUTEX_WAIT`, `timeout` is interpreted as a relative value. This differs from
-            // other futex operations, where `timeout` is interpreted as an absolute value.
-            // Reference: <https://www.man7.org/linux/man-pages/man2/FUTEX_WAIT.2const.html>
-            if futex_op == FutexOp::FUTEX_WAIT {
-                Timeout::After(timeout)
-            } else {
-                Timeout::When(timeout)
-            }
-        };
-
-        let timer_manager = if is_real_time {
-            debug!("futex timeout = {:?}, clock = CLOCK_REALTIME", timeout);
-            RealTimeClock::timer_manager()
+        // For `FUTEX_WAIT`, `timeout` is interpreted as a relative value. This differs from
+        // other futex operations, where `timeout` is interpreted as an absolute value.
+        // Reference: <https://www.man7.org/linux/man-pages/man2/FUTEX_WAIT.2const.html>
+        let expiry = if futex_op == FutexOp::FUTEX_WAIT {
+            MonotonicClock::get().read_time().saturating_add(timeout)
         } else {
-            debug!("futex timeout = {:?}, clock = CLOCK_MONOTONIC", timeout);
-            MonotonicClock::timer_manager()
+            timeout
         };
+        debug!(
+            "futex expiry = {:?}, is_real_time = {}",
+            expiry, is_real_time
+        );
 
-        Ok(Some(ManagedTimeout::new_with_manager(
-            timeout,
-            timer_manager,
-        )))
+        Ok(Some(FutexDeadline {
+            expiry,
+            is_real_time,
+        }))
     };
 
     let visibility = FutexVisibility::from(futex_flags);
     let res = match futex_op {
-        FutexOp::FUTEX_WAIT => {
-            let timeout = get_futex_timeout(utime_addr)?;
-            futex_wait(futex_addr as _, futex_val as _, timeout, ctx, visibility).map(|_| 0)
-        }
-        FutexOp::FUTEX_WAIT_BITSET => {
-            let timeout = get_futex_timeout(utime_addr)?;
-            futex_wait_bitset(
-                futex_addr as _,
-                futex_val as _,
-                timeout,
-                bitset as _,
-                ctx,
-                visibility,
-            )
-            .map(|_| 0)
+        FutexOp::FUTEX_WAIT | FutexOp::FUTEX_WAIT_BITSET => {
+            let bitset = if futex_op == FutexOp::FUTEX_WAIT {
+                FUTEX_BITSET_MATCH_ANY
+            } else {
+                bitset
+            };
+            let deadline = get_futex_deadline(utime_addr)?;
+            let res = do_futex_wait(futex_addr, futex_val, deadline, bitset, visibility, ctx);
+            return res.map(SyscallReturn::Return);
         }
         FutexOp::FUTEX_WAKE => {
             let max_count = futex_val_to_max_count(futex_val);
@@ -141,6 +129,51 @@ pub(super) fn sys_futex(
 
     debug!("futex returns, tid = {}", ctx.posix_thread.tid());
     Ok(SyscallReturn::Return(res as _))
+}
+
+/// The absolute timeout of a futex wait.
+#[derive(Clone, Copy, Debug)]
+struct FutexDeadline {
+    expiry: Duration,
+    is_real_time: bool,
+}
+
+/// Waits on the futex until `deadline`.
+///
+/// If interrupted, a wait with a timeout continues via `restart_syscall` with the same deadline
+/// unless a user signal handler runs, and a wait without a timeout restarts with `ERESTARTSYS`.
+//
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/futex/waitwake.c#L741-L785>
+fn do_futex_wait(
+    futex_addr: Vaddr,
+    futex_val: u32,
+    deadline: Option<FutexDeadline>,
+    bitset: u32,
+    visibility: FutexVisibility,
+    ctx: &Context,
+) -> Result<isize> {
+    let timeout = deadline.map(|deadline| {
+        let timer_manager = if deadline.is_real_time {
+            RealTimeClock::timer_manager()
+        } else {
+            MonotonicClock::timer_manager()
+        };
+        ManagedTimeout::new_with_manager(Timeout::When(deadline.expiry), timer_manager)
+    });
+
+    let Err(err) = futex_wait_bitset(futex_addr, futex_val as _, timeout, bitset, ctx, visibility)
+    else {
+        return Ok(0);
+    };
+
+    match err.error() {
+        Errno::ETIME => Err(Error::new(Errno::ETIMEDOUT)),
+        Errno::EINTR if deadline.is_some() => Err(RestartBlock::set(ctx, move |ctx| {
+            do_futex_wait(futex_addr, futex_val, deadline, bitset, visibility, ctx)
+        })),
+        Errno::EINTR => Err(Error::new(Errno::ERESTARTSYS)),
+        _ => Err(err),
+    }
 }
 
 fn futex_val_to_max_count(futex_val: u32) -> usize {

@@ -17,7 +17,7 @@ use crate::{
 
 type FutexBitSet = u32;
 
-const FUTEX_BITSET_MATCH_ANY: FutexBitSet = 0xFFFF_FFFF;
+pub(crate) const FUTEX_BITSET_MATCH_ANY: FutexBitSet = 0xFFFF_FFFF;
 
 /// Specifies whether a futex is scoped to the current process or shared through
 /// its backing mapping.
@@ -38,23 +38,6 @@ impl From<FutexFlags> for FutexVisibility {
             Self::Shared
         }
     }
-}
-
-pub(crate) fn futex_wait(
-    futex_addr: u64,
-    futex_val: i32,
-    timeout: Option<ManagedTimeout>,
-    ctx: &Context,
-    visibility: FutexVisibility,
-) -> Result<()> {
-    futex_wait_bitset(
-        futex_addr as _,
-        futex_val,
-        timeout,
-        FUTEX_BITSET_MATCH_ANY,
-        ctx,
-        visibility,
-    )
 }
 
 pub(crate) fn futex_wait_bitset(

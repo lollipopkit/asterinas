@@ -109,6 +109,7 @@ use super::{
     recvmsg::sys_recvmsg,
     removexattr::{sys_fremovexattr, sys_lremovexattr, sys_removexattr},
     rename::{sys_rename, sys_renameat, sys_renameat2},
+    restart_syscall::sys_restart_syscall,
     rmdir::sys_rmdir,
     rt_sigaction::sys_rt_sigaction,
     rt_sigpending::sys_rt_sigpending,
@@ -355,6 +356,7 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_EPOLL_CREATE = 213     => sys_epoll_create(args[..1]);
     SYS_GETDENTS64 = 217       => sys_getdents64(args[..3]);
     SYS_SET_TID_ADDRESS = 218  => sys_set_tid_address(args[..1]);
+    SYS_RESTART_SYSCALL = 219  => sys_restart_syscall(args[..0]);
     SYS_SEMTIMEDOP = 220       => sys_semtimedop(args[..4]);
     SYS_FADVISE64 = 221        => sys_fadvise64(args[..4]);
     SYS_TIMER_CREATE = 222     => sys_timer_create(args[..3]);
