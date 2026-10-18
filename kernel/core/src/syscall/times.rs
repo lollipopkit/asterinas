@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use ostd::{mm::VmIo, timer::Jiffies};
+use aster_time::read_monotonic_time;
+use ostd::mm::VmIo;
 
 use super::SyscallReturn;
 use crate::{
@@ -34,6 +35,7 @@ pub(super) fn sys_times(tbuf: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
 
     // Linux starts its jiffies at `INITIAL_JIFFIES` to catch wrap-around bugs, so user space can
     // only rely on differences between the returned values.
-    let ticks = duration_to_clock_t(Jiffies::elapsed().as_duration());
+    // The monotonic clock is used to be consistent with `/proc/uptime`.
+    let ticks = duration_to_clock_t(read_monotonic_time());
     Ok(SyscallReturn::Return(ticks as _))
 }

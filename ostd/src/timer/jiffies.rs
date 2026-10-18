@@ -5,16 +5,40 @@ use core::{
     time::Duration,
 };
 
+use spin::Once;
+
 use super::TIMER_FREQ;
+use crate::arch::{read_tsc, tsc_freq};
 
 /// Jiffies is a term used to denote the units of time measurement by the kernel.
 ///
-/// A jiffy represents one tick of the system timer interrupt,
-/// whose frequency is equal to [`TIMER_FREQ`] Hz.
+/// A jiffy represents one tick of the system timer, whose frequency is equal to [`TIMER_FREQ`] Hz.
 #[derive(Clone, Copy, Debug)]
 pub struct Jiffies(u64);
 
-pub(crate) static ELAPSED: AtomicU64 = AtomicU64::new(0);
+static ELAPSED: AtomicU64 = AtomicU64::new(0);
+
+/// The TSC value at the first timer interrupt, from which [`ELAPSED`] is counted.
+static BASE_TSC: Once<u64> = Once::new();
+
+/// Brings [`ELAPSED`] up to date from the TSC.
+///
+/// Timer interrupts can be delayed or lost (e.g., when a vCPU is not scheduled by the host), so
+/// counting interrupts falls behind the real time. Like Linux, this derives the jiffies from the
+/// clock source instead, which also catches up the missed ticks.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/time/tick-sched.c#L57-L150>
+pub(super) fn update_elapsed() {
+    let now = read_tsc();
+    let base = *BASE_TSC.call_once(|| now);
+    let freq = tsc_freq();
+    if freq == 0 {
+        return;
+    }
+
+    let elapsed = u128::from(now.saturating_sub(base)) * u128::from(TIMER_FREQ) / u128::from(freq);
+    ELAPSED.fetch_max(elapsed as u64, Ordering::Relaxed);
+}
 
 impl Jiffies {
     /// The maximum value of [`Jiffies`].
