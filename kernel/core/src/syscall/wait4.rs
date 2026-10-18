@@ -5,7 +5,7 @@ use ostd::mm::VmIo;
 use super::{SyscallReturn, getrusage::rusage_t};
 use crate::{
     prelude::*,
-    process::{ProcessFilter, WaitOptions, WaitStatus, do_wait, posix_thread::AsPosixThread},
+    process::{ProcessFilter, WaitOptions, WaitStatus, do_wait},
 };
 
 pub(super) fn sys_wait4(
@@ -15,23 +15,26 @@ pub(super) fn sys_wait4(
     rusage_addr: Vaddr,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1866-L1868>
     let wait_options = WaitOptions::from_bits(wait_options)
-        .ok_or_else(|| Error::with_message(Errno::EINVAL, "unknown wait option"))?;
+        .filter(|options| {
+            (WaitOptions::WNOHANG
+                | WaitOptions::WSTOPPED
+                | WaitOptions::WCONTINUED
+                | WaitOptions::WNOTHREAD
+                | WaitOptions::WCLONE
+                | WaitOptions::WALL)
+                .contains(*options)
+        })
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid wait options"))?
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1889>
+        | WaitOptions::WEXITED;
     debug!(
         "pid = {}, status_ptr = {}, wait_options: {:?}",
         wait_pid as i32, status_ptr, wait_options
     );
     debug!("wait4 current pid = {}", ctx.process.pid());
     let process_filter = ProcessFilter::from_id(wait_pid as _)?;
-
-    if wait_options.intersects(WaitOptions::WSTOPPED | WaitOptions::WCONTINUED)
-        && wait_options.contains(WaitOptions::WNOWAIT)
-    {
-        return_errno_with_message!(
-            Errno::EINVAL,
-            "WNOWAIT cannot be used toghther with WSTOPPED or WCONTINUED"
-        );
-    }
 
     let wait_status =
         do_wait(process_filter, wait_options, ctx).map_err(|err| match err.error() {
@@ -65,7 +68,7 @@ fn calculate_status_code(wait_status: &WaitStatus) -> u32 {
         WaitStatus::Zombie(process) => process.status().exit_code(),
         WaitStatus::Stop(_, sig_num) => ((sig_num.as_u8() as u32) << 8) | 0x7f,
         WaitStatus::Continue(_) => 0xffff,
-        WaitStatus::TraceeExit(thread) => thread.as_posix_thread().unwrap().exit_code(),
+        WaitStatus::TraceeExit(_, exit_code) => *exit_code,
         WaitStatus::TraceeStop(_, status) => status.to_wait4_status(),
     }
 }

@@ -251,7 +251,7 @@ fn do_execve_no_return(
     set_cpu_context(thread_local, user_context, elf_load_info);
 
     // If this was a vfork child, reset vfork-specific state.
-    reset_vfork_child(process);
+    process.complete_vfork_done();
 
     // Unshare file descriptor table and close files with O_CLOEXEC flag.
     unshare_and_close_files(ctx);
@@ -317,6 +317,18 @@ fn make_current_main_thread(ctx: &Context) {
 
     // Lock order: PID table -> tracer.tracees -> tasks of process
     let mut pid_table = pid_table::pid_table_mut();
+
+    // The old main thread has exited and will be released without being reported, so it must
+    // be unlinked from its tracer, which may differ from the tracer of the current thread.
+    // This is done before locking the tracees of the current thread's tracer, so no two
+    // tracee maps are locked at the same time.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/exec.c#L1024-L1036>
+    let old_main_thread = ctx.process.main_thread();
+    old_main_thread
+        .as_posix_thread()
+        .unwrap()
+        .ptrace_release_exited();
+
     let tracer = ctx.posix_thread.tracer();
     let mut tracer_tracees = tracer
         .as_ref()
@@ -384,15 +396,6 @@ fn apply_exec_cred(
     credentials.apply_exec_cred(exec_cred)?;
 
     Ok(())
-}
-
-fn reset_vfork_child(process: &Process) {
-    if process.status().is_vfork_child() {
-        // Resumes the parent process.
-        process.status().set_vfork_child(false);
-        let parent = process.parent().lock().process().upgrade().unwrap();
-        parent.children_wait_queue().wake_all();
-    }
 }
 
 fn unshare_and_close_files(ctx: &Context) {

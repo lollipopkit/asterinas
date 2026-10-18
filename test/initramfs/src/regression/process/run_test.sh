@@ -47,6 +47,7 @@ fi
 ./pthread/pthread_signal_test
 ./pthread/pthread_test
 
+./ptrace/clone_events
 ./ptrace/ptrace
 ./ptrace/set_options
 

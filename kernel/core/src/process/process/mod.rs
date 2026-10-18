@@ -728,6 +728,14 @@ impl Process {
         &self.status
     }
 
+    /// Resumes the parent waiting in `vfork`, if this process is a vfork child.
+    pub(in crate::process) fn complete_vfork_done(&self) {
+        if self.status.is_vfork_child() {
+            self.status.set_vfork_child(false);
+            self.wake_up_parent();
+        }
+    }
+
     /// Stops the process.
     pub(crate) fn stop(&self, sig_num: SigNum) {
         if self.status.stop_status().stop(sig_num) {
