@@ -168,15 +168,7 @@ fn do_ptrace_attach(tracer_thread: &Arc<Thread>, tracee_thread: Arc<Thread>) -> 
 }
 
 fn parse_ptrace_injected_signal(data: usize) -> Result<Option<SigNum>> {
-    if data == 0 {
-        return Ok(None);
-    }
-
-    let sig_num = u8::try_from(data)
-        .map_err(|_| Error::with_message(Errno::EINVAL, "invalid signal number"))?;
-    let sig_num = SigNum::try_from(sig_num)?;
-
-    Ok(Some(sig_num))
+    SigNum::try_from_raw(data as u64)
 }
 
 #[repr(u32)]

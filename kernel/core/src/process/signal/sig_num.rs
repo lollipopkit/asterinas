@@ -24,6 +24,22 @@ impl TryFrom<u8> for SigNum {
 }
 
 impl SigNum {
+    /// Converts a raw signal number from the user space, where zero means no signal.
+    ///
+    /// The number is checked like Linux's `valid_signal`. Callers with a C `int` should
+    /// sign-extend it, so that negative numbers are rejected.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/signal.h#L271-L275>
+    pub(crate) fn try_from_raw(raw: u64) -> Result<Option<Self>> {
+        if raw == 0 {
+            return Ok(None);
+        }
+        if raw > MAX_RT_SIG_NUM as u64 {
+            return_errno_with_message!(Errno::EINVAL, "invalid signal number");
+        }
+        Ok(Some(Self::from_u8(raw as u8)))
+    }
+
     /// Caller must ensure the sig_num is valid. Otherwise, use try_from will check sig_num and does not panic.
     pub(crate) const fn from_u8(sig_num: u8) -> Self {
         if sig_num > MAX_RT_SIG_NUM || sig_num < MIN_STD_SIG_NUM {

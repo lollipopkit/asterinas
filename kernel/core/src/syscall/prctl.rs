@@ -25,8 +25,11 @@ pub(super) fn sys_prctl(
     debug!("prctl_cmd = {:x?}", prctl_cmd);
 
     match prctl_cmd {
-        PrctlCmd::PR_SET_PDEATHSIG(signum) => {
+        PrctlCmd::PR_SET_PDEATHSIG(Some(signum)) => {
             ctx.process.set_parent_death_signal(signum);
+        }
+        PrctlCmd::PR_SET_PDEATHSIG(None) => {
+            ctx.process.clear_parent_death_signal();
         }
         PrctlCmd::PR_GET_PDEATHSIG(write_to_addr) => {
             let write_val = match ctx.process.parent_death_signal() {
@@ -175,7 +178,7 @@ const PR_CAP_AMBIENT: i32 = 47;
 #[expect(non_camel_case_types)]
 #[derive(Clone, Copy, Debug)]
 enum PrctlCmd {
-    PR_SET_PDEATHSIG(SigNum),
+    PR_SET_PDEATHSIG(Option<SigNum>),
     PR_GET_PDEATHSIG(Vaddr),
     PR_GET_DUMPABLE,
     PR_SET_DUMPABLE(Dumpable),
@@ -208,7 +211,7 @@ impl PrctlCmd {
     fn from_args(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> Result<PrctlCmd> {
         match option {
             PR_SET_PDEATHSIG => {
-                let signum = SigNum::try_from(arg2 as u8)?;
+                let signum = SigNum::try_from_raw(arg2)?;
                 Ok(PrctlCmd::PR_SET_PDEATHSIG(signum))
             }
             PR_GET_PDEATHSIG => Ok(PrctlCmd::PR_GET_PDEATHSIG(arg2 as _)),

@@ -68,6 +68,7 @@ fi
 ./signal/rt_sigpending
 ./signal/sigchld_info
 ./signal/signal_fd
+./signal/signalfd_siginfo
 ./signal/signal_test2
 
 if [ "$(uname -m)" = "x86_64" ]; then

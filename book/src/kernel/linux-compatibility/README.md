@@ -149,7 +149,7 @@ which are summarized in the table below.
 | 126     | capset                 | ✅             | [⚠️](syscall-flag-coverage/namespaces-cgroups-and-security/#capget-and-capset) |
 | 127     | rt_sigpending          | ✅             | 💯 |
 | 128     | rt_sigtimedwait        | ✅             | 💯 |
-| 129     | rt_sigqueueinfo        | ❌             | N/A |
+| 129     | rt_sigqueueinfo        | ✅             | 💯 |
 | 130     | rt_sigsuspend          | ✅             | 💯 |
 | 131     | sigaltstack            | ✅             | 💯 |
 | 132     | utime                  | ✅             | 💯 |
@@ -317,7 +317,7 @@ which are summarized in the table below.
 | 294     | inotify_init1          | ✅             | [⚠️](syscall-flag-coverage/file-systems-and-mount-control/#inotify_init-and-inotify_init1) |
 | 295     | preadv                 | ✅             | 💯 |
 | 296     | pwritev                | ✅             | 💯 |
-| 297     | rt_tgsigqueueinfo      | ❌             | N/A |
+| 297     | rt_tgsigqueueinfo      | ✅             | 💯 |
 | 298     | perf_event_open        | ❌             | N/A |
 | 299     | recvmmsg               | ❌             | N/A |
 | 300     | fanotify_init          | ❌             | N/A |
