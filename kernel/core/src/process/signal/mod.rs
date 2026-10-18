@@ -15,7 +15,7 @@ pub(crate) mod signals;
 
 use align_ext::AlignExt;
 use c_types::{siginfo_t, ucontext_t};
-use constants::SIGSEGV;
+use constants::{SI_KERNEL, SIGSEGV};
 use ostd::{
     arch::cpu::context::{FpuContext, UserContext},
     mm::VmIo,
@@ -38,7 +38,11 @@ use crate::{
     process::{
         TermStatus,
         posix_thread::{ContextPthreadAdminApi, do_exit_group, ptrace::PtraceStopResult},
-        signal::{c_types::stack_t, constants::SIGKILL},
+        signal::{
+            c_types::stack_t,
+            constants::SIGKILL,
+            signals::{Signal, fault::FaultSignal},
+        },
     },
 };
 
@@ -218,6 +222,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -
                 }
             }
 
+            let mask_to_restore = restore_sig_mask.as_ref().map(|guard| guard.mask);
             if let Err(e) = handle_user_signal(
                 ctx,
                 sig_num,
@@ -225,18 +230,26 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -
                 flags,
                 restorer_addr,
                 mask,
-                restore_sig_mask.map(RestoreSigMaskGuard::into_mask),
+                mask_to_restore,
                 user_ctx,
                 signal.to_info(),
             ) {
-                debug!("Failed to handle user signal: {:?}", e);
-                // If signal handling fails, the process should be terminated with SIGSEGV.
-                // Reference: <https://elixir.bootlin.com/linux/v6.13/source/kernel/signal.c#L3082>
-                //
-                // FIXME: Linux converts a signal-frame setup failure into a SIGSEGV delivery,
-                // instead of killing the process directly.
-                // This can be observed in LTP test `signal06`.
-                do_exit_group(TermStatus::Killed(SIGSEGV), ctx, user_ctx);
+                debug!("Failed to set up the signal frame: {:?}", e);
+                // The signal mask to restore must be kept so that the frame of the forced
+                // `SIGSEGV` saves it.
+                if let Some(guard) = restore_sig_mask {
+                    ctx.thread_local
+                        .sig_mask_saved()
+                        .set(Some(guard.into_mask()));
+                }
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L3166-L3172>
+                force_sigsegv(ctx, sig_num);
+                // Deliver the forced `SIGSEGV` before returning to user space, as Linux does by
+                // looping in `exit_to_user_mode_loop`.
+                let _ = handle_pending_signal(user_ctx, ctx);
+            } else if let Some(guard) = restore_sig_mask {
+                // The signal mask to restore is saved in the signal frame.
+                let _ = guard.into_mask();
             }
             true
         }
@@ -343,6 +356,43 @@ fn requeue_signal(ctx: &Context, signal: DequeuedSignal) {
     }
 }
 
+/// Forces a signal on the current thread.
+///
+/// If the signal is blocked or ignored, it is unblocked and its handler is reset to `SIG_DFL`.
+/// A forced signal with the default disposition also terminates the init process.
+pub(crate) fn force_signal(ctx: &Context, signal: FaultSignal) {
+    force_signal_with(ctx, signal, false);
+}
+
+/// Forces `SIGSEGV` on the current thread after failing to set up the frame of `failed_sig`.
+///
+/// If `failed_sig` is `SIGSEGV` itself, its handler is reset to `SIG_DFL` so that the forced
+/// `SIGSEGV` terminates the process instead of failing again.
+//
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L1735-L1741>
+fn force_sigsegv(ctx: &Context, failed_sig: SigNum) {
+    let signal = FaultSignal::new(SIGSEGV, SI_KERNEL, None);
+    force_signal_with(ctx, signal, failed_sig == SIGSEGV);
+}
+
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L1339-L1372>
+fn force_signal_with(ctx: &Context, signal: FaultSignal, reset_handler: bool) {
+    let sig_num = signal.num();
+
+    let sig_dispositions = ctx.process.sig_dispositions().lock();
+    let mut sig_dispositions = sig_dispositions.lock();
+
+    let is_blocked = ctx.posix_thread.has_signal_blocked(sig_num);
+    if is_blocked || reset_handler || sig_dispositions.get(sig_num).handler == SigHandler::Ign {
+        sig_dispositions.reset_handler(sig_num);
+    }
+    if is_blocked {
+        ctx.set_sig_mask(ctx.posix_thread.sig_mask() - sig_num);
+    }
+
+    ctx.posix_thread.enqueue_signal(Box::new(signal));
+}
+
 fn get_sig_action(ctx: &Context, sig_num: SigNum) -> SigAction {
     let sig_dispositions = ctx.process.sig_dispositions().lock();
     let sig_dispositions = sig_dispositions.lock();
@@ -372,10 +422,8 @@ pub(crate) fn handle_user_signal(
         mask += sig_num;
     }
 
-    // Block signals in `mask` while running the signal handler.
     let old_mask = ctx.posix_thread.sig_mask();
     let mask_to_restore = mask_to_restore.unwrap_or(old_mask);
-    ctx.set_sig_mask(old_mask + mask);
 
     // Set up the signal stack.
     let mut stack_pointer = if let Some(sp) =
@@ -406,16 +454,7 @@ pub(crate) fn handle_user_signal(
     // 2. Write `ucontext_t`.
 
     // Save the current signal stack information.
-    let uc_stack = {
-        let mut sig_stack = ctx.thread_local.sig_stack().borrow_mut();
-        let stack = stack_t::from(&*sig_stack);
-
-        if sig_stack.flags().contains(SigStackFlags::SS_AUTODISARM) {
-            sig_stack.reset();
-        }
-
-        stack
-    };
+    let uc_stack = stack_t::from(&*ctx.thread_local.sig_stack().borrow());
 
     let mut ucontext = ucontext_t {
         uc_stack,
@@ -426,11 +465,10 @@ pub(crate) fn handle_user_signal(
     // Save general-purpose registers.
     ucontext.uc_mcontext.copy_user_regs_from(user_ctx);
 
-    // Clone and reset the FPU context.
+    // Clone the FPU context.
     let supp = ctx.thread_local.supp_user_context();
     let fpu_context = supp.fpu().get();
     let fpu_context_bytes = fpu_context.as_bytes();
-    supp.fpu().set(FpuContext::new());
 
     cfg_select! {
         target_arch = "x86_64" => {
@@ -536,6 +574,22 @@ pub(crate) fn handle_user_signal(
         "Before calling to signal handler: stack_pointer = 0x{:x}",
         stack_pointer
     );
+
+    // The signal frame is set up. Commit the state changes, which must not happen if the setup
+    // fails.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L3146-L3164>
+
+    // Block signals in `mask` while running the signal handler.
+    ctx.set_sig_mask(old_mask + mask);
+    {
+        let mut sig_stack = ctx.thread_local.sig_stack().borrow_mut();
+        if sig_stack.flags().contains(SigStackFlags::SS_AUTODISARM) {
+            sig_stack.reset();
+        }
+    }
+    // Reset the FPU context.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/signal.c#L293-L312>
+    supp.fpu().set(FpuContext::new());
 
     // 4. Set correct register values.
     user_ctx.set_instruction_pointer(handler_addr as _);
