@@ -51,16 +51,20 @@ pub(super) fn sys_wait4(
     }
 
     if rusage_addr != 0 {
-        let rusage = rusage_t {
-            ru_utime: wait_status.prof_clock().user_clock().read_time().into(),
-            ru_stime: wait_status.prof_clock().kernel_clock().read_time().into(),
-            ..Default::default()
-        };
-
-        ctx.user_space().write_val(rusage_addr, &rusage)?;
+        ctx.user_space()
+            .write_val(rusage_addr, &calculate_rusage(&wait_status))?;
     }
 
     Ok(SyscallReturn::Return(return_pid as _))
+}
+
+/// Calculates the resource usage of the waited child.
+pub(super) fn calculate_rusage(wait_status: &WaitStatus) -> rusage_t {
+    rusage_t {
+        ru_utime: wait_status.prof_clock().user_clock().read_time().into(),
+        ru_stime: wait_status.prof_clock().kernel_clock().read_time().into(),
+        ..Default::default()
+    }
 }
 
 fn calculate_status_code(wait_status: &WaitStatus) -> u32 {

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -66,6 +67,42 @@ FN_TEST(wclone_and_wall)
 		 _ret == fork_child && WIFEXITED(status) &&
 			 WEXITSTATUS(status) == 6);
 	TEST_ERRNO(waitpid(-1, &status, __WALL), ECHILD);
+
+	TEST_SUCC(close(go_pipe[0]));
+	TEST_SUCC(close(go_pipe[1]));
+}
+END_TEST()
+
+FN_TEST(waitid_info_and_rusage)
+{
+	int go_pipe[2];
+	siginfo_t si;
+	struct rusage ru;
+	char byte = 0;
+
+	TEST_SUCC(pipe(go_pipe));
+	pid_t child = TEST_SUCC(fork_waiting_child(go_pipe[0], 9));
+
+	// If no child is waited for, the `siginfo_t` fields are zeroed.
+	memset(&si, 0xff, sizeof(si));
+	TEST_RES(waitid(P_PID, child, &si, WEXITED | WNOHANG),
+		 _ret == 0 && si.si_signo == 0 && si.si_errno == 0 &&
+			 si.si_code == 0 && si.si_pid == 0 && si.si_uid == 0 &&
+			 si.si_status == 0);
+
+	TEST_RES(write(go_pipe[1], &byte, 1), _ret == 1);
+
+	// The resource usage of the child is reported.
+	memset(&si, 0xff, sizeof(si));
+	memset(&ru, 0xff, sizeof(ru));
+	TEST_RES(syscall(SYS_waitid, P_PID, child, &si, WEXITED, &ru),
+		 _ret == 0 && si.si_signo == SIGCHLD && si.si_errno == 0 &&
+			 si.si_code == CLD_EXITED && si.si_pid == child &&
+			 si.si_uid == getuid() && si.si_status == 9 &&
+			 ru.ru_utime.tv_sec >= 0 && ru.ru_utime.tv_usec >= 0 &&
+			 ru.ru_utime.tv_usec < 1000000 &&
+			 ru.ru_stime.tv_sec >= 0 && ru.ru_stime.tv_usec >= 0 &&
+			 ru.ru_stime.tv_usec < 1000000);
 
 	TEST_SUCC(close(go_pipe[0]));
 	TEST_SUCC(close(go_pipe[1]));
