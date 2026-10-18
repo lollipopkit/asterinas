@@ -9,7 +9,7 @@ use aster_softirq::{
     iter_irq_counts_across_all_cpus, iter_softirq_counts_across_all_cpus, softirq_id::*,
 };
 use aster_util::printer::VmPrinter;
-use ostd::util::id_set::Id;
+use ostd::{timer::Jiffies, util::id_set::Id};
 
 use crate::{
     fs::{
@@ -21,7 +21,11 @@ use crate::{
     process::collect_process_creation_count,
     sched::nr_queued_and_running,
     thread::collect_context_switch_count,
-    time::{START_TIME, SystemTime, cpu_time_stats::CpuTimeStatsManager},
+    time::{
+        START_TIME, SystemTime,
+        cpu_time_stats::{CpuTimeStats, CpuTimeStatsManager},
+        duration_to_clock_t,
+    },
 };
 
 /// Represents the inode at `/proc/stat`.
@@ -35,44 +39,49 @@ impl StatFileOps {
         ProcFile::new(Self, parent, mkmod!(a+r))
     }
 
+    /// Prints a line of CPU times in clock ticks of `USER_HZ`, like Linux.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/proc/stat.c#L91-L130>
+    fn print_cpu_stats(
+        printer: &mut VmPrinter,
+        label: impl core::fmt::Display,
+        stats: &CpuTimeStats,
+    ) -> Result<()> {
+        let ticks = |jiffies: Jiffies| duration_to_clock_t(jiffies.as_duration());
+        writeln!(
+            printer,
+            "{} {} {} {} {} {} {} {} {} {} {}",
+            label,
+            ticks(stats.user),
+            ticks(stats.nice),
+            ticks(stats.system),
+            ticks(stats.idle),
+            ticks(stats.iowait),
+            ticks(stats.irq),
+            ticks(stats.softirq),
+            ticks(stats.steal),
+            ticks(stats.guest),
+            ticks(stats.guest_nice)
+        )?;
+        Ok(())
+    }
+
     fn print_stats(printer: &mut VmPrinter) -> Result<()> {
         let stats_manager = CpuTimeStatsManager::singleton();
 
         // Global CPU statistics:
         // cpu <user> <nice> <system> <idle> <iowait> <irq> <softirq> <steal> <guest> <guest_nice>
         let global_stats = stats_manager.collect_stats_on_all_cpus();
-        writeln!(
-            printer,
-            "cpu {} {} {} {} {} {} {} {} {} {}",
-            global_stats.user.as_u64(),
-            global_stats.nice.as_u64(),
-            global_stats.system.as_u64(),
-            global_stats.idle.as_u64(),
-            global_stats.iowait.as_u64(),
-            global_stats.irq.as_u64(),
-            global_stats.softirq.as_u64(),
-            global_stats.steal.as_u64(),
-            global_stats.guest.as_u64(),
-            global_stats.guest_nice.as_u64()
-        )?;
+        // Linux separates the global label from the values with two spaces.
+        Self::print_cpu_stats(printer, "cpu ", &global_stats)?;
 
         // Per-CPU statistics:
         for cpu_id in ostd::cpu::all_cpus() {
             let cpu_stats = stats_manager.collect_stats_on_cpu(cpu_id);
-            writeln!(
+            Self::print_cpu_stats(
                 printer,
-                "cpu{} {} {} {} {} {} {} {} {} {} {}",
-                cpu_id.as_usize(),
-                cpu_stats.user.as_u64(),
-                cpu_stats.nice.as_u64(),
-                cpu_stats.system.as_u64(),
-                cpu_stats.idle.as_u64(),
-                cpu_stats.iowait.as_u64(),
-                cpu_stats.irq.as_u64(),
-                cpu_stats.softirq.as_u64(),
-                cpu_stats.steal.as_u64(),
-                cpu_stats.guest.as_u64(),
-                cpu_stats.guest_nice.as_u64()
+                format_args!("cpu{}", cpu_id.as_usize()),
+                &cpu_stats,
             )?;
         }
 

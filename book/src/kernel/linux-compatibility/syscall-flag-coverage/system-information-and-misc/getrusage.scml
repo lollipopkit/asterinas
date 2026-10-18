@@ -4,6 +4,12 @@ getrusage(
     usage
 );
 
+// Return resource usage statistics for the terminated and waited-for children
+getrusage(
+    who = RUSAGE_CHILDREN,
+    usage
+);
+
 // Return resource usage statistics for the calling thread
 getrusage(
     who = RUSAGE_THREAD,

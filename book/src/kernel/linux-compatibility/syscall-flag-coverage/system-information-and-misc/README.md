@@ -30,8 +30,10 @@ Supported functionality in SCML:
 {{#include getrusage.scml}}
 ```
 
-Unsupported `who` flags:
-* `RUSAGE_CHILDREN`
+Supported returned fields:
+* `ru_utime` and `ru_stime`
+
+The other fields are reported as zero.
 
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/getrusage.2.html).

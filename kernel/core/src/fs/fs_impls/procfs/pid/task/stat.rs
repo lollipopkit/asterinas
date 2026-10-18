@@ -2,10 +2,9 @@
 
 #![short_vis_path::add(pid)]
 
-use core::{sync::atomic::Ordering, time::Duration};
+use core::sync::atomic::Ordering;
 
 use aster_util::printer::VmPrinter;
-use ostd::timer::TIMER_FREQ;
 
 use super::{super::PidDirOps, TidDirOps};
 use crate::{
@@ -22,7 +21,7 @@ use crate::{
     },
     sched::{LinuxSchedPolicy, RealTimePriority, SchedPolicy},
     thread::Thread,
-    time::NSEC_PER_SEC,
+    time::duration_to_clock_t,
     vm::vmar::RssType,
 };
 
@@ -54,7 +53,7 @@ use crate::{
 /// - priority         : Kernel scheduling priority.
 /// - nice             : Nice value (-20 to 19; lower is higher priority).
 /// - num_threads      : Number of threads.
-/// - itrealvalue      : Time before the next `SIGALRM`.
+/// - itrealvalue      : Always zero since Linux 2.6.17.
 /// - starttime        : Process start time since boot (clock ticks).
 /// - vsize            : Virtual memory size (bytes).
 /// - rss              : Resident Set Size (pages in real memory).
@@ -183,25 +182,24 @@ impl ProcFileOps for StatFileOps {
                 StatMode::Thread => posix_thread.prof_clock(),
             };
             (
-                prof_clock.user_clock().read_jiffies().as_u64(),
-                prof_clock.kernel_clock().read_jiffies().as_u64(),
+                duration_to_clock_t(prof_clock.user_clock().read_time()),
+                duration_to_clock_t(prof_clock.kernel_clock().read_time()),
             )
         };
 
         let (cutime, cstime) = {
             let (user_time, kernel_time) = process.reaped_children_stats().lock().get();
             (
-                duration_to_jiffies(user_time),
-                duration_to_jiffies(kernel_time),
+                duration_to_clock_t(user_time),
+                duration_to_clock_t(kernel_time),
             )
         };
 
         let (priority, rt_priority, policy) = sched_values(&thread);
         let nice = process.nice().load(Ordering::Relaxed).value().get();
         let num_threads = process.tasks().lock().as_slice().len();
-        let itrealvalue =
-            duration_to_jiffies(process.timer_manager().alarm_timer().lock().remain());
-        let starttime = process.start_time().as_u64();
+        let itrealvalue = 0;
+        let starttime = duration_to_clock_t(process.start_time().as_duration());
 
         let (
             vsize,
@@ -345,16 +343,6 @@ impl ProcFileOps for StatFileOps {
 
         Ok(printer.bytes_written())
     }
-}
-
-/// Converts a duration into kernel clock ticks.
-fn duration_to_jiffies(duration: Duration) -> u64 {
-    const NSEC_PER_JIFFY: u64 = NSEC_PER_SEC as u64 / TIMER_FREQ;
-    const { assert!((NSEC_PER_SEC as u64).is_multiple_of(TIMER_FREQ)) };
-
-    let sec_jiffies = duration.as_secs().saturating_mul(TIMER_FREQ);
-    let subsec_jiffies = u64::from(duration.subsec_nanos()) / NSEC_PER_JIFFY;
-    sec_jiffies.saturating_add(subsec_jiffies)
 }
 
 /// Returns the `priority`, `rt_priority`, and `policy` values for `/proc/<pid>/stat`.
