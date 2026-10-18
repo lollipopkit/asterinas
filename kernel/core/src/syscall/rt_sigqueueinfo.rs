@@ -33,7 +33,7 @@ pub(super) fn sys_rt_sigqueueinfo(
         return_errno_with_message!(Errno::ESRCH, "the target process does not exist");
     }
 
-    kill(pid as Pid, to_signal(sig, info)?, ctx)?;
+    kill(pid as Pid, to_signal(sig, info), ctx)?;
     Ok(SyscallReturn::Return(0))
 }
 
@@ -58,7 +58,7 @@ pub(super) fn sys_rt_tgsigqueueinfo(
     }
     check_si_code(&info, tid, ctx)?;
 
-    tgkill(tid as Tid, Some(tgid as Pid), to_signal(sig, info)?, ctx)?;
+    tgkill(tid as Tid, Some(tgid as Pid), to_signal(sig, info), ctx)?;
     Ok(SyscallReturn::Return(0))
 }
 
@@ -76,13 +76,9 @@ fn check_si_code(info: &siginfo_t, target_tid: i32, ctx: &Context) -> Result<()>
     Ok(())
 }
 
+/// Converts the signal number into a signal, whose error is reported after the target is found.
 fn to_signal(sig: i32, info: siginfo_t) -> Result<Option<Box<dyn Signal>>> {
-    if sig == 0 {
-        return Ok(None);
-    }
-
-    u8::try_from(sig)
-        .map_err(|_| Error::with_message(Errno::EINVAL, "invalid signal number"))
-        .and_then(SigNum::try_from)?;
-    Ok(Some(Box::new(RawSignal::new(info))))
+    let signal = SigNum::try_from_raw(sig as u64)?
+        .map(|_| Box::new(RawSignal::new(info)) as Box<dyn Signal>);
+    Ok(signal)
 }

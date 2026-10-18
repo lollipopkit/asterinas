@@ -292,7 +292,7 @@ const SIGTRAP_NUM: i32 = SIGTRAP.as_u8() as i32;
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L3501-L3515>
 fn sig_sicodes(signo: i32) -> Option<(i32, SigInfoLayout)> {
-    let num = SigNum::try_from(u8::try_from(signo).ok()?).ok()?;
+    let num = SigNum::try_from_raw(signo as u64).ok().flatten()?;
     let sicodes = match num {
         SIGILL => (NSIGILL, SigInfoLayout::Fault),
         SIGFPE => (NSIGFPE, SigInfoLayout::Fault),

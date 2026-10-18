@@ -10,7 +10,11 @@ use crate::{
             c_types::siginfo_t,
             constants::SI_TKILL,
             sig_num::SigNum,
-            signals::{Signal, raw::RawSignal, user::UserSignal},
+            signals::{
+                Signal,
+                raw::RawSignal,
+                user::{UserSignal, UserSignalKind},
+            },
         },
         tgkill,
     },
@@ -20,56 +24,71 @@ use crate::{
 
 pub(super) fn sys_pidfd_send_signal(
     pidfd: RawFileDesc,
-    sig_num: u64,
+    sig_num: i32,
     info_ptr: Vaddr,
     flags: u32,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
     let flags = PidfdSendSignalFlags::try_from(flags)?;
-    let sig_num = if sig_num == 0 {
-        None
-    } else {
-        Some(SigNum::try_from(sig_num as u8)?)
-    };
     debug!(
-        "pidfd={}, info_ptr={:#x}, flags={:?}",
-        pidfd, info_ptr, flags
+        "pidfd={}, sig_num={}, info_ptr={:#x}, flags={:?}",
+        pidfd, sig_num, info_ptr, flags
     );
 
     let target = get_target_from_pidfd(pidfd, flags, ctx)?;
 
-    let signal = if let Some(sig_num) = sig_num {
-        let siginfo = read_siginfo_from_user(info_ptr, sig_num, ctx)?;
-
-        // Only check `si_code` permissions when the user explicitly provided a siginfo.
-        // When `info_ptr` is `NULL`, the kernel generates the siginfo, so no restriction applies.
-        if info_ptr != 0 {
-            let is_self = match &target {
-                SignalTarget::Thread { tid, tgid: _ } => *tid == ctx.posix_thread.tid(),
-                SignalTarget::Process { pid } => *pid == ctx.posix_thread.tid(),
-                SignalTarget::ProcessGroup { pgid: _ } => false,
-            };
-
-            if !is_self && (siginfo.si_code >= 0 || siginfo.si_code == SI_TKILL) {
-                return_errno_with_message!(
-                    Errno::EPERM,
-                    "signals with custom code can only be sent to the current thread/process"
-                );
-            }
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L4091-L4130>
+    let siginfo = if info_ptr != 0 {
+        let siginfo = siginfo_t::read_from_user(info_ptr, None, ctx)?;
+        if siginfo.si_signo != sig_num {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "`siginfo.si_signo` does not match the specified signal number"
+            );
         }
 
-        Some(RawSignal::new(siginfo))
+        let is_self = match &target {
+            SignalTarget::Thread { tid, tgid: _ } => *tid == ctx.posix_thread.tid(),
+            SignalTarget::Process { pid } => *pid == ctx.posix_thread.tid(),
+            SignalTarget::ProcessGroup { pgid: _ } => false,
+        };
+        if !is_self && (siginfo.si_code >= 0 || siginfo.si_code == SI_TKILL) {
+            return_errno_with_message!(
+                Errno::EPERM,
+                "signals with custom code can only be sent to the current thread/process"
+            );
+        }
+
+        Some(siginfo)
     } else {
         None
     };
 
+    // The signal number is checked after the target is found.
+    let signal = SigNum::try_from_raw(sig_num as u64).map(|sig_num| {
+        sig_num.map(|sig_num| {
+            // If `info_ptr` is NULL, the kernel constructs a default `siginfo_t` structure
+            // like `kill()` or `tgkill()`.
+            let siginfo = siginfo.unwrap_or_else(|| {
+                let kind = match &target {
+                    SignalTarget::Thread { .. } => UserSignalKind::Tkill,
+                    _ => UserSignalKind::Kill,
+                };
+                let pid = ctx.process.pid();
+                let uid = ctx.posix_thread.credentials().ruid();
+                UserSignal::new(sig_num, kind, pid, uid).to_info()
+            });
+            RawSignal::new(siginfo)
+        })
+    });
+
     match target {
         SignalTarget::Thread { tid, tgid } => {
-            let signal = signal.map(|s| Box::new(s) as Box<dyn Signal>);
+            let signal = signal.map(|s| s.map(|s| Box::new(s) as Box<dyn Signal>));
             tgkill(tid, Some(tgid), signal, ctx)?;
         }
         SignalTarget::Process { pid } => {
-            let signal = signal.map(|s| Box::new(s) as Box<dyn Signal>);
+            let signal = signal.map(|s| s.map(|s| Box::new(s) as Box<dyn Signal>));
             kill(pid, signal, ctx)?;
         }
         SignalTarget::ProcessGroup { pgid } => {
@@ -78,23 +97,6 @@ pub(super) fn sys_pidfd_send_signal(
     }
 
     Ok(SyscallReturn::Return(0))
-}
-
-fn read_siginfo_from_user(info_ptr: Vaddr, sig_num: SigNum, ctx: &Context) -> Result<siginfo_t> {
-    if info_ptr != 0 {
-        let si = siginfo_t::read_from_user(info_ptr, None, ctx)?;
-        if si.si_signo != sig_num.as_u8() as i32 {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "`siginfo.si_signo` does not match the specified signal number"
-            );
-        }
-        Ok(si)
-    } else {
-        // If `info_ptr` is NULL, the kernel constructs a default `siginfo_t` structure
-        // whose fields match the values that are implicitly supplied when a signal is sent using the kill(2).
-        Ok(UserSignal::new_kill(sig_num, ctx).to_info())
-    }
 }
 
 fn get_target_from_pidfd(

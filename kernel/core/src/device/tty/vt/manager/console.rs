@@ -122,16 +122,8 @@ impl TryInto<VtMode> for CVtMode {
         // - 0 means "no signal";
         // - invalid/unknown signal numbers are treated as 0 (`None`) instead of
         //   returning an error.
-        let release_signal = if self.relsig == 0 {
-            None
-        } else {
-            SigNum::try_from(self.relsig as u8).ok()
-        };
-        let acquire_signal = if self.acqsig == 0 {
-            None
-        } else {
-            SigNum::try_from(self.acqsig as u8).ok()
-        };
+        let release_signal = SigNum::try_from_raw(self.relsig.into()).ok().flatten();
+        let acquire_signal = SigNum::try_from_raw(self.acqsig.into()).ok().flatten();
 
         Ok(VtMode {
             mode_type,

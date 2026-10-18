@@ -19,13 +19,14 @@ use crate::{
 };
 
 pub(super) fn sys_rt_sigaction(
-    sig_num: u8,
+    sig_num: i32,
     sig_action_addr: Vaddr,
     old_sig_action_addr: Vaddr,
     sigset_size: usize,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let sig_num = SigNum::try_from(sig_num)?;
+    let sig_num = SigNum::try_from_raw(sig_num as u64)?
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid signal number"))?;
     debug!(
         "signal = {}, sig_action_addr = 0x{:x}, old_sig_action_addr = 0x{:x}, sigset_size = {}",
         sig_num.sig_name(),

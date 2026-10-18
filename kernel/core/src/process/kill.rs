@@ -18,11 +18,14 @@ use crate::{
 /// if it is authorized to send the signal to this particular target process.
 ///
 /// If `signal` is `None`, this method will only check permission without sending
-/// any signal.
-pub(crate) fn kill(pid: Pid, signal: Option<Box<dyn Signal>>, ctx: &Context) -> Result<()> {
+/// any signal. If `signal` is an error (e.g., an invalid signal number), the error is
+/// returned after the target is found, like Linux.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L823-L830>
+pub(crate) fn kill(pid: Pid, signal: Result<Option<Box<dyn Signal>>>, ctx: &Context) -> Result<()> {
     // Fast path: If the signal is sent to self, we can skip most checks.
     if pid == ctx.process.pid() {
-        let Some(signal) = signal else {
+        let Some(signal) = signal? else {
             return Ok(());
         };
 
@@ -40,7 +43,7 @@ pub(crate) fn kill(pid: Pid, signal: Option<Box<dyn Signal>>, ctx: &Context) -> 
         .get_process(pid)
         .ok_or_else(|| Error::with_message(Errno::ESRCH, "the target process does not exist"))?;
 
-    kill_process(&process, signal, ctx)
+    kill_process(&process, signal?, ctx)
 }
 
 /// Sends a signal to all processes in a group, using the current process
@@ -50,15 +53,17 @@ pub(crate) fn kill(pid: Pid, signal: Option<Box<dyn Signal>>, ctx: &Context) -> 
 /// if it is authorized to send the signal to the target group.
 ///
 /// If `signal` is `None`, this method will only check permission without sending
-/// any signal.
+/// any signal. If `signal` is an error, the error is returned after the target is found.
 pub(crate) fn kill_group<S: Signal + Clone>(
     pgid: Pgid,
-    signal: Option<S>,
+    signal: Result<Option<S>>,
     ctx: &Context,
 ) -> Result<()> {
     let process_group = pid_table::pid_table_mut()
         .get_process_group(&pgid)
         .ok_or_else(|| Error::with_message(Errno::ESRCH, "the target group does not exist"))?;
+    // A process group that exists is not empty.
+    let signal = signal?;
 
     let mut result = Ok(());
 
@@ -83,11 +88,11 @@ pub(crate) fn kill_group<S: Signal + Clone>(
 /// Checks the target thread belongs to the target process if `tgid` is provided.
 ///
 /// If `signal` is `None`, this method will only check permission without sending
-/// any signal.
+/// any signal. If `signal` is an error, the error is returned after the target is found.
 pub(crate) fn tgkill(
     tid: Tid,
     tgid: Option<Pid>,
-    signal: Option<Box<dyn Signal>>,
+    signal: Result<Option<Box<dyn Signal>>>,
     ctx: &Context,
 ) -> Result<()> {
     let thread = pid_table::pid_table_mut()
@@ -107,6 +112,7 @@ pub(crate) fn tgkill(
     }
 
     // Check permission
+    let signal = signal?;
     let signum = signal.as_ref().map(|signal| signal.num());
     check_signal_perm(target_posix_thread, ctx, signum)?;
 
@@ -128,24 +134,35 @@ pub(crate) fn tgkill(
 ///
 /// The credentials of the current process will be checked to determine
 /// if it is authorized to send the signal to the target group.
-pub(crate) fn kill_all<S: Signal + Clone>(signal: Option<S>, ctx: &Context) -> Result<()> {
+///
+/// If `signal` is an error, the error is returned if any target is found.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L1642-L1656>
+pub(crate) fn kill_all<S: Signal + Clone>(signal: Result<Option<S>>, ctx: &Context) -> Result<()> {
     let mut result = Ok(());
+    let mut count = 0;
 
     for process in pid_table::pid_table_mut().iter_processes() {
         if Arc::ptr_eq(&ctx.process, &process) || process.is_init_process() {
             continue;
         }
+        count += 1;
 
-        let res = kill_process(
-            &process,
-            signal.clone().map(|s| Box::new(s) as Box<dyn Signal>),
-            ctx,
-        );
+        let res = signal.clone().and_then(|signal| {
+            kill_process(
+                &process,
+                signal.map(|s| Box::new(s) as Box<dyn Signal>),
+                ctx,
+            )
+        });
         if res.is_err_and(|err| err.error() != Errno::EPERM) {
             result = res;
         }
     }
 
+    if count == 0 {
+        return_errno_with_message!(Errno::ESRCH, "no target process exists");
+    }
     result
 }
 
