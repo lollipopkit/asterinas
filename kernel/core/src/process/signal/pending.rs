@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::Ordering;
+
 use crate::{
     prelude::*,
     process::{
@@ -132,6 +134,12 @@ fn has_pending_signal(posix_thread: &PosixThread, process: &Process) -> bool {
     // A pending ptrace trap interrupts the thread like a pending signal.
     // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L159-L175>
     if posix_thread.ptrace_has_pending_trap() {
+        return true;
+    }
+
+    // A thread that has yet to participate in a group stop is interrupted as well.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2686-L2692>
+    if posix_thread.group_stop_pending().load(Ordering::Relaxed) {
         return true;
     }
 

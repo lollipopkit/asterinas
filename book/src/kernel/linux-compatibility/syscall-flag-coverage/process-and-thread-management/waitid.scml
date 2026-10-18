@@ -2,6 +2,7 @@
 waitid(
     which = P_PID | P_PIDFD | P_PGID | P_ALL,
     pid, infop,
-    options = WNOHANG | WSTOPPED | WCONTINUED | WNOWAIT,
+    options = WNOHANG | WEXITED | WSTOPPED | WCONTINUED | WNOWAIT |
+              __WNOTHREAD | __WALL | __WCLONE,
     ru
 );

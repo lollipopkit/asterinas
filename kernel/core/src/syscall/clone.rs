@@ -97,8 +97,23 @@ impl TryFrom<Clone3Args> for CloneArgs {
         // This checks arguments only for the `clone3()` system call.
         // Reference: <https://elixir.bootlin.com/linux/v6.16.9/source/kernel/fork.c#L2843-L2869>.
 
-        let flags = CloneFlags::from_bits(value.flags as u32)
+        // TODO: Support the other `clone3`-only flags above bit 31 (`CLONE_INTO_CGROUP`, etc.).
+        // They are rejected rather than silently ignored.
+        //
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2992-L3010>
+        const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+        let clear_sighand = value.flags & CLONE_CLEAR_SIGHAND != 0;
+        let flags = u32::try_from(value.flags & !CLONE_CLEAR_SIGHAND)
+            .ok()
+            .and_then(CloneFlags::from_bits)
+            .filter(|flags| !flags.contains(CloneFlags::CLONE_DETACHED))
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clone flags"))?;
+        if clear_sighand && flags.contains(CloneFlags::CLONE_SIGHAND) {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "`CLONE_CLEAR_SIGHAND` cannot be used together with `CLONE_SIGHAND`"
+            );
+        }
         let exit_signal = SigNum::try_from_raw(value.exit_signal)
             .map_err(|_| Error::with_message(Errno::EINVAL, "invalid exit signal"))?;
         if flags.intersects(CloneFlags::CLONE_PARENT | CloneFlags::CLONE_THREAD)
@@ -141,6 +156,7 @@ impl TryFrom<Clone3Args> for CloneArgs {
             stack,
             stack_size,
             tls: value.tls,
+            clear_sighand,
             _set_tid: Some(value.set_tid),
             _set_tid_size: Some(value.set_tid_size),
             _cgroup: Some(value.cgroup),

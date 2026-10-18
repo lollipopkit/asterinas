@@ -192,9 +192,8 @@ impl PosixThread {
         }
 
         let child_status = child.tracee_status.get().unwrap();
-        if is_seized {
-            child_status.set_trap_stop_for_new_child(&child.process());
-        } else {
+        child_status.init_jobctl_for_new_child(&child.process(), is_seized);
+        if !is_seized {
             // Linux adds `SIGSTOP` to the private pending set without a `siginfo`,
             // which is then reported as a `SI_USER` signal from PID 0 and UID 0.
             child.enqueue_signal(Box::new(UserSignal::new(
@@ -780,15 +779,20 @@ impl TraceeStatus {
         true
     }
 
-    /// Schedules the initial `PTRACE_EVENT_STOP` of a new child of a seized tracee.
+    /// Initializes the job control states of a new child.
     ///
-    /// The child also joins the group-stop that is in effect.
+    /// A seized child starts with a `PTRACE_EVENT_STOP`. The child also joins the group-stop
+    /// that is in effect.
     ///
-    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L387-L399>
-    fn set_trap_stop_for_new_child(&self, process: &Process) {
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L387-L399>,
+    /// <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/ptrace.h#L209-L216>
+    fn init_jobctl_for_new_child(&self, process: &Process, is_seized: bool) {
         let mut state = self.state.lock();
 
-        let mut jobctl = state.jobctl | JobCtl::TRAP_STOP;
+        let mut jobctl = state.jobctl;
+        if is_seized {
+            jobctl |= JobCtl::TRAP_STOP;
+        }
         if let Some(stop_signal) = process.stop_signal() {
             state.stop_signal = stop_signal;
             jobctl |= JobCtl::STOP_PENDING;
@@ -929,6 +933,7 @@ impl TraceeStatus {
         }
         self.set_jobctl(&mut state, jobctl);
         state.is_event_stop = state.is_seized;
+        let group_stop_done = ctx.process.participate_group_stop(ctx.posix_thread);
 
         let result = self.do_ptrace_stop(
             state,
@@ -937,6 +942,7 @@ impl TraceeStatus {
             wait_status,
             None,
             CLD_STOPPED,
+            group_stop_done,
             ctx,
             user_ctx,
         );
@@ -983,6 +989,7 @@ impl TraceeStatus {
             wait_status,
             None,
             CLD_TRAPPED,
+            None,
             ctx,
             user_ctx,
         )
@@ -1022,6 +1029,7 @@ impl TraceeStatus {
             wait_status,
             Some(event),
             CLD_TRAPPED,
+            None,
             ctx,
             user_ctx,
         );
@@ -1053,6 +1061,7 @@ impl TraceeStatus {
             wait_status,
             None,
             CLD_TRAPPED,
+            None,
             ctx,
             user_ctx,
         )
@@ -1060,6 +1069,9 @@ impl TraceeStatus {
 
     /// Enters a ptrace-stop and notifies the tracer with `SIGCHLD` of `code`
     /// (`CLD_TRAPPED` or `CLD_STOPPED`).
+    ///
+    /// If `group_stop_done` is the stop signal of a group stop that this ptrace-stop completes,
+    /// the real parent is notified as well, unless it is the tracer.
     #[expect(clippy::too_many_arguments)]
     fn do_ptrace_stop(
         &self,
@@ -1069,6 +1081,7 @@ impl TraceeStatus {
         wait_status: PtraceWaitStatus,
         event: Option<PtraceEvent>,
         code: i32,
+        group_stop_done: Option<SigNum>,
         ctx: &Context,
         user_ctx: &mut UserContext,
     ) -> PtraceStopResult {
@@ -1090,12 +1103,24 @@ impl TraceeStatus {
         self.is_stopped.store(true, Ordering::Relaxed);
         drop(state);
 
+        // The tracer is notified of every ptrace-stop, while the real parent is only notified of
+        // the completion of a group stop.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2514-L2527>
+        let tracer_process = tracer.as_posix_thread().unwrap().process();
         sigchld::notify_parent_of_stop(
             ChildSource::Thread(ctx.posix_thread),
-            &tracer.as_posix_thread().unwrap().process(),
+            &tracer_process,
             code,
             wait_status.to_sigchld_si_status(),
         );
+        if let Some(sig_num) = group_stop_done
+            && !core::ptr::eq(
+                ctx.process.parent().lock().process().as_ptr(),
+                Arc::as_ptr(&tracer_process),
+            )
+        {
+            ctx.process.notify_parent_of_group_stop(sig_num);
+        }
 
         let waiter = Waiter::new_pair().0;
         if waiter

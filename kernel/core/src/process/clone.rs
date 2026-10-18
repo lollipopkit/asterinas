@@ -35,7 +35,7 @@ use crate::{
     },
     sched::Nice,
     security::audit,
-    thread::{AsThread, Tid},
+    thread::{AsThread, Thread, Tid},
     vm::vmar::{Vmar, VmarHandle},
 };
 
@@ -114,6 +114,8 @@ pub(crate) struct CloneArgs {
     pub stack: Option<NonZeroU64>,
     pub stack_size: Option<NonZeroU64>,
     pub tls: u64,
+    /// Whether to reset the signal handlers of the child (`CLONE_CLEAR_SIGHAND` of `clone3`).
+    pub clear_sighand: bool,
     pub _set_tid: Option<u64>,
     pub _set_tid_size: Option<u64>,
     pub _cgroup: Option<u64>,
@@ -130,10 +132,8 @@ impl CloneArgs {
     ) -> Result<Self> {
         const FLAG_MASK: u64 = 0xff;
         let flags = CloneFlags::from(raw_flags & !FLAG_MASK);
-        let exit_signal = match (raw_flags & FLAG_MASK) as u8 {
-            0 => None,
-            sig_num => SigNum::try_from(sig_num).ok(),
-        };
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2731-L2732>
+        let exit_signal = SigNum::try_from_raw(raw_flags & FLAG_MASK)?;
 
         // Disambiguate the `parent_tid` parameter. The field is used
         // both for `CLONE_PIDFD` and `CLONE_PARENT_SETTID`, so at
@@ -499,16 +499,16 @@ fn clone_child_task(
         thread_builder.build()
     };
 
-    process
-        .tasks()
-        .lock()
-        .insert(child_task.clone())
-        .map_err(|_| {
-            Error::with_message(
-                Errno::EINTR,
-                "the process has exited or has already executed a new program",
-            )
-        })?;
+    let mut tasks = process.tasks().lock();
+    tasks.insert(child_task.clone()).map_err(|_| {
+        Error::with_message(
+            Errno::EINTR,
+            "the process has exited or has already executed a new program",
+        )
+    })?;
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2527-L2534>
+    process.join_group_stop(child_task.as_posix_thread().unwrap());
+    drop(tasks);
 
     let child_thread = child_task.as_thread().unwrap();
     pid_table::pid_table_mut().insert_thread(child_tid, child_thread);
@@ -553,7 +553,11 @@ fn clone_child_process(
     let child_fs = clone_fs(&thread_local.borrow_fs(), clone_flags);
 
     // Clone signal dispositions
-    let child_sig_dispositions = clone_sighand(process.sig_dispositions(), clone_flags);
+    let child_sig_dispositions = clone_sighand(
+        process.sig_dispositions(),
+        clone_flags,
+        clone_args.clear_sighand,
+    );
 
     // Clone System V semaphore
     clone_sysvsem(clone_flags)?;
@@ -670,7 +674,7 @@ fn clone_child_process(
     audit::on_fork(process, &child);
 
     // Sets parent process and group for child process.
-    set_parent_and_group(clone_flags, process, &child);
+    set_parent_and_group(clone_flags, ctx, &child);
 
     Ok(child)
 }
@@ -788,18 +792,23 @@ fn clone_files(parent_file_table: &RwArc<FileTable>, clone_flags: CloneFlags) ->
     }
 }
 
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L1672-L1695>
 fn clone_sighand(
     parent_sig_dispositions: &Mutex<Arc<Mutex<SigDispositions>>>,
     clone_flags: CloneFlags,
+    clear_sighand: bool,
 ) -> Arc<Mutex<SigDispositions>> {
     // If CLONE_SIGHAND is set, the child and parent shares the same signal handlers.
     // Otherwise, the child has a copy of the parent's signal handlers.
     if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
         parent_sig_dispositions.lock().clone()
     } else {
-        let sig_dispositions = parent_sig_dispositions.lock();
-        let sig_dispositions = sig_dispositions.lock();
-        Arc::new(Mutex::new(*sig_dispositions))
+        let mut sig_dispositions = *parent_sig_dispositions.lock().lock();
+        // `CLONE_CLEAR_SIGHAND` resets the handlers that are not `SIG_IGN`, like `execve`.
+        if clear_sighand {
+            sig_dispositions.inherit();
+        }
+        Arc::new(Mutex::new(sig_dispositions))
     }
 }
 
@@ -902,9 +911,11 @@ fn create_child_process(
     child_proc
 }
 
-fn set_parent_and_group(clone_flags: CloneFlags, parent: &Arc<Process>, child: &Arc<Process>) {
+fn set_parent_and_group(clone_flags: CloneFlags, ctx: &Context, child: &Arc<Process>) {
+    let parent = &ctx.process;
+
     loop {
-        let real_parent = clone_parent(clone_flags, parent);
+        let (real_parent, real_parent_thread) = clone_parent(clone_flags, ctx);
 
         // Lock the parent's children before checking its status.
         let mut children_mut = real_parent.children().lock();
@@ -917,7 +928,10 @@ fn set_parent_and_group(clone_flags: CloneFlags, parent: &Arc<Process>, child: &
         };
 
         // Lock order: children of process -> parent of process
-        child.parent().lock().set_process(&real_parent);
+        child
+            .parent()
+            .lock()
+            .set_process_and_thread(&real_parent, real_parent_thread);
 
         // Update `has_child_subreaper` for the child process to
         // make sure the `has_child_subreaper` state of the child process
@@ -952,12 +966,25 @@ fn set_parent_and_group(clone_flags: CloneFlags, parent: &Arc<Process>, child: &
     }
 }
 
-fn clone_parent(clone_flags: CloneFlags, current: &Arc<Process>) -> Cow<'_, Arc<Process>> {
+/// Returns the real parent process and the real parent thread of the new child process.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2443-L2449>
+fn clone_parent<'a>(
+    clone_flags: CloneFlags,
+    ctx: &'a Context,
+) -> (Cow<'a, Arc<Process>>, Weak<Thread>) {
     if clone_flags.contains(CloneFlags::CLONE_PARENT) {
         // The parent process of the current process cannot be `None`, since we have checked that
         // the current process is not the init process.
-        Cow::Owned(current.parent().lock().process().upgrade().unwrap())
+        let parent = ctx.process.parent().lock();
+        (
+            Cow::Owned(parent.process().upgrade().unwrap()),
+            parent.thread().clone(),
+        )
     } else {
-        Cow::Borrowed(current)
+        (
+            Cow::Borrowed(&ctx.process),
+            Arc::downgrade(ctx.task.as_thread().unwrap()),
+        )
     }
 }
