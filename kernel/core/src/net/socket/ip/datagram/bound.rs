@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use aster_bigtcp::{
     errors::udp::{RecvError, SendError},
     wire::{IpAddress, IpEndpoint},
@@ -10,6 +12,7 @@ use crate::{
     events::IoEvents,
     net::{
         iface::{Iface, UdpSocket},
+        route::is_broadcast_endpoint,
         socket::{
             ip::common::{BindLocks, select_source},
             util::{RecvFlags, RecvOutput, SendFlags, datagram_common},
@@ -37,6 +40,13 @@ pub(super) struct BoundDatagram {
     /// The source address selected by `connect` if the socket is bound at the unspecified
     /// address.
     connected_source: Option<ConnectedSource>,
+    /// Whether the route to the remote endpoint has been checked, like a cached route (i.e.,
+    /// `sk_dst_cache`) in Linux.
+    ///
+    /// Like Linux, a datagram to the remote endpoint is not checked against `SO_BROADCAST` if the
+    /// route is cached. The cache is set by a successful `connect` or `send`, and is reset by
+    /// every `connect`, even if it fails.
+    is_route_cached: AtomicBool,
     locks: BindLocks,
 }
 
@@ -54,8 +64,54 @@ impl BoundDatagram {
             bound_sockets,
             remote_endpoint: None,
             connected_source: None,
+            is_route_cached: AtomicBool::new(false),
             locks,
         }
+    }
+
+    /// Connects to the remote endpoint.
+    ///
+    /// Like Linux, connecting to a broadcast address requires `SO_BROADCAST`. If connecting
+    /// fails, the socket stays associated with the previous remote endpoint (if any), but the
+    /// route must be checked again.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/datagram.c#L36-L63>
+    pub(super) fn connect(&mut self, remote: &IpEndpoint, can_broadcast: bool) -> Result<()> {
+        *self.is_route_cached.get_mut() = false;
+
+        if !can_broadcast && is_broadcast_endpoint(remote) {
+            return_errno_with_message!(
+                Errno::EACCES,
+                "connecting to a broadcast address without SO_BROADCAST is not allowed"
+            );
+        }
+
+        datagram_common::Bound::set_remote_endpoint(self, remote)?;
+        *self.is_route_cached.get_mut() = true;
+
+        Ok(())
+    }
+
+    /// Checks the route to the connected remote endpoint if it is not cached.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L1402-L1432>
+    pub(super) fn check_connected_route(&self, can_broadcast: bool) -> Result<()> {
+        if self.is_route_cached.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        if let Some(remote) = self.remote_endpoint.as_ref()
+            && !can_broadcast
+            && is_broadcast_endpoint(remote)
+        {
+            return_errno_with_message!(
+                Errno::EACCES,
+                "sending to a broadcast address without SO_BROADCAST is not allowed"
+            );
+        }
+
+        self.is_route_cached.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn first_socket(&self) -> &UdpSocket {
@@ -79,6 +135,7 @@ impl BoundDatagram {
         }
         self.remote_endpoint = None;
         self.connected_source = None;
+        *self.is_route_cached.get_mut() = false;
 
         if self.locks.port {
             return None;

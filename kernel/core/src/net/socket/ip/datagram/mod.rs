@@ -111,6 +111,7 @@ impl DatagramSocket {
         remote: Option<&IpEndpoint>,
         flags: SendFlags,
     ) -> Result<usize> {
+        let can_broadcast = self.options.read().socket.broadcast();
         let (sent_bytes, iface_to_poll) = select_remote_and_bind(
             &self.inner,
             remote,
@@ -126,6 +127,18 @@ impl DatagramSocket {
                     .bind_ephemeral(remote_endpoint, &self.pollee)
             },
             |bound_datagram, remote_endpoint| {
+                // Like Linux, the socket is bound before the route is checked.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L849-L851>
+                match remote {
+                    Some(remote) if !can_broadcast && is_broadcast_endpoint(remote) => {
+                        return_errno_with_message!(
+                            Errno::EACCES,
+                            "sending to a broadcast address without SO_BROADCAST is not allowed"
+                        );
+                    }
+                    Some(_) => (),
+                    None => bound_datagram.check_connected_route(can_broadcast)?,
+                }
                 let (sent_bytes, iface_to_poll) =
                     bound_datagram.send(reader, remote_endpoint, flags)?;
                 Ok((sent_bytes, iface_to_poll.clone()))
@@ -180,14 +193,15 @@ impl Socket for DatagramSocket {
         let endpoint =
             map_unspecified_to_localhost(IpAddressFamily::IPv4.to_endpoint(socket_addr)?);
         let can_broadcast = self.options.read().socket.broadcast();
-        if !can_broadcast && is_broadcast_endpoint(&endpoint) {
-            return_errno_with_message!(
-                Errno::EACCES,
-                "connecting to a broadcast address without SO_BROADCAST is not allowed"
-            );
-        }
 
-        self.inner.write().connect(&endpoint, &self.pollee)
+        // Like Linux, the socket is bound before the route is checked.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/af_inet.c#L597>
+        let mut inner = self.inner.write();
+        inner.bind_ephemeral(&endpoint, &self.pollee)?;
+        let Inner::Bound(bound_datagram) = &mut *inner else {
+            unreachable!("`bind_ephemeral` succeeds so the socket cannot be unbound");
+        };
+        bound_datagram.connect(&endpoint, can_broadcast)
     }
 
     fn addr(&self) -> Result<SocketAddr> {
@@ -228,16 +242,6 @@ impl Socket for DatagramSocket {
             Some(addr) => Some(IpAddressFamily::IPv4.to_send_endpoint(addr)?),
             None => None,
         };
-
-        if let Some(endpoint) = endpoint.as_ref() {
-            let can_broadcast = self.options.read().socket.broadcast();
-            if !can_broadcast && is_broadcast_endpoint(endpoint) {
-                return_errno_with_message!(
-                    Errno::EACCES,
-                    "sending to a broadcast address without SO_BROADCAST is not allowed"
-                );
-            }
-        }
 
         if !control_messages.is_empty() {
             // TODO: Support sending control message
