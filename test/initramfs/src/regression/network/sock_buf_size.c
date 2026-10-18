@@ -38,6 +38,19 @@ static int read_sysctl(const char *name)
 	return atoi(buf);
 }
 
+// Returns `tcp_rmem[1]`, or its Linux default if the system does not expose it.
+static int tcp_rmem_default(void)
+{
+	int min, def, max;
+	FILE *file = fopen("/proc/sys/net/ipv4/tcp_rmem", "r");
+
+	if (file == NULL)
+		return 131072;
+	CHECK_WITH(fscanf(file, "%d %d %d", &min, &def, &max), _ret == 3);
+	CHECK(fclose(file));
+	return def;
+}
+
 static int write_sysctl(const char *name, const char *value)
 {
 	char path[64];
@@ -119,7 +132,7 @@ FN_TEST(default_sizes)
 
 	// TCP sockets use `tcp_rmem[1]` as the default receive buffer size.
 	sk = TEST_SUCC(new_socket(0));
-	TEST_RES(get_int_opt(sk, SO_RCVBUF), _ret == 131072);
+	TEST_RES(get_int_opt(sk, SO_RCVBUF), _ret == tcp_rmem_default());
 	TEST_SUCC(close(sk));
 }
 END_TEST()
