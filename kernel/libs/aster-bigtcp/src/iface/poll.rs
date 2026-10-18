@@ -333,12 +333,7 @@ impl<E: Ext> PollContext<'_, E> {
         if !self.iface.context().is_unicast(ip_repr.dst_addr()) {
             let mut processed = false;
             for socket in candidates {
-                processed |= socket.process(
-                    self.iface.context_mut(),
-                    ip_repr,
-                    udp_repr,
-                    udp_payload.clone(),
-                );
+                processed |= socket.process(ip_repr, udp_repr, udp_payload.clone());
             }
             return processed;
         }
@@ -359,7 +354,7 @@ impl<E: Ext> PollContext<'_, E> {
         let Some((socket, _)) = best else {
             return false;
         };
-        socket.process(self.iface.context_mut(), ip_repr, udp_repr, udp_payload)
+        socket.process(ip_repr, udp_repr, udp_payload)
     }
 
     fn generate_icmp_unreachable(

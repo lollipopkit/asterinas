@@ -7,7 +7,8 @@ use aster_softirq::BottomHalfDisabled;
 use ostd::sync::SpinLock;
 use smoltcp::{
     iface::Context,
-    socket::udp::UdpMetadata,
+    socket::udp::{PacketBuffer, RecvError, UdpMetadata},
+    storage::SliceLike,
     wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpRepr, UdpRepr},
 };
 
@@ -19,7 +20,11 @@ use crate::{
     errors::udp::SendError,
     ext::Ext,
     iface::{BoundUdpPort, PacketSlice},
-    socket::{RawUdpSocket, event::SocketEvents, unbound::new_udp_socket},
+    socket::{
+        RawUdpSocket,
+        event::SocketEvents,
+        unbound::{new_udp_recv_buffer, new_udp_socket},
+    },
 };
 
 pub type UdpSocket<E> = Socket<UdpSocketInner, E>;
@@ -27,8 +32,74 @@ pub type UdpSocket<E> = Socket<UdpSocketInner, E>;
 /// States needed by [`UdpSocketBg`].
 pub struct UdpSocketInner {
     socket: SpinLock<Box<RawUdpSocket>, BottomHalfDisabled>,
+    recv_queue: Arc<UdpRecvQueue>,
     need_dispatch: AtomicBool,
     connection: SpinLock<Option<UdpConnection>, BottomHalfDisabled>,
+}
+
+/// The receive queue of a UDP socket.
+///
+/// Like Linux, which has one receive queue for each socket, a socket that has multiple bound
+/// sockets (e.g., one on each iface) can share one receive queue among them. So received
+/// datagrams are kept in their arrival order, and the queue length is limited for the socket as
+/// a whole.
+pub struct UdpRecvQueue {
+    buffer: SpinLock<PacketBuffer<'static>, BottomHalfDisabled>,
+}
+
+impl UdpRecvQueue {
+    /// Creates an empty receive queue.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            buffer: SpinLock::new(new_udp_recv_buffer()),
+        })
+    }
+
+    /// Returns whether there are datagrams to receive.
+    pub fn can_recv(&self) -> bool {
+        !self.buffer.lock().is_empty()
+    }
+
+    /// Receives a datagram.
+    ///
+    /// Polling the iface is _not_ required after this method succeeds.
+    pub fn recv<CopyFn, R>(
+        &self,
+        behavior: ReceiveBehavior,
+        copy_fn: CopyFn,
+    ) -> Result<R, RecvError>
+    where
+        CopyFn: FnOnce(&[u8], UdpMetadata) -> R,
+    {
+        let mut buffer = self.buffer.lock();
+
+        let result = match behavior {
+            ReceiveBehavior::Recv => {
+                let (meta, data) = buffer.dequeue().map_err(|_| RecvError::Exhausted)?;
+                copy_fn(data, meta)
+            }
+            ReceiveBehavior::Peek => {
+                let (meta, data) = buffer.peek().map_err(|_| RecvError::Exhausted)?;
+                copy_fn(data, *meta)
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// Queues a received datagram, which is dropped if the queue is full.
+    fn enqueue(&self, ip_repr: &IpRepr, udp_repr: &UdpRepr, udp_payload: PacketSlice<'_>) {
+        let meta = UdpMetadata {
+            endpoint: IpEndpoint::new(ip_repr.src_addr(), udp_repr.src_port),
+            local_address: Some(ip_repr.dst_addr()),
+            meta: Default::default(),
+        };
+
+        let mut buffer = self.buffer.lock();
+        if let Ok(data) = buffer.enqueue(udp_payload.len(), meta) {
+            udp_payload.copy_to_slice(data);
+        }
+    }
 }
 
 /// The association that a UDP socket establishes by connecting.
@@ -58,7 +129,6 @@ impl<E: Ext> UdpSocketBg<E> {
     /// Tries to process an incoming packet and returns whether the packet is processed.
     pub(crate) fn process(
         &self,
-        cx: &mut Context,
         ip_repr: &IpRepr,
         udp_repr: &UdpRepr,
         udp_payload: PacketSlice<'_>,
@@ -67,15 +137,9 @@ impl<E: Ext> UdpSocketBg<E> {
             return false;
         }
 
-        let mut socket = self.inner.socket.lock();
-
-        socket.process(
-            cx,
-            smoltcp::phy::PacketMeta::default(),
-            ip_repr,
-            udp_repr,
-            udp_payload,
-        );
+        self.inner
+            .recv_queue
+            .enqueue(ip_repr, udp_repr, udp_payload);
 
         self.notify_events(SocketEvents::CAN_RECV);
 
@@ -92,11 +156,6 @@ impl<E: Ext> UdpSocketBg<E> {
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L696-L726>
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L375-L391>
     pub(crate) fn score(&self, ip_repr: &IpRepr, udp_repr: &UdpRepr) -> Option<u8> {
-        // This must be stricter than `RawUdpSocket::accepts` so that `RawUdpSocket::process` is
-        // guaranteed to work correctly if this method returns `Some(_)`.
-        //
-        // `RawUdpSocket::accepts` accepts all incoming broadcast and multicast packets, which is not
-        // what we want.
         if udp_repr.dst_port != self.bound.port() {
             return None;
         }
@@ -171,9 +230,12 @@ impl<E: Ext> UdpSocketBg<E> {
 impl<E: Ext> UdpSocket<E> {
     /// Binds to a specified endpoint.
     ///
+    /// Received datagrams are queued in `recv_queue`, which can be shared with other sockets.
+    ///
     /// Polling the iface is _not_ required after this method succeeds.
     pub fn new_bind(
         bound: BoundUdpPort<E>,
+        recv_queue: Arc<UdpRecvQueue>,
         observer: E::UdpEventObserver,
     ) -> Result<Self, (BoundUdpPort<E>, smoltcp::socket::udp::BindError)> {
         let local_endpoint = {
@@ -206,6 +268,7 @@ impl<E: Ext> UdpSocket<E> {
 
         let inner = UdpSocketInner {
             socket: SpinLock::new(socket),
+            recv_queue,
             need_dispatch: AtomicBool::new(false),
             connection: SpinLock::new(None),
         };
@@ -288,29 +351,9 @@ impl<E: Ext> UdpSocket<E> {
         Ok(result)
     }
 
-    /// Receives some data.
-    ///
-    /// Polling the iface is _not_ required after this method succeeds.
-    pub fn recv<CopyFn, R>(
-        &self,
-        behavior: ReceiveBehavior,
-        copy_fn: CopyFn,
-    ) -> Result<R, smoltcp::socket::udp::RecvError>
-    where
-        CopyFn: FnOnce(&[u8], UdpMetadata) -> R,
-    {
-        let mut socket = self.0.inner.socket.lock();
-
-        let (data, meta) = match behavior {
-            ReceiveBehavior::Recv => socket.recv()?,
-            ReceiveBehavior::Peek => {
-                let (data, meta) = socket.peek()?;
-                (data, *meta)
-            }
-        };
-        let result = copy_fn(data, meta);
-
-        Ok(result)
+    /// Returns the receive queue.
+    pub fn recv_queue(&self) -> &Arc<UdpRecvQueue> {
+        &self.0.inner.recv_queue
     }
 
     /// Calls `f` with an immutable reference to the associated [`RawUdpSocket`].

@@ -217,6 +217,110 @@ FN_TEST(recv_any_iface)
 }
 END_TEST()
 
+FN_TEST(recv_any_order)
+{
+	struct sockaddr_in addr = any_addr;
+	struct sockaddr_in lo_sender_addr = loopback_addr;
+	struct sockaddr_in if_sender_addr = iface_addr;
+	struct sockaddr_in to_lo, to_if;
+	int sk, lo_sender, if_sender;
+
+	SKIP_TEST_IF(iface_addr.sin_addr.s_addr == htonl(INADDR_ANY));
+
+	sk = new_bound_udp_socket(&addr, 0);
+	lo_sender = new_bound_udp_socket(&lo_sender_addr, 0);
+	if_sender = new_bound_udp_socket(&if_sender_addr, 0);
+	to_lo = with_port(loopback_addr, addr.sin_port);
+	to_if = with_port(iface_addr, addr.sin_port);
+
+	// Datagrams to different ifaces are received in their arrival order.
+	// Wait after each datagram so that the arrival order is deterministic.
+	SEND(lo_sender, "a", to_lo);
+	usleep(20 * 1000);
+	SEND(if_sender, "b", to_if);
+	usleep(20 * 1000);
+	SEND(lo_sender, "c", to_lo);
+	usleep(20 * 1000);
+	SEND(if_sender, "d", to_if);
+	RECV_FROM(sk, lo_sender_addr, 'a');
+	RECV_FROM(sk, if_sender_addr, 'b');
+	RECV_FROM(sk, lo_sender_addr, 'c');
+	RECV_FROM(sk, if_sender_addr, 'd');
+	RECV_NONE(sk);
+
+	// Peeking sees the earliest datagram.
+	SEND(if_sender, "e", to_if);
+	usleep(20 * 1000);
+	SEND(lo_sender, "f", to_lo);
+	WAIT_READABLE(sk);
+	TEST_RES(recv(sk, (char[2]){}, 2, MSG_PEEK), _ret == 1);
+	RECV_FROM(sk, if_sender_addr, 'e');
+	RECV_FROM(sk, lo_sender_addr, 'f');
+
+	TEST_SUCC(close(if_sender));
+	TEST_SUCC(close(lo_sender));
+	TEST_SUCC(close(sk));
+}
+END_TEST()
+
+#define NR_FLOOD 400
+#define FLOOD_LEN 1024
+
+// Sends `NR_FLOOD` datagrams alternately from `senders` and returns the number
+// of datagrams that are received.
+static int flood(int sk, int *senders, struct sockaddr_in *tos, int nr_senders)
+{
+	char buf[FLOOD_LEN] = { 0 };
+	int i, received = 0;
+
+	for (i = 0; i < NR_FLOOD; ++i) {
+		struct pollfd pfd = { .fd = senders[i % nr_senders],
+				      .events = POLLOUT };
+
+		// Wait if the send buffer is full.
+		CHECK(poll(&pfd, 1, 1000));
+		CHECK(sendto(pfd.fd, buf, sizeof(buf), 0,
+			     (struct sockaddr *)&tos[i % nr_senders],
+			     sizeof(tos[0])));
+	}
+	usleep(100 * 1000);
+
+	while (recv(sk, buf, sizeof(buf), MSG_DONTWAIT) == sizeof(buf))
+		++received;
+	// The last `recv` fails with `EAGAIN`, which is expected.
+	errno = 0;
+
+	return received;
+}
+
+FN_TEST(recv_any_buffer_limit)
+{
+	struct sockaddr_in addr = any_addr;
+	struct sockaddr_in sender_addrs[2] = { loopback_addr, iface_addr };
+	struct sockaddr_in tos[2];
+	int sk, senders[2];
+	int nr_single;
+
+	SKIP_TEST_IF(iface_addr.sin_addr.s_addr == htonl(INADDR_ANY));
+
+	sk = new_bound_udp_socket(&addr, 0);
+	senders[0] = new_bound_udp_socket(&sender_addrs[0], 0);
+	senders[1] = new_bound_udp_socket(&sender_addrs[1], 0);
+	tos[0] = with_port(loopback_addr, addr.sin_port);
+	tos[1] = with_port(iface_addr, addr.sin_port);
+
+	// The receive buffer is limited for the socket as a whole, regardless of
+	// the ifaces where the datagrams arrive.
+	nr_single = TEST_RES(flood(sk, senders, tos, 1),
+			     _ret > 0 && _ret < NR_FLOOD);
+	TEST_RES(flood(sk, senders, tos, 2), _ret <= nr_single);
+
+	TEST_SUCC(close(senders[1]));
+	TEST_SUCC(close(senders[0]));
+	TEST_SUCC(close(sk));
+}
+END_TEST()
+
 FN_TEST(recv_specific_over_any)
 {
 	struct sockaddr_in addr = with_port(any_addr, BOUND_PORT);

@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use aster_bigtcp::{
     errors::udp::{RecvError, SendError},
+    socket::UdpRecvQueue,
     wire::{IpAddress, IpEndpoint},
 };
 
@@ -29,13 +30,13 @@ const MAX_UDP_PAYLOAD_LEN: usize = u16::MAX as usize;
 ///
 /// A socket bound at a specified address has one bigtcp socket. A socket bound at the unspecified
 /// address has one bigtcp socket on each iface, and all the sockets share the same port number.
-//
-// TODO: Linux has one receive queue for each socket, but here each bigtcp socket has its own
-// receive queue. Datagrams that arrive at different ifaces may be received out of order.
+/// Like Linux, all the bigtcp sockets share one receive queue, so datagrams are received in their
+/// arrival order.
 pub(super) struct BoundDatagram {
     // INVARIANT: `bound_sockets` is not empty, and the first socket is bound at the local
     // endpoint.
     bound_sockets: Vec<UdpSocket>,
+    recv_queue: Arc<UdpRecvQueue>,
     remote_endpoint: Option<IpEndpoint>,
     /// The source address selected by `connect` if the socket is bound at the unspecified
     /// address.
@@ -58,10 +59,15 @@ struct ConnectedSource {
 }
 
 impl BoundDatagram {
-    pub(super) fn new(bound_sockets: Vec<UdpSocket>, locks: BindLocks) -> Self {
+    pub(super) fn new(
+        bound_sockets: Vec<UdpSocket>,
+        recv_queue: Arc<UdpRecvQueue>,
+        locks: BindLocks,
+    ) -> Self {
         debug_assert!(!bound_sockets.is_empty());
         Self {
             bound_sockets,
+            recv_queue,
             remote_endpoint: None,
             connected_source: None,
             is_route_cached: AtomicBool::new(false),
@@ -126,9 +132,6 @@ impl BoundDatagram {
     /// always reset.
     ///
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/udp.c#L2168-L2193>
-    //
-    // TODO: Linux keeps the received datagrams after releasing the port, but they are dropped
-    // with the bound socket here.
     pub(super) fn disconnect(&mut self) -> Option<UnboundDatagram> {
         for bound_socket in self.bound_sockets.iter() {
             bound_socket.disconnect();
@@ -144,7 +147,10 @@ impl BoundDatagram {
             .locks
             .addr
             .then(|| self.first_socket().local_endpoint().addr);
-        Some(UnboundDatagram::new_disconnected(local_addr))
+        Some(UnboundDatagram::new_disconnected(
+            local_addr,
+            self.recv_queue.clone(),
+        ))
     }
 
     /// Returns the ifaces of the bigtcp sockets.
@@ -282,37 +288,7 @@ impl datagram_common::Bound for BoundDatagram {
         writer: &mut dyn MultiWrite,
         flags: RecvFlags,
     ) -> Result<(RecvOutput, Self::Endpoint)> {
-        // User space cannot be accessed while holding spin locks, so the packet is first copied to
-        // a kernel buffer. If copying to user space fails later, the packet is dropped like Linux.
-        let user_len = writer.sum_lens();
-        let mut result = Err(RecvError::Exhausted);
-        for bound_socket in self.bound_sockets.iter() {
-            result = bound_socket.recv(flags.receive_behavior(), |packet, udp_metadata| {
-                let copy_len = packet.len().min(user_len);
-                (
-                    packet[..copy_len].to_vec(),
-                    udp_metadata.endpoint,
-                    packet.len(),
-                )
-            });
-            if !matches!(result, Err(RecvError::Exhausted)) {
-                break;
-            }
-        }
-
-        match result {
-            Ok((data, endpoint, message_len)) => {
-                let copied_len = writer.write(&mut VmReader::from(data.as_slice()))?;
-                let output = RecvOutput::new_for_packet(flags, copied_len, message_len);
-                Ok((output, endpoint))
-            }
-            Err(RecvError::Exhausted) => {
-                return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty")
-            }
-            Err(RecvError::Truncated) => {
-                unreachable!("`recv` should never fail with `RecvError::Truncated`")
-            }
-        }
+        recv_from_queue(&self.recv_queue, writer, flags)
     }
 
     fn try_send(
@@ -325,17 +301,13 @@ impl datagram_common::Bound for BoundDatagram {
     }
 
     fn check_io_events(&self) -> IoEvents {
-        let mut can_recv = false;
-        let mut can_send = true;
-        for bound_socket in self.bound_sockets.iter() {
-            bound_socket.raw_with(|socket| {
-                can_recv |= socket.can_recv();
-                can_send &= socket.can_send();
-            });
-        }
+        let can_send = self
+            .bound_sockets
+            .iter()
+            .all(|bound_socket| bound_socket.raw_with(|socket| socket.can_send()));
 
         let mut events = IoEvents::empty();
-        if can_recv {
+        if self.recv_queue.can_recv() {
             events |= IoEvents::IN;
         }
         // Datagrams may be sent from any of the sockets.
@@ -343,5 +315,38 @@ impl datagram_common::Bound for BoundDatagram {
             events |= IoEvents::OUT;
         }
         events
+    }
+}
+
+/// Receives a datagram from the receive queue.
+pub(super) fn recv_from_queue(
+    recv_queue: &UdpRecvQueue,
+    writer: &mut dyn MultiWrite,
+    flags: RecvFlags,
+) -> Result<(RecvOutput, IpEndpoint)> {
+    // User space cannot be accessed while holding spin locks, so the packet is first copied to a
+    // kernel buffer. If copying to user space fails later, the packet is dropped like Linux.
+    let user_len = writer.sum_lens();
+    let result = recv_queue.recv(flags.receive_behavior(), |packet, udp_metadata| {
+        let copy_len = packet.len().min(user_len);
+        (
+            packet[..copy_len].to_vec(),
+            udp_metadata.endpoint,
+            packet.len(),
+        )
+    });
+
+    match result {
+        Ok((data, endpoint, message_len)) => {
+            let copied_len = writer.write(&mut VmReader::from(data.as_slice()))?;
+            let output = RecvOutput::new_for_packet(flags, copied_len, message_len);
+            Ok((output, endpoint))
+        }
+        Err(RecvError::Exhausted) => {
+            return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty")
+        }
+        Err(RecvError::Truncated) => {
+            unreachable!("`recv` should never fail with `RecvError::Truncated`")
+        }
     }
 }

@@ -154,6 +154,30 @@ FN_TEST(udp_disconnect_auto_bound)
 }
 END_TEST()
 
+FN_TEST(udp_disconnect_keeps_datagrams)
+{
+	struct sockaddr_in name;
+	socklen_t namelen = sizeof(name);
+	int sk;
+
+	sk = new_udp_socket();
+	TEST_SUCC(connect(sk, (struct sockaddr *)&peer_addr_a,
+			  sizeof(peer_addr_a)));
+	TEST_SUCC(getsockname(sk, (struct sockaddr *)&name, &namelen));
+	SEND(peer_a, "a", name);
+	WAIT_READABLE(sk);
+
+	// The datagrams received before disconnecting are kept, even though the
+	// port is released.
+	TEST_SUCC(connect(sk, &unspec_addr, UNSPEC_LEN));
+	CHECK_SOCKNAME(sk, htonl(INADDR_ANY), 0);
+	RECV_FROM(sk, peer_addr_a.sin_port, 'a');
+	RECV_NONE(sk);
+
+	TEST_SUCC(close(sk));
+}
+END_TEST()
+
 // Tests a socket bound to `bind_addr` and a specified port.
 #define TEST_DISCONNECT_BOUND_PORT(bind_addr)                                 \
 	do {                                                                  \
