@@ -24,6 +24,8 @@ pub(super) fn sys_waitid(
 ) -> Result<SyscallReturn> {
     // FIXME: what does rusage use for?
     let process_filter = ProcessFilter::from_which_and_id(which, upid as _, ctx)?;
+    // The upper bits are ignored since `options` is an `int`.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1825-L1826>
     let wait_options = WaitOptions::from_bits(options as u32)
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid options"))?;
 

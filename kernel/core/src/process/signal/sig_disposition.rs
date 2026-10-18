@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::{constants::*, sig_action::SigAction, sig_num::SigNum};
-use crate::{
-    prelude::*,
-    process::signal::{sig_action::SigActionFlags, signals::Signal},
+use super::{
+    constants::*,
+    sig_action::{SigAction, SigActionFlags, SigHandler},
+    sig_num::SigNum,
 };
+use crate::{prelude::*, process::signal::signals::Signal};
 
 #[derive(Clone, Copy)]
 pub(crate) struct SigDispositions {
@@ -47,20 +48,28 @@ impl SigDispositions {
         Ok(core::mem::replace(&mut self.map[idx], sa))
     }
 
-    pub(crate) fn set_default(&mut self, num: SigNum) {
+    /// Resets the handler of the signal to `SIG_DFL`, keeping the other fields of the action.
+    pub(crate) fn reset_handler(&mut self, num: SigNum) {
         let idx = Self::num_to_idx(num);
-        self.map[idx] = SigAction::Dfl;
+        self.map[idx].handler = SigHandler::Dfl;
     }
 
-    /// man 7 signal:
-    /// When execve, the handled signals are reset to the default; the dispositions of
-    /// ignored signals are left unchanged.
-    /// This function should be used when execve.
+    /// Resets the signal actions on `execve`.
+    ///
+    /// The handled signals are reset to `SIG_DFL` while the ignored signals are left unchanged.
+    /// The flags, the masks, and the restorers of all actions are cleared.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L543-L558>
     pub(crate) fn inherit(&mut self) {
         for sigaction in &mut self.map {
-            if let SigAction::User { .. } = sigaction {
-                *sigaction = SigAction::Dfl;
-            }
+            let handler = match sigaction.handler {
+                SigHandler::Ign => SigHandler::Ign,
+                SigHandler::Dfl | SigHandler::User(_) => SigHandler::Dfl,
+            };
+            *sigaction = SigAction {
+                handler,
+                ..SigAction::default()
+            };
         }
     }
 
@@ -80,16 +89,11 @@ fn check_sigaction(sig_action: &SigAction) -> Result<()> {
     // whereas we have moved this check forward to prevent this action from being set.
     // This may result in some differences from the behavior of Linux.
 
-    let SigAction::User {
-        flags,
-        restorer_addr,
-        ..
-    } = sig_action
-    else {
+    if !matches!(sig_action.handler, SigHandler::User(_)) {
         return Ok(());
-    };
+    }
 
-    if flags.contains(SigActionFlags::SA_RESTORER) && *restorer_addr != 0 {
+    if sig_action.flags.contains(SigActionFlags::SA_RESTORER) && sig_action.restorer_addr != 0 {
         return Ok(());
     }
 

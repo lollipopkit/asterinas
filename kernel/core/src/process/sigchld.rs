@@ -8,7 +8,7 @@ use super::{
     signal::{
         c_types::siginfo_t,
         constants::{CLD_DUMPED, CLD_EXITED, CLD_KILLED, SIGCHLD},
-        sig_action::{SigAction, SigActionFlags},
+        sig_action::{SigAction, SigActionFlags, SigHandler},
         sig_num::SigNum,
         signals::raw::RawSignal,
     },
@@ -98,17 +98,12 @@ pub(super) fn notify_parent_of_death(
 ) -> bool {
     let mut autoreap = false;
     if !is_traced && sig == Some(SIGCHLD) {
-        // FIXME: `SA_NOCLDWAIT` is lost if it is set along with `SIG_DFL`, since `SigAction`
-        // does not keep the flags of `SIG_DFL` and `SIG_IGN`.
-        match sigchld_action(parent) {
-            SigAction::Ign => {
-                autoreap = true;
-                sig = None;
-            }
-            SigAction::User { flags, .. } if flags.contains(SigActionFlags::SA_NOCLDWAIT) => {
-                autoreap = true;
-            }
-            _ => {}
+        let action = sigchld_action(parent);
+        if action.handler == SigHandler::Ign {
+            autoreap = true;
+            sig = None;
+        } else if action.flags.contains(SigActionFlags::SA_NOCLDWAIT) {
+            autoreap = true;
         }
     }
 
@@ -129,15 +124,8 @@ pub(super) fn notify_parent_of_death(
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L2367-L2422>
 pub(super) fn notify_parent_of_stop(child: ChildSource, parent: &Process, code: i32, status: i32) {
-    // FIXME: `SA_NOCLDSTOP` is lost if it is set along with `SIG_DFL`, since `SigAction` does not
-    // keep the flags of `SIG_DFL`.
-    let should_send = match sigchld_action(parent) {
-        SigAction::Ign => false,
-        SigAction::User { flags, .. } => !flags.contains(SigActionFlags::SA_NOCLDSTOP),
-        SigAction::Dfl => true,
-    };
-
-    if should_send {
+    let action = sigchld_action(parent);
+    if action.handler != SigHandler::Ign && !action.flags.contains(SigActionFlags::SA_NOCLDSTOP) {
         let siginfo = child.siginfo(SIGCHLD, code, status);
         parent.enqueue_signal(Box::new(RawSignal::new(siginfo)));
     }

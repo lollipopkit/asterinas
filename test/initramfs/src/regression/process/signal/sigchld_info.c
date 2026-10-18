@@ -87,9 +87,11 @@ FN_SETUP(exec_id_child)
 		return;
 	cpid = atoi(env);
 
+	// This runs before `block_signals`, so block the signals here for `sigwaitinfo`.
 	CHECK(sigemptyset(&mask));
 	CHECK(sigaddset(&mask, SIGCHLD));
 	CHECK(sigaddset(&mask, SIGUSR1));
+	CHECK(sigprocmask(SIG_BLOCK, &mask, NULL));
 	CHECK_WITH(sigwaitinfo(&mask, &info), _ret == SIGCHLD);
 	CHECK_WITH(info.si_code, _ret == CLD_EXITED);
 	CHECK_WITH(info.si_pid, _ret == cpid);
@@ -260,6 +262,105 @@ FN_TEST(no_cld_stop)
 	TEST_RES(waitpid(cpid, NULL, 0), _ret == cpid);
 
 	reset_handler(SIGCHLD);
+}
+END_TEST()
+
+static void set_default_action(int sig, int flags)
+{
+	struct sigaction action = {
+		.sa_handler = SIG_DFL,
+		.sa_flags = flags,
+	};
+
+	CHECK(sigemptyset(&action.sa_mask));
+	CHECK(sigaction(sig, &action, NULL));
+}
+
+FN_TEST(default_no_cld_stop)
+{
+	pid_t cpid;
+	int status;
+
+	// `SA_NOCLDSTOP` works with `SIG_DFL`. `SIGCHLD` is blocked, so it would stay pending if it
+	// were sent.
+	set_default_action(SIGCHLD, SA_NOCLDSTOP);
+
+	cpid = TEST_SUCC(fork());
+	if (cpid == 0) {
+		for (;;)
+			pause();
+	}
+
+	TEST_SUCC(kill(cpid, SIGSTOP));
+	TEST_RES(waitpid(cpid, &status, WUNTRACED),
+		 _ret == cpid && WIFSTOPPED(status));
+	TEST_RES(is_pending(SIGCHLD), _ret == 0);
+
+	TEST_SUCC(kill(cpid, SIGCONT));
+	TEST_RES(waitpid(cpid, &status, WCONTINUED),
+		 _ret == cpid && WIFCONTINUED(status));
+	TEST_RES(is_pending(SIGCHLD), _ret == 0);
+
+	TEST_SUCC(kill(cpid, SIGKILL));
+	TEST_RES(waitpid(cpid, &status, 0),
+		 _ret == cpid && WIFSIGNALED(status));
+	TEST_RES(is_pending(SIGCHLD), _ret == 1);
+
+	// Setting `SIG_DFL` again discards the pending `SIGCHLD`.
+	reset_handler(SIGCHLD);
+	TEST_RES(is_pending(SIGCHLD), _ret == 0);
+}
+END_TEST()
+
+FN_TEST(default_no_cld_wait_autoreap)
+{
+	pid_t cpid;
+
+	// `SA_NOCLDWAIT` works with `SIG_DFL`.
+	set_default_action(SIGCHLD, SA_NOCLDWAIT);
+
+	cpid = TEST_SUCC(fork());
+	if (cpid == 0)
+		_exit(0);
+
+	TEST_ERRNO(wait(NULL), ECHILD);
+	TEST_ERRNO(kill(cpid, 0), ESRCH);
+	TEST_RES(is_pending(SIGCHLD), _ret == 1);
+
+	reset_handler(SIGCHLD);
+	TEST_RES(is_pending(SIGCHLD), _ret == 0);
+}
+END_TEST()
+
+FN_TEST(old_action_flags)
+{
+	struct sigaction action = {
+		.sa_flags = SA_NOCLDSTOP | SA_RESTART,
+	};
+	struct sigaction old_action;
+
+	// The flags and the mask are kept for `SIG_DFL` and `SIG_IGN`.
+	action.sa_handler = SIG_DFL;
+	CHECK(sigemptyset(&action.sa_mask));
+	CHECK(sigaddset(&action.sa_mask, SIGUSR2));
+	TEST_SUCC(sigaction(SIGCHLD, &action, NULL));
+	TEST_RES(sigaction(SIGCHLD, NULL, &old_action),
+		 old_action.sa_handler == SIG_DFL &&
+			 (old_action.sa_flags & (SA_NOCLDSTOP | SA_RESTART)) ==
+				 (SA_NOCLDSTOP | SA_RESTART) &&
+			 sigismember(&old_action.sa_mask, SIGUSR2) == 1);
+
+	action.sa_handler = SIG_IGN;
+	action.sa_flags = SA_NODEFER;
+	TEST_SUCC(sigaction(SIGUSR2, &action, NULL));
+	TEST_RES(sigaction(SIGUSR2, NULL, &old_action),
+		 old_action.sa_handler == SIG_IGN &&
+			 (old_action.sa_flags & SA_NODEFER) == SA_NODEFER &&
+			 (old_action.sa_flags & SA_RESTART) == 0 &&
+			 sigismember(&old_action.sa_mask, SIGUSR2) == 1);
+
+	reset_handler(SIGCHLD);
+	reset_handler(SIGUSR2);
 }
 END_TEST()
 

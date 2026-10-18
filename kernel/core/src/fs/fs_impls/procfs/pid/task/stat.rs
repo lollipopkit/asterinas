@@ -18,7 +18,7 @@ use crate::{
     process::{
         Process, ResourceType,
         posix_thread::{AsPosixThread, SleepingState},
-        signal::{HandlePendingSignal, sig_action::SigAction, sig_mask::SigMask},
+        signal::{HandlePendingSignal, sig_action::SigHandler, sig_mask::SigMask},
     },
     sched::{LinuxSchedPolicy, RealTimePriority, SchedPolicy},
     thread::Thread,
@@ -401,12 +401,12 @@ fn signal_disposition_masks(process: &Process) -> (u64, u64) {
         }
 
         let bit = u64::from(SigMask::from(sig_num));
-        match sig_action {
-            SigAction::Dfl => {}
+        match sig_action.handler {
+            SigHandler::Dfl => {}
             // `sigignore` tracks explicitly ignored signals, while `sigcatch` tracks
             // signals with user-registered handlers.
-            SigAction::Ign => ignored |= bit,
-            SigAction::User { .. } => caught |= bit,
+            SigHandler::Ign => ignored |= bit,
+            SigHandler::User(_) => caught |= bit,
         }
     }
 
