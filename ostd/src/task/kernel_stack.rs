@@ -11,6 +11,7 @@ use crate::{
         FrameAllocOptions, PAGE_SIZE,
         kspace::kvirt_area::KVirtArea,
         page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
+        stat::KERNEL_STACK_PAGES,
     },
     prelude::*,
 };
@@ -75,6 +76,7 @@ impl KernelStack {
             pages.into_iter(),
             prop,
         );
+        KERNEL_STACK_PAGES.add(KERNEL_STACK_SIZE / PAGE_SIZE);
         let mapped_start = new_kvirt_area.range().start + 2 * PAGE_SIZE;
         let mapped_end = mapped_start + KERNEL_STACK_SIZE;
         Ok(Self {
@@ -95,5 +97,11 @@ impl KernelStack {
 
     pub(super) fn end_vaddr(&self) -> Vaddr {
         self.end_vaddr
+    }
+}
+
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        KERNEL_STACK_PAGES.sub(KERNEL_STACK_SIZE / PAGE_SIZE);
     }
 }

@@ -255,6 +255,14 @@ pub(crate) unsafe fn copy_bsp_for_ap(num_cpus: usize) {
     CPU_LOCAL_STORAGES.call_once(|| res);
 }
 
+/// Returns the number of pages used by the static CPU-local storage of all
+/// CPUs, including the storage of the BSP linked in the kernel image.
+pub(crate) fn nr_static_storage_pages() -> usize {
+    let bsp_base_va = __cpu_local_start as *const () as usize;
+    let bsp_end_va = __cpu_local_end as *const () as usize;
+    (bsp_end_va - bsp_base_va).div_ceil(PAGE_SIZE) * super::num_cpus()
+}
+
 /// Gets the pointer to the static CPU-local storage for the given AP.
 ///
 /// # Panics

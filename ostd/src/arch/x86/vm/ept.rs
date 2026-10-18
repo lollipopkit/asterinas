@@ -20,6 +20,7 @@ pub(crate) struct EptPtConfig {}
 // `ItemRef` types.
 unsafe impl PageTableConfig for EptPtConfig {
     const TOP_LEVEL_INDEX_RANGE: Range<usize> = 0..512;
+    const IS_SECONDARY: bool = true;
 
     type E = PageTableEntry;
     type C = PagingConsts;

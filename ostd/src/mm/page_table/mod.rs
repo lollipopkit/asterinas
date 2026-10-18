@@ -88,6 +88,13 @@ pub(crate) unsafe trait PageTableConfig:
     /// Other page tables do not need to set this to `false`.
     const TOP_LEVEL_CAN_UNMAP: bool = true;
 
+    /// Whether the page table translates addresses for devices or guests
+    /// rather than for CPUs.
+    ///
+    /// The pages of such page tables are counted as secondary page tables,
+    /// like Linux's `NR_SECONDARY_PAGETABLE`.
+    const IS_SECONDARY: bool = false;
+
     /// The type of the page table entry.
     type E: PteTrait;
 

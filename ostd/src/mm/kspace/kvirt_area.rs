@@ -12,7 +12,8 @@ use crate::{
         HasSize, PAGE_SIZE, Paddr, Split, Vaddr,
         frame::{Frame, meta::AnyFrameMeta},
         page_prop::PageProperty,
-        page_table::{largest_pages, max_page_level},
+        page_table::{PageTableFrag, largest_pages, max_page_level},
+        stat::VMALLOC_PAGES,
     },
 };
 
@@ -54,6 +55,8 @@ mod allocator {
 #[derive(Debug)]
 pub(crate) struct KVirtArea {
     range: Range<Vaddr>,
+    /// Whether the area maps tracked frames (see [`Self::map_frames`]).
+    is_tracked: bool,
 }
 
 impl HasSize for KVirtArea {
@@ -72,8 +75,14 @@ impl Split for KVirtArea {
         let left_range = old.start()..old.start() + offset;
         let right_range = old.start() + offset..old.end();
         (
-            KVirtArea { range: left_range },
-            KVirtArea { range: right_range },
+            KVirtArea {
+                range: left_range,
+                is_tracked: old.is_tracked,
+            },
+            KVirtArea {
+                range: right_range,
+                is_tracked: old.is_tracked,
+            },
         )
     }
 }
@@ -138,13 +147,19 @@ impl KVirtArea {
         let page_table = KERNEL_PAGE_TABLE.get().unwrap();
         let mut cursor = page_table.cursor_mut(&irq_guard, &cursor_range).unwrap();
 
+        let mut nr_frames = 0;
         for frame in frames.into_iter() {
             // SAFETY: The constructor of the `KVirtArea` has already ensured
             // that this mapping does not affect kernel's memory safety.
             unsafe { cursor.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) };
+            nr_frames += 1;
         }
+        VMALLOC_PAGES.add(nr_frames);
 
-        Self { range }
+        Self {
+            range,
+            is_tracked: true,
+        }
     }
 
     /// Creates a kernel virtual area and maps untracked frames into it.
@@ -198,7 +213,10 @@ impl KVirtArea {
             }
         }
 
-        Self { range }
+        Self {
+            range,
+            is_tracked: false,
+        }
     }
 }
 
@@ -218,6 +236,13 @@ impl Drop for KVirtArea {
             let Some(frag) = (unsafe { cursor.take_next(self.end() - cursor.virt_addr()) }) else {
                 break;
             };
+            // A tracked area maps only tracked frames.
+            if self.is_tracked {
+                VMALLOC_PAGES.sub(match &frag {
+                    PageTableFrag::Mapped { .. } => 1,
+                    PageTableFrag::StrayPageTable { num_frames, .. } => *num_frames,
+                });
+            }
             drop(frag);
         }
 

@@ -11,7 +11,10 @@ use crate::{
     Result,
     cpu::{CpuId, PinCurrentCpu, all_cpus, num_cpus},
     irq::DisabledLocalIrqGuard,
-    mm::{FrameAllocOptions, HasPaddr, PAGE_SIZE, Segment, Vaddr, paddr_to_vaddr},
+    mm::{
+        FrameAllocOptions, HasPaddr, HasSize, PAGE_SIZE, Segment, Vaddr, paddr_to_vaddr,
+        stat::DYN_CPU_LOCAL_PAGES,
+    },
     util::id_set::Id,
 };
 
@@ -139,6 +142,7 @@ impl<const ITEM_SIZE: usize> DynCpuLocalChunk<ITEM_SIZE> {
         let segment = FrameAllocOptions::new()
             .zeroed(false)
             .alloc_segment_with(total_chunk_size.div_ceil(PAGE_SIZE), |_| DynCpuLocalMeta)?;
+        DYN_CPU_LOCAL_PAGES.add(segment.size() / PAGE_SIZE);
 
         let num_items = CHUNK_SIZE / ITEM_SIZE;
         const { assert!(CHUNK_SIZE.is_multiple_of(ITEM_SIZE)) };
@@ -245,6 +249,7 @@ impl<const ITEM_SIZE: usize> DynCpuLocalChunk<ITEM_SIZE> {
 impl<const ITEM_SIZE: usize> Drop for DynCpuLocalChunk<ITEM_SIZE> {
     fn drop(&mut self) {
         if self.is_empty() {
+            DYN_CPU_LOCAL_PAGES.sub(self.segment.size() / PAGE_SIZE);
             // SAFETY: The `segment` does not contain any CPU-local objects.
             // It is the last time the `segment` is accessed, and it will be
             // dropped only once.
