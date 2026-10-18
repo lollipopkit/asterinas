@@ -15,3 +15,5 @@ set -e
 
 ./timerfd/timerfd_clockid
 ./timerfd/timerfd_readiness
+
+./times/times

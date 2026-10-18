@@ -14,5 +14,8 @@ sethostname(name, size);
 // Set Network Information Service (NIS) domain name
 setdomainname(name, size);
 
+// Get process times
+times(buf);
+
 // Sleep for the specified duration
 nanosleep(duration, remain);
