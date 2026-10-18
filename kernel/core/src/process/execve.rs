@@ -317,6 +317,18 @@ fn make_current_main_thread(ctx: &Context) {
 
     // Lock order: PID table -> tracer.tracees -> tasks of process
     let mut pid_table = pid_table::pid_table_mut();
+
+    // The old main thread has exited and will be released without being reported, so it must
+    // be unlinked from its tracer, which may differ from the tracer of the current thread.
+    // This is done before locking the tracees of the current thread's tracer, so no two
+    // tracee maps are locked at the same time.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/fs/exec.c#L1024-L1036>
+    let old_main_thread = ctx.process.main_thread();
+    old_main_thread
+        .as_posix_thread()
+        .unwrap()
+        .ptrace_release_exited();
+
     let tracer = ctx.posix_thread.tracer();
     let mut tracer_tracees = tracer
         .as_ref()

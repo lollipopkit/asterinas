@@ -5,8 +5,10 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../../common/test.h"
@@ -274,5 +276,85 @@ FN_TEST(real_parent_waits_after_tracer_exits)
 						   WEXITSTATUS(status) == 0);
 
 	TEST_SUCC(prctl(PR_SET_CHILD_SUBREAPER, 0));
+}
+END_TEST()
+
+static int thread_exec_fn(void *arg)
+{
+	// Give the main thread time to exit first. Otherwise, `execve` kills it,
+	// which also leaves an unreaped old main thread.
+	struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
+	nanosleep(&ts, NULL);
+
+	char *const argv[] = { "/bin/true", NULL };
+	char *const envp[] = { NULL };
+	execve("/bin/true", argv, envp);
+	syscall(SYS_exit_group, -1);
+	return -1;
+}
+
+// Creates a thread that executes `/bin/true`, and then exits the main thread.
+static void tracee_thread_exec(void)
+{
+	CHECK(clone(thread_exec_fn, child_stack + STACK_SIZE,
+		    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+			    CLONE_THREAD | CLONE_SYSVSEM,
+		    NULL));
+	syscall(SYS_exit, 5);
+}
+
+FN_TEST(traced_thread_exec)
+{
+	SKIP_TEST_IF(read_yama_scope() == YAMA_SCOPE_NO_ATTACH);
+
+	pid_t pid = TEST_SUCC(start_tracee(
+		tracee_thread_exec, PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC));
+
+	int status;
+	unsigned long eventmsg;
+	TEST_RES(waitpid(pid, &status, 0),
+		 _ret == pid && WIFSTOPPED(status) &&
+			 (status >> 8) == ptrace_event_status(PTRACE_EVENT_CLONE));
+	TEST_SUCC(ptrace(PTRACE_GETEVENTMSG, pid, 0, &eventmsg));
+	pid_t tid = eventmsg;
+	TEST_RES(waitpid(tid, &status, __WALL), _ret == tid &&
+						       WIFSTOPPED(status) &&
+						       WSTOPSIG(status) ==
+							       SIGSTOP);
+	TEST_SUCC(ptrace(PTRACE_CONT, tid, 0, 0));
+	TEST_SUCC(ptrace(PTRACE_CONT, pid, 0, 0));
+
+	// The exiting old main thread is released silently. The thread that executes
+	// the new program takes over the PID and reports its former TID.
+	TEST_RES(waitpid(-1, &status, __WALL),
+		 _ret == pid && WIFSTOPPED(status) &&
+			 (status >> 8) == ptrace_event_status(PTRACE_EVENT_EXEC));
+	TEST_RES(ptrace(PTRACE_GETEVENTMSG, pid, 0, &eventmsg),
+		 eventmsg == tid);
+	TEST_ERRNO(waitpid(tid, &status, __WALL | WNOHANG), ECHILD);
+
+	TEST_SUCC(ptrace(PTRACE_CONT, pid, 0, 0));
+	TEST_RES(waitpid(-1, &status, __WALL), _ret == pid &&
+						       WIFEXITED(status) &&
+						       WEXITSTATUS(status) ==
+							       0);
+	TEST_ERRNO(waitpid(-1, &status, __WALL | WNOHANG), ECHILD);
+}
+END_TEST()
+
+FN_TEST(untraced_thread_exec)
+{
+	SKIP_TEST_IF(read_yama_scope() == YAMA_SCOPE_NO_ATTACH);
+
+	// Only the main thread is traced.
+	pid_t pid = TEST_SUCC(start_tracee(tracee_thread_exec, 0));
+
+	// The exit of the traced old main thread is never reported.
+	int status;
+	TEST_RES(waitpid(-1, &status, __WALL), _ret == pid &&
+						       WIFEXITED(status) &&
+						       WEXITSTATUS(status) ==
+							       0);
+	TEST_ERRNO(waitpid(-1, &status, __WALL | WNOHANG), ECHILD);
 }
 END_TEST()

@@ -383,6 +383,33 @@ impl PosixThread {
         Ok(true)
     }
 
+    /// Silently unlinks this exited thread from its tracer and wakes up the tracer.
+    ///
+    /// This is used when the thread is released without its exit being reported,
+    /// so that the tracer does not keep waiting for it.
+    pub(in crate::process) fn ptrace_release_exited(&self) {
+        let Some(tracer_thread) = self.tracer() else {
+            return;
+        };
+        let tracer = tracer_thread.as_posix_thread().unwrap();
+
+        // Lock order: tracer.tracees -> tracee.tracee_status
+        let mut tracees = tracer.tracees().unwrap().lock();
+        if tracees
+            .get(&self.tid())
+            .is_some_and(|tracee| core::ptr::eq(tracee.as_posix_thread().unwrap(), self))
+        {
+            tracees.remove(&self.tid());
+        }
+        // The exit notification is deferred only for a zombie process,
+        // so there is no notification to cascade for a released thread.
+        let is_exit_notify_deferred = self.detach_tracer();
+        debug_assert!(!is_exit_notify_deferred);
+        drop(tracees);
+
+        tracer.process().children_wait_queue().wake_all();
+    }
+
     /// Returns the tracee map of this thread if it is a tracer.
     pub(in crate::process) fn tracees(&self) -> Option<&Mutex<BTreeMap<Tid, Arc<Thread>>>> {
         self.tracees.get()
