@@ -26,6 +26,7 @@ sleep 0.2
 ./privileged_ports
 ./send_buf_full
 ./sendmmsg
+./sigpipe
 ./socketpair
 ./socket_ioctl
 ./sockoption

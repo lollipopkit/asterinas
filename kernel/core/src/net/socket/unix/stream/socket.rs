@@ -510,12 +510,22 @@ impl Socket for UnixStreamSocket {
         }
         let mut auxiliary_data = AuxiliaryData::from_control(control_messages)?;
 
-        self.block_on_unless(
+        let result = self.block_on_unless(
             flags.contains(SendFlags::MSG_DONTWAIT),
             IoEvents::OUT,
             self.timeouts.send_timeout(),
             || self.try_send(reader, &mut auxiliary_data, flags),
-        )
+        );
+
+        // Like Linux, `SOCK_SEQPACKET` sockets do not raise `SIGPIPE` since they send messages
+        // like datagram sockets.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2509-L2514>
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/unix/af_unix.c#L2233-L2236>
+        if self.is_seqpacket() {
+            result
+        } else {
+            flags.raise_sigpipe_on_epipe(result)
+        }
     }
 
     fn recvmsg(

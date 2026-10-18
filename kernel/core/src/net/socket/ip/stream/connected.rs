@@ -2,7 +2,7 @@
 
 use aster_bigtcp::{
     errors::tcp::{IoError, RecvError, SendError},
-    socket::{NeedIfacePoll, RawTcpSetOption},
+    socket::{NeedIfacePoll, RawTcpSetOption, RstError},
     wire::IpEndpoint,
 };
 
@@ -219,13 +219,15 @@ impl ConnectedStream {
     }
 
     pub(super) fn test_and_clear_error(&self) -> Option<Error> {
-        if self.tcp_conn.clear_rst_closed() {
-            Some(Error::with_message(
+        match self.tcp_conn.take_rst_error()? {
+            RstError::ConnReset => Some(Error::with_message(
                 Errno::ECONNRESET,
                 "the connection is reset",
-            ))
-        } else {
-            None
+            )),
+            RstError::BrokenPipe => Some(Error::with_message(
+                Errno::EPIPE,
+                "the connection is reset after the peer closed its sending half",
+            )),
         }
     }
 

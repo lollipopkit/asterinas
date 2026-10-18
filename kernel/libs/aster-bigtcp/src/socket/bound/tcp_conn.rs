@@ -54,8 +54,22 @@ pub struct RawTcpSocketExt<E: Ext> {
     has_connected: bool,
     /// Indicates if the receiving side of this socket is shut down by the user.
     is_recv_shut: bool,
-    /// Indicates if the socket is closed by a RST packet.
-    is_rst_closed: bool,
+    /// The pending error if the socket is closed by a RST packet.
+    rst_error: Option<RstError>,
+}
+
+/// The error reported when a TCP connection is closed by a RST packet.
+///
+/// Like Linux, a RST packet received after the peer has closed its sending half breaks the pipe,
+/// and other RST packets reset the connection.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp_input.c#L4900-L4915>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RstError {
+    /// The connection is reset (`ECONNRESET`).
+    ConnReset,
+    /// The connection is reset in the `CLOSE-WAIT` state (`EPIPE`).
+    BrokenPipe,
 }
 
 impl<E: Ext> Deref for RawTcpSocketExt<E> {
@@ -109,10 +123,10 @@ impl<E: Ext> RawTcpSocketExt<E> {
 
     /// Checks if the socket is closed by a RST packet.
     ///
-    /// Note that the flag is automatically cleared when it is read by
-    /// [`TcpConnection::clear_rst_closed`], [`TcpConnection::send`], or [`TcpConnection::recv`].
+    /// Note that the error is automatically cleared when it is read by
+    /// [`TcpConnection::take_rst_error`], [`TcpConnection::send`], or [`TcpConnection::recv`].
     pub fn is_rst_closed(&self) -> bool {
-        self.is_rst_closed
+        self.rst_error.is_some()
     }
 }
 
@@ -143,7 +157,7 @@ impl<E: Ext> RawTcpSocketExt<E> {
                 // Strictly speaking, the socket isn't closed by an incoming RST packet in this
                 // situation. Instead, we reset the connection and _send_ an outgoing RST packet.
                 // However, Linux reports `ECONNRESET`, so we have to follow Linux.
-                self.is_rst_closed = true;
+                self.rst_error = Some(RstError::ConnReset);
                 self.abort();
             }
             self.check_dead(this)
@@ -153,7 +167,11 @@ impl<E: Ext> RawTcpSocketExt<E> {
 
         let events = if self.state() != old_state {
             if self.state() == State::Closed && is_rst {
-                self.is_rst_closed = true;
+                self.rst_error = Some(if old_state == State::CloseWait {
+                    RstError::BrokenPipe
+                } else {
+                    RstError::ConnReset
+                });
             }
             self.on_new_state(this)
         } else {
@@ -242,7 +260,7 @@ impl<E: Ext> TcpConnectionInner<E> {
             listener,
             has_connected: false,
             is_recv_shut: false,
-            is_rst_closed: false,
+            rst_error: None,
         };
 
         TcpConnectionInner {
@@ -395,9 +413,11 @@ impl<E: Ext> TcpConnection<E> {
 
         let mut socket = self.0.inner.lock();
 
-        if socket.is_rst_closed {
-            socket.is_rst_closed = false;
-            return Err(IoError::Socket(SendError::ConnReset));
+        if let Some(rst_error) = socket.rst_error.take() {
+            return Err(IoError::Socket(match rst_error {
+                RstError::ConnReset => SendError::ConnReset,
+                RstError::BrokenPipe => SendError::InvalidState,
+            }));
         }
 
         let mut total_sent_bytes = 0;
@@ -514,8 +534,13 @@ impl<E: Ext> TcpConnection<E> {
             };
 
             let copy_result = match recv_result {
-                Err(_) if socket.is_rst_closed && total_recv_bytes == 0 => {
-                    socket.is_rst_closed = false;
+                // Like Linux, the end of the stream is reported before the pending error if the
+                // peer has closed its sending half, so `EPIPE` is kept for later operations.
+                // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/net/ipv4/tcp.c#L2758-L2764>
+                Err(_)
+                    if socket.rst_error == Some(RstError::ConnReset) && total_recv_bytes == 0 =>
+                {
+                    socket.rst_error = None;
                     return Err(IoError::Socket(RecvError::ConnReset));
                 }
                 Err(_) if total_recv_bytes > 0 => break total_recv_bytes,
@@ -545,16 +570,12 @@ impl<E: Ext> TcpConnection<E> {
         Ok((result, need_poll))
     }
 
-    /// Checks if the socket is closed by a RST packet and clears the flag.
+    /// Takes the pending error if the socket is closed by a RST packet.
     ///
-    /// This flag is set when the socket is closed by a RST packet, and cleared when the connection
-    /// reset error is reported via one of the [`Self::send`], [`Self::recv`], or this method.
-    pub fn clear_rst_closed(&self) -> bool {
-        let mut socket = self.0.inner.lock();
-
-        let is_rst = socket.is_rst_closed;
-        socket.is_rst_closed = false;
-        is_rst
+    /// The error is set when the socket is closed by a RST packet, and cleared when it is reported
+    /// via one of the [`Self::send`], [`Self::recv`], or this method.
+    pub fn take_rst_error(&self) -> Option<RstError> {
+        self.0.inner.lock().rst_error.take()
     }
 
     /// Shuts down the sending half of the connection.
@@ -669,7 +690,7 @@ impl<E: Ext> TcpConnection<E> {
                 true
             }
         };
-        let is_reset = core::mem::take(&mut socket.is_rst_closed) || is_reset;
+        let is_reset = socket.rst_error.take().is_some() || is_reset;
 
         let poll_at = socket.poll_at(iface.context_mut());
         iface.update_next_poll_at_ms(&self.0, poll_at);

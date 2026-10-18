@@ -16,14 +16,7 @@ use crate::{
         vfs::{inode::FileOps, path::Path},
     },
     prelude::*,
-    process::{
-        posix_thread::AsPosixThread,
-        signal::{
-            PollHandle, Pollable,
-            constants::SIGPIPE,
-            signals::user::{UserSignal, UserSignalKind},
-        },
-    },
+    process::signal::{PollHandle, Pollable, send_sigpipe_to_current},
     util::{
         ioctl::RawIoctl,
         ring_buffer::{ConsumerU8Ext, ProducerU8Ext, RbConsumer, RbProducer, RingBuffer},
@@ -476,15 +469,8 @@ impl PipeWriter {
         if res.is_ok() {
             self.state.notify_write();
         }
-        if res.is_err_and(|e| e.error() == Errno::EPIPE)
-            && let Some(posix_thread) = current_thread!().as_posix_thread()
-        {
-            posix_thread.enqueue_signal(Box::new(UserSignal::new(
-                SIGPIPE,
-                UserSignalKind::Kill,
-                posix_thread.process().pid(),
-                posix_thread.credentials().ruid(),
-            )));
+        if res.is_err_and(|e| e.error() == Errno::EPIPE) {
+            send_sigpipe_to_current();
         }
 
         res

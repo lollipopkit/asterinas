@@ -848,7 +848,7 @@ impl Socket for StreamSocket {
         }
 
         let nr_disconnects = self.nr_disconnects.load(Ordering::Relaxed);
-        self.block_on_unless(
+        let result = self.block_on_unless(
             flags.contains(SendFlags::MSG_DONTWAIT),
             IoEvents::OUT,
             self.timeouts.send_timeout(),
@@ -856,9 +856,8 @@ impl Socket for StreamSocket {
                 self.check_not_disconnected(nr_disconnects)?;
                 self.try_send(reader, flags)
             },
-        )
-
-        // TODO: Trigger `SIGPIPE` if the error code is `EPIPE` and `MSG_NOSIGNAL` is not specified
+        );
+        flags.raise_sigpipe_on_epipe(result)
     }
 
     fn recvmsg(
