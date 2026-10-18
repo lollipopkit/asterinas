@@ -64,6 +64,7 @@ fi
 ./sched/sched_param_getset
 ./sched/sched_param_idle
 
+./signal/fatal_signal
 ./signal/forced_fault_signals
 ./signal/kill
 ./signal/parent_death_signal

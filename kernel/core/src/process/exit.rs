@@ -12,8 +12,11 @@ use crate::{
     events::IoEvents,
     fs::cgroupfs::CgroupMembership,
     prelude::*,
-    process::{posix_thread::AsPosixThread, signal::signals::kernel::KernelSignal},
+    process::{
+        kill::check_signal_perm, posix_thread::AsPosixThread, signal::signals::user::UserSignal,
+    },
     security::audit,
+    thread::AsThread,
 };
 
 /// Exits the current POSIX process.
@@ -23,7 +26,8 @@ use crate::{
 ///
 /// [`do_exit`]: crate::process::posix_thread::do_exit
 /// [`do_exit_group`]: crate::process::posix_thread::do_exit_group
-pub(super) fn exit_process(current_process: &Process) {
+pub(super) fn exit_process(ctx: &Context) {
+    let current_process = ctx.process.as_ref();
     current_process.complete_vfork_done();
 
     // Drop fields in `Process`.
@@ -32,7 +36,9 @@ pub(super) fn exit_process(current_process: &Process) {
     // Move the children to the reaper process and send them signals. The children should see a new
     // parent when they receive the signal.
     let children = move_children_to_reaper_process(current_process);
-    send_parent_death_signal(&children);
+    for child in children.values() {
+        send_parent_death_signal(child, ctx);
+    }
     drop(children);
 
     // This must happen before the process can be reaped, so that audit hooks see the exit
@@ -195,20 +201,59 @@ fn move_process_children(
     Ok(children)
 }
 
-/// Sends parent-death signals to the children.
-//
-// FIXME: According to the Linux implementation, the signal should be sent when the POSIX thread
-// that created the child exits, not when the whole process exits. For more details, see the
-// "CAVEATS" section in <https://man7.org/linux/man-pages/man2/pr_set_pdeathsig.2const.html>.
-fn send_parent_death_signal(children: &BTreeMap<Pid, Arc<Process>>) {
-    for child in children.values() {
-        let Some(signum) = child.parent_death_signal() else {
-            continue;
+/// Sends the parent-death signals to the children of the current thread, which is exiting but is
+/// not the last thread in the current process.
+///
+/// The children are implicitly reparented to the first alive thread in the current process (see
+/// [`ParentProcessGuard::thread`]). `was_first_alive` tells whether the current thread was the
+/// first alive thread before it exited.
+///
+/// [`ParentProcessGuard::thread`]: super::process::ParentProcessGuard::thread
+pub(super) fn send_parent_death_signals_on_thread_exit(was_first_alive: bool, ctx: &Context) {
+    let children = {
+        let children = ctx.process.children().lock();
+        let Some(children) = children.as_ref() else {
+            return;
         };
 
-        // FIXME: Set `si_pid` in the `siginfo_t` argument.
-        let signal = Box::new(KernelSignal::new(signum));
-        child.enqueue_signal(signal);
+        // Lock order: children of process -> parent of process
+        children
+            .values()
+            .filter(|child| match child.parent().lock().thread().upgrade() {
+                Some(thread) if core::ptr::eq(thread.as_ref(), ctx.thread) => true,
+                Some(thread) if !thread.is_exited() => false,
+                _ => was_first_alive,
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    for child in children.iter() {
+        send_parent_death_signal(child, ctx);
+    }
+}
+
+/// Sends the parent-death signals of the threads in `child` to `child`, as the current thread
+/// (the parent thread of `child`) exits.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L726-L733>
+fn send_parent_death_signal(child: &Process, ctx: &Context) {
+    let signals = child
+        .tasks()
+        .lock()
+        .as_slice()
+        .iter()
+        .filter(|task| !task.as_thread().unwrap().is_exited())
+        .filter_map(|task| {
+            let thread = task.as_posix_thread().unwrap();
+            let sig_num = thread.parent_death_signal()?;
+            check_signal_perm(thread, ctx, Some(sig_num)).ok()?;
+            Some(sig_num)
+        })
+        .collect::<Vec<_>>();
+
+    for sig_num in signals {
+        child.enqueue_signal(Box::new(UserSignal::new_kill(sig_num, ctx)));
     }
 }
 

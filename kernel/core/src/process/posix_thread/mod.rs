@@ -12,7 +12,12 @@ use spin::Once;
 
 use super::{
     Credentials, Process,
-    signal::{sig_mask::AtomicSigMask, sig_num::SigNum, sig_queues::SigQueues, signals::Signal},
+    signal::{
+        sig_mask::AtomicSigMask,
+        sig_num::{AtomicSigNum, SigNum},
+        sig_queues::SigQueues,
+        signals::Signal,
+    },
 };
 use crate::{
     events::IoEvents,
@@ -22,7 +27,10 @@ use crate::{
         ExitCode, Pid,
         namespace::nsproxy::NsProxy,
         posix_thread::ptrace::TraceeStatus,
-        signal::{PauseReason, PollHandle, sig_mask::SigMask},
+        signal::{
+            PauseReason, PollHandle, constants::SIGKILL, sig_mask::SigMask,
+            signals::kernel::KernelSignal,
+        },
     },
     thread::{Thread, Tid},
     time::{Timer, TimerManager, clocks::ProfClock, timer::TimerGuard},
@@ -72,6 +80,10 @@ pub struct PosixThread {
     // Signal
     /// Blocked signals
     sig_mask: AtomicSigMask,
+    /// The signals blocked before waiting for some of them in `rt_sigtimedwait`.
+    ///
+    /// The signals waited for in `rt_sigtimedwait` are not fatal.
+    real_blocked: AtomicSigMask,
     /// Thread-directed sigqueue
     sig_queues: SigQueues,
     /// The per-thread signal [`Waker`], which will be used to wake up the thread
@@ -110,6 +122,9 @@ pub struct PosixThread {
 
     /// Exit code of this thread.
     exit_code: AtomicU32,
+
+    /// The signal sent to the process when the parent thread exits.
+    parent_death_signal: AtomicSigNum,
 
     /// The personality value for this thread.
     personality: AtomicU32,
@@ -163,6 +178,31 @@ impl PosixThread {
 
     pub(super) fn sig_queues(&self) -> &SigQueues {
         &self.sig_queues
+    }
+
+    /// Returns the signals blocked before waiting for some of them in `rt_sigtimedwait`.
+    pub(in crate::process) fn real_blocked(&self) -> SigMask {
+        self.real_blocked.load(Ordering::Relaxed)
+    }
+
+    /// Sets the signals blocked before waiting for some of them in `rt_sigtimedwait`.
+    pub(crate) fn set_real_blocked(&self, real_blocked: SigMask) {
+        self.real_blocked.store(real_blocked, Ordering::Relaxed);
+    }
+
+    /// Returns the signal sent to the process when the parent thread exits.
+    pub(crate) fn parent_death_signal(&self) -> Option<SigNum> {
+        self.parent_death_signal.as_sig_num()
+    }
+
+    /// Sets the signal sent to the process when the parent thread exits.
+    pub(crate) fn set_parent_death_signal(&self, sig_num: SigNum) {
+        self.parent_death_signal.set(sig_num);
+    }
+
+    /// Clears the signal sent to the process when the parent thread exits.
+    pub(crate) fn clear_parent_death_signal(&self) {
+        self.parent_death_signal.clear();
     }
 
     /// Returns whether the signal is blocked by the thread.
@@ -246,6 +286,7 @@ impl PosixThread {
             task.schedule_info().cpu.get().is_none(),
         ) {
             (Some((_, PauseReason::Sleep)), true) => SleepingState::Interruptible,
+            (Some((_, PauseReason::Killable)), true) => SleepingState::Uninterruptible,
             (Some((_, PauseReason::StopBySignal)), true) => SleepingState::StopBySignal,
             (Some((_, PauseReason::StopByPtrace)), true) => SleepingState::StopByPtrace,
             (None, true) => SleepingState::Uninterruptible,
@@ -256,6 +297,14 @@ impl PosixThread {
     /// Returns whether this thread has yet to participate in the group stop in progress.
     pub(in crate::process) fn group_stop_pending(&self) -> &AtomicBool {
         &self.group_stop_pending
+    }
+
+    /// Returns whether this thread is in a group stop or a ptrace-stop.
+    pub(in crate::process) fn is_stopped_or_traced(&self) -> bool {
+        matches!(
+            &*self.signalled_waker.lock(),
+            Some((_, PauseReason::StopBySignal | PauseReason::StopByPtrace))
+        )
     }
 
     /// Wakes up the signalled waker.
@@ -271,10 +320,25 @@ impl PosixThread {
     /// Therefore, unless the caller can ensure that there are no permission issues,
     /// this method should be used to enqueue kernel signals or fault signals.
     pub(crate) fn enqueue_signal(&self, signal: Box<dyn Signal>) {
-        if let Some(process) = self.weak_process().upgrade() {
+        let process = self.weak_process().upgrade();
+        if let Some(process) = process.as_ref() {
             process.prepare_signal(signal.num());
         }
+        let sig_num = signal.num();
         self.sig_queues.enqueue(signal);
+
+        if process.is_some_and(|process| process.complete_signal(sig_num, Some(self))) {
+            return;
+        }
+        self.wake_signalled_waker();
+    }
+
+    /// Enqueues `SIGKILL` to kill this thread as part of a group exit or an `execve`.
+    ///
+    /// Unlike [`Self::enqueue_signal`], this method never starts a group exit.
+    pub(in crate::process) fn enqueue_group_sigkill(&self) {
+        self.sig_queues
+            .enqueue(Box::new(KernelSignal::new(SIGKILL)));
         self.wake_signalled_waker();
     }
 
@@ -395,7 +459,7 @@ pub(crate) trait ContextPthreadAdminApi {
 
 impl ContextPthreadAdminApi for Context<'_> {
     fn set_sig_mask(&self, mut sig_mask: SigMask) {
-        use crate::process::signal::constants::{SIGKILL, SIGSTOP};
+        use crate::process::signal::constants::SIGSTOP;
 
         sig_mask -= SIGKILL;
         sig_mask -= SIGSTOP;
@@ -426,6 +490,7 @@ impl ContextPthreadAdminApi for Context<'_> {
     fn credentials_mut(&self) -> CredentialsUpdate<'_> {
         CredentialsUpdate::new(
             self.posix_thread.credentials.dup().restrict(),
+            self.posix_thread,
             &self.process,
         )
     }

@@ -13,13 +13,10 @@ use crate::{
     prelude::*,
     process::{
         TermStatus,
-        exit::{drop_after, exit_process},
+        exit::{drop_after, exit_process, send_parent_death_signals_on_thread_exit},
         pid_table,
         sigchld::{self, ChildSource},
-        signal::{
-            constants::{SIGCHLD, SIGKILL},
-            signals::kernel::KernelSignal,
-        },
+        signal::constants::SIGCHLD,
         task_set::TaskSet,
     },
     thread::{AsThread, Tid},
@@ -54,7 +51,13 @@ fn exit_internal(
     ctx: &Context,
     user_ctx: &mut UserContext,
 ) {
-    let exit_code = term_status.as_u32();
+    // A thread killed in a group exit exits with the exit code of the group.
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1109-L1110>
+    let exit_code = if is_exiting_group && ctx.process.tasks().lock().has_exited_group() {
+        ctx.process.status().exit_code()
+    } else {
+        term_status.as_u32()
+    };
     ctx.posix_thread
         .ptrace_may_stop_on(PtraceEvent::Exit(exit_code), ctx, user_ctx);
 
@@ -65,6 +68,7 @@ fn exit_internal(
     let posix_process = posix_thread.process();
 
     let mut group_stop_done = None;
+    let was_first_alive;
     let is_last_thread = {
         let mut tasks = posix_process.tasks().lock();
         let has_exited_group = tasks.has_exited_group();
@@ -89,6 +93,12 @@ fn exit_internal(
         if current_thread.is_exited() {
             return;
         }
+        was_first_alive = tasks
+            .as_slice()
+            .iter()
+            .map(|task| task.as_thread().unwrap())
+            .find(|thread| !thread.is_exited())
+            .is_some_and(|thread| Arc::ptr_eq(thread, current_thread));
         current_thread.exit();
 
         let is_last_thread = tasks.remove_exited(&current_task);
@@ -105,6 +115,11 @@ fn exit_internal(
 
     if let Some(sig_num) = group_stop_done {
         posix_process.notify_parent_of_group_stop(sig_num);
+    }
+
+    // The children of the last thread are moved to the reaper process in `exit_process`.
+    if !is_last_thread {
+        send_parent_death_signals_on_thread_exit(was_first_alive, ctx);
     }
 
     // This is put after `current_thread.exit()`,
@@ -149,7 +164,7 @@ fn exit_internal(
     drop_after!(thread_local.borrow_ns_proxy_mut().remove());
 
     if is_last_thread {
-        exit_process(&posix_process);
+        exit_process(ctx);
     }
 }
 
@@ -166,9 +181,7 @@ pub(in crate::process) fn sigkill_other_threads(current_task: &Task, task_set: &
         if core::ptr::eq(current_task, task.as_ref()) {
             continue;
         }
-        task.as_posix_thread()
-            .unwrap()
-            .enqueue_signal(Box::new(KernelSignal::new(SIGKILL)));
+        task.as_posix_thread().unwrap().enqueue_group_sigkill();
     }
 }
 

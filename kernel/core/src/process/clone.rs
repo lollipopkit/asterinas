@@ -15,7 +15,8 @@ use super::{
     posix_thread::{AsPosixThread, PosixThreadBuilder},
     rlimit::ResourceLimits,
     signal::{
-        HandlePendingSignal, constants::SIGCHLD, sig_disposition::SigDispositions, sig_num::SigNum,
+        HandlePendingSignal, PauseReason, constants::SIGCHLD, sig_disposition::SigDispositions,
+        sig_num::SigNum,
     },
 };
 use crate::{
@@ -376,16 +377,24 @@ pub(crate) fn clone_child(
                 .ptrace_may_stop_on(event, ctx, parent_context);
         }
 
+        // The wait is killable, and the killed parent forgets the child.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L1438-L1456>
         if clone_args.flags.contains(CloneFlags::CLONE_VFORK) {
             let cond = || (!child_process.status().is_vfork_child()).then_some(());
             let current = ctx.process.as_ref();
-            current.children_wait_queue().wait_until(cond);
-
-            ctx.posix_thread.ptrace_may_stop_on(
-                PtraceEvent::VforkDone(child_pid),
-                ctx,
-                parent_context,
-            );
+            if current
+                .children_wait_queue()
+                .pause_until_by(cond, PauseReason::Killable)
+                .is_ok()
+            {
+                ctx.posix_thread.ptrace_may_stop_on(
+                    PtraceEvent::VforkDone(child_pid),
+                    ctx,
+                    parent_context,
+                );
+            } else {
+                child_process.status().set_vfork_child(false);
+            }
         }
 
         Ok(child_pid)

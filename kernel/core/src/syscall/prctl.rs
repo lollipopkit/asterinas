@@ -26,13 +26,13 @@ pub(super) fn sys_prctl(
 
     match prctl_cmd {
         PrctlCmd::PR_SET_PDEATHSIG(Some(signum)) => {
-            ctx.process.set_parent_death_signal(signum);
+            ctx.posix_thread.set_parent_death_signal(signum);
         }
         PrctlCmd::PR_SET_PDEATHSIG(None) => {
-            ctx.process.clear_parent_death_signal();
+            ctx.posix_thread.clear_parent_death_signal();
         }
         PrctlCmd::PR_GET_PDEATHSIG(write_to_addr) => {
-            let write_val = match ctx.process.parent_death_signal() {
+            let write_val = match ctx.posix_thread.parent_death_signal() {
                 None => 0i32,
                 Some(signum) => signum.as_u8() as i32,
             };

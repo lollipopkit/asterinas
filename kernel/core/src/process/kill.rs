@@ -186,7 +186,11 @@ fn kill_process(process: &Process, signal: Option<Box<dyn Signal>>, ctx: &Contex
 }
 
 // Reference: <https://elixir.bootlin.com/linux/v6.17/source/kernel/signal.c#L799>.
-fn check_signal_perm(target: &PosixThread, ctx: &Context, signum: Option<SigNum>) -> Result<()> {
+pub(super) fn check_signal_perm(
+    target: &PosixThread,
+    ctx: &Context,
+    signum: Option<SigNum>,
+) -> Result<()> {
     let target_process = target.process();
 
     if Arc::ptr_eq(&target_process, &ctx.process) {

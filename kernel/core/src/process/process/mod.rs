@@ -16,8 +16,10 @@ use super::{
     sigchld::{self, ChildSource},
     signal::{
         HandlePendingSignal,
-        constants::{CLD_CONTINUED, CLD_STOPPED, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU},
-        sig_action::SigDefaultAction,
+        constants::{
+            CLD_CONTINUED, CLD_STOPPED, SIGCONT, SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU,
+        },
+        sig_action::{SigDefaultAction, SigHandler},
         sig_disposition::SigDispositions,
         sig_mask::SigSet,
         sig_num::{AtomicSigNum, SigNum},
@@ -31,7 +33,7 @@ use crate::{
     fs::cgroupfs::CgroupNode,
     prelude::*,
     process::{
-        UserNamespace, WaitOptions,
+        TermStatus, UserNamespace, WaitOptions,
         signal::{Pollee, sig_queues::SigQueues},
     },
     sched::{AtomicNice, Nice},
@@ -145,8 +147,6 @@ pub struct Process {
     sig_dispositions: Mutex<Arc<Mutex<SigDispositions>>>,
     /// The process-level sigqueue.
     sig_queues: SigQueues,
-    /// The signal that the process should receive when parent process exits.
-    parent_death_signal: AtomicSigNum,
     /// The signal that should be sent to the parent when this process exits.
     exit_signal: AtomicSigNum,
     /// The ID of the execution domain, which increases on every `execve`.
@@ -321,7 +321,6 @@ impl Process {
                 has_child_subreaper: AtomicBool::new(false),
                 sig_dispositions: Mutex::new(sig_dispositions),
                 sig_queues: SigQueues::new(),
-                parent_death_signal: AtomicSigNum::new_empty(),
                 exit_signal: AtomicSigNum::new_empty(),
                 self_exec_id: AtomicU64::new(0),
                 parent_exec_id: AtomicU64::new(0),
@@ -708,7 +707,12 @@ impl Process {
         }
 
         self.prepare_signal(signal.num());
+        let sig_num = signal.num();
         self.sig_queues.enqueue(signal);
+
+        if self.complete_signal(sig_num, None) {
+            return;
+        }
 
         for task in self.tasks.lock().as_slice() {
             let posix_thread = task.as_posix_thread().unwrap();
@@ -756,6 +760,80 @@ impl Process {
         }
     }
 
+    /// Starts a group exit if the generated signal will be fatal.
+    ///
+    /// `target` is the target thread of a thread-directed signal, or `None` for a process-directed
+    /// signal. If a thread can take the signal and the signal will be fatal, all the threads are
+    /// killed immediately, so that no thread keeps running after a fatal signal is pending, and
+    /// threads in killable waits are woken up.
+    ///
+    /// Returns whether a group exit has been started. If so, all the threads have been woken up.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L987-L1057>
+    pub(in crate::process) fn complete_signal(
+        &self,
+        sig_num: SigNum,
+        target: Option<&PosixThread>,
+    ) -> bool {
+        // Like Linux, a signal whose default action dumps core is not promoted.
+        if SigDefaultAction::from_signum(sig_num) != SigDefaultAction::Term {
+            return false;
+        }
+        // The init process cannot be killed by a signal with the default disposition. Forced
+        // signals, which may kill the init process, dump core and are not promoted.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L94-L96>
+        if self.is_init_process() {
+            return false;
+        }
+        let handler = self.sig_dispositions.lock().lock().get(sig_num).handler;
+        if handler != SigHandler::Dfl {
+            return false;
+        }
+        // A traced process reports the signal to its tracer before taking it.
+        let is_traced = match target {
+            Some(thread) => thread.is_traced(),
+            None => self.main_thread().as_posix_thread().unwrap().is_traced(),
+        };
+        if is_traced && sig_num != SIGKILL {
+            return false;
+        }
+
+        let mut tasks = self.tasks.lock();
+        if tasks.has_exited_group() {
+            return false;
+        }
+
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/signal.c#L970-L985>
+        let wants_signal = |task: &Arc<Task>| {
+            let posix_thread = task.as_posix_thread().unwrap();
+            target.is_none_or(|target| core::ptr::eq(target, posix_thread))
+                && !posix_thread.sig_mask().contains(sig_num)
+                && !task.as_thread().unwrap().is_exited()
+                && (sig_num == SIGKILL || !posix_thread.is_stopped_or_traced())
+        };
+        let Some(task) = tasks.as_slice().iter().find(|task| wants_signal(task)) else {
+            return false;
+        };
+        if task
+            .as_posix_thread()
+            .unwrap()
+            .real_blocked()
+            .contains(sig_num)
+        {
+            return false;
+        }
+
+        tasks.set_exited_group();
+        self.status
+            .set_exit_code(TermStatus::Killed(sig_num).as_u32());
+        self.clear_group_stop_for_group_exit(&tasks);
+        for task in tasks.as_slice() {
+            task.as_posix_thread().unwrap().enqueue_group_sigkill();
+        }
+
+        true
+    }
+
     /// Returns the dumpability.
     pub(crate) fn dumpable(&self) -> Dumpable {
         self.dumpable.load(Ordering::SeqCst)
@@ -775,24 +853,6 @@ impl Process {
     /// Swaps the dumpability while holding [`Self::credentials_update_lock`].
     pub(crate) fn swap_dumpable_locked(&self, dumpable: Dumpable) -> Dumpable {
         self.dumpable.swap(dumpable, Ordering::SeqCst)
-    }
-
-    /// Clears the parent death signal.
-    pub(crate) fn clear_parent_death_signal(&self) {
-        self.parent_death_signal.clear();
-    }
-
-    /// Sets the parent death signal as `signum`.
-    pub(crate) fn set_parent_death_signal(&self, sig_num: SigNum) {
-        self.parent_death_signal.set(sig_num);
-    }
-
-    /// Returns the parent death signal.
-    ///
-    /// The parent death signal is the signal will be sent to child processes
-    /// when the process exits.
-    pub(crate) fn parent_death_signal(&self) -> Option<SigNum> {
-        self.parent_death_signal.as_sig_num()
     }
 
     pub(crate) fn set_exit_signal(&self, sig_num: SigNum) {

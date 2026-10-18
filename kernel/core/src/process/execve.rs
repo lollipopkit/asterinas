@@ -22,8 +22,8 @@ use crate::{
         credentials::{ExecCred, FileCapabilities},
         pid_table,
         posix_thread::{
-            AsPosixThread, ContextPthreadAdminApi, ThreadLocal, ThreadName, ptrace::PtraceEvent,
-            sigkill_other_threads,
+            AsPosixThread, ContextPthreadAdminApi, PosixThread, ThreadLocal, ThreadName,
+            ptrace::PtraceEvent, sigkill_other_threads,
         },
         process_vm::{MAX_LEN_STRING_ARG, MAX_NR_STRING_ARGS, ProcessVm},
         program_loader::{ProgramToLoad, UndetectedExecutable, elf::ElfLoadInfo},
@@ -239,7 +239,7 @@ fn do_execve_no_return(
         Dumpable::Owner
     };
     process.set_dumpable(dumpable);
-    apply_exec_cred(process, &ctx.credentials_mut(), exec_cred)?;
+    apply_exec_cred(posix_thread, &ctx.credentials_mut(), exec_cred)?;
     drop(vmar_guard);
     drop(old_vmar);
 
@@ -289,7 +289,7 @@ fn wait_other_threads_exit(ctx: &Context) -> Result<()> {
         let (waiter, waker) = Waiter::new_pair();
 
         ctx.posix_thread
-            .set_signalled_waker(waker.clone(), PauseReason::Sleep);
+            .set_signalled_waker(waker.clone(), PauseReason::Killable);
         if ctx.has_pending_sigkill() {
             ctx.posix_thread.clear_signalled_waker();
             return_errno_with_message!(Errno::EAGAIN, "the current thread has received SIGKILL");
@@ -389,12 +389,12 @@ fn set_cpu_context(
 
 /// Applies prepared credentials.
 fn apply_exec_cred(
-    process: &Process,
+    posix_thread: &PosixThread,
     credentials: &Credentials<ReadWriteOp>,
     exec_cred: ExecCred,
 ) -> Result<()> {
     if exec_cred.will_change_ids() {
-        process.clear_parent_death_signal();
+        posix_thread.clear_parent_death_signal();
     }
     credentials.apply_exec_cred(exec_cred)?;
 
