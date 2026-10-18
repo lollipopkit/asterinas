@@ -5,7 +5,10 @@
 #include <unistd.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -109,7 +112,7 @@ FN_TEST(disconnect_connected)
 	TEST_SUCC(connect(sk, &unspec_addr, UNSPEC_LEN));
 	CHECK_NO_PEER(sk);
 	WAIT_EVENTS(peer, POLLIN);
-	TEST_ERRNO(recv(peer, buf, sizeof(buf), 0), ECONNRESET);
+	TEST_ERRNO(recv(peer, buf, sizeof(buf), MSG_DONTWAIT), ECONNRESET);
 	TEST_SUCC(close(peer));
 
 	// The reset is reported once, then the socket is unconnected.
@@ -182,7 +185,7 @@ FN_TEST(disconnect_auto_bound)
 {
 	struct sockaddr_in name;
 	socklen_t namelen = sizeof(name);
-	int sk, sk2, peer;
+	int sk, peer;
 
 	sk = new_tcp_socket();
 	peer = connect_and_accept(sk);
@@ -190,12 +193,9 @@ FN_TEST(disconnect_auto_bound)
 	TEST_SUCC(connect(sk, &unspec_addr, UNSPEC_LEN));
 	TEST_SUCC(close(peer));
 
-	// The automatically bound port is released.
-	sk2 = CHECK(socket(PF_INET, SOCK_STREAM, 0));
-	TEST_SUCC(bind(sk2, (struct sockaddr *)&name, sizeof(name)));
-	TEST_SUCC(close(sk2));
-
-	// The socket can be bound again.
+	// The automatically bound port is released, so the socket can be bound
+	// again. Another socket may not bind the port without `SO_REUSEADDR`,
+	// since a previous connection from the same port may be in TIME-WAIT.
 	TEST_SUCC(bind(sk, (struct sockaddr *)&name, sizeof(name)));
 	CHECK_SOCKNAME(sk, name.sin_addr.s_addr, name.sin_port);
 
@@ -264,11 +264,14 @@ FN_TEST(disconnect_listening)
 	sk = new_listener(&addr);
 	client = new_tcp_socket();
 	TEST_SUCC(connect(client, (struct sockaddr *)&addr, sizeof(addr)));
+	// Wait until the connection is in the accept queue, since connections
+	// that are not established yet are dropped silently.
+	WAIT_EVENTS(sk, POLLIN);
 
 	// Pending connections are reset.
 	TEST_SUCC(connect(sk, &unspec_addr, UNSPEC_LEN));
 	WAIT_EVENTS(client, POLLIN);
-	TEST_ERRNO(recv(client, buf, sizeof(buf), 0), ECONNRESET);
+	TEST_ERRNO(recv(client, buf, sizeof(buf), MSG_DONTWAIT), ECONNRESET);
 	CHECK_SO_ERROR(sk, 0);
 
 	// The socket stops listening, but the bound address is kept.
@@ -314,14 +317,50 @@ END_TEST()
 
 struct blocked_op {
 	int sk;
+	_Atomic pid_t tid;
 	int ret;
 	int err;
 };
+
+static char thread_state(pid_t tid)
+{
+	char path[64];
+	char state = 0;
+	FILE *file;
+
+	snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+	file = fopen(path, "r");
+	CHECK_WITH(0, file != NULL);
+	CHECK_WITH(fscanf(file, "%*d %*s %c", &state), _ret == 1);
+	CHECK(fclose(file));
+	return state;
+}
+
+// Starts `func` in another thread and waits until it is blocked.
+static void start_blocked(struct blocked_op *op, void *(*func)(void *),
+			  pthread_t *thread)
+{
+	struct timespec delay = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
+	pid_t tid;
+	int i;
+
+	CHECK_WITH(pthread_create(thread, NULL, func, op), _ret == 0);
+
+	while ((tid = atomic_load(&op->tid)) == 0)
+		nanosleep(&delay, NULL);
+
+	// The thread sleeps only in the blocking operation after publishing its
+	// ID.
+	for (i = 0; i < 1000 && thread_state(tid) != 'S'; ++i)
+		nanosleep(&delay, NULL);
+	CHECK_WITH(thread_state(tid), _ret == 'S');
+}
 
 static void *blocked_accept(void *arg)
 {
 	struct blocked_op *op = arg;
 
+	atomic_store(&op->tid, syscall(SYS_gettid));
 	op->ret = accept(op->sk, NULL, NULL);
 	op->err = errno;
 	return NULL;
@@ -332,6 +371,7 @@ static void *blocked_recv(void *arg)
 	struct blocked_op *op = arg;
 	char buf[2];
 
+	atomic_store(&op->tid, syscall(SYS_gettid));
 	op->ret = recv(op->sk, buf, sizeof(buf), 0);
 	op->err = errno;
 	return NULL;
@@ -341,12 +381,11 @@ static void *blocked_recv(void *arg)
 #define TEST_DISCONNECT_BLOCKED(fd, func, expected)                          \
 	do {                                                                 \
 		struct blocked_op __op = { .sk = (fd) };                     \
-		pthread_t __tid;                                          \
+		pthread_t __thread_id;                                       \
                                                                              \
-		TEST_SUCC(pthread_create(&__tid, NULL, func, &__op));     \
-		usleep(200 * 1000);                                          \
+		start_blocked(&__op, func, &__thread_id);                    \
 		TEST_SUCC(connect(fd, &unspec_addr, UNSPEC_LEN));            \
-		TEST_SUCC(pthread_join(__tid, NULL));                     \
+		TEST_SUCC(pthread_join(__thread_id, NULL));                  \
 		TEST_RES(__op.ret, __op.ret == -1 && __op.err == (expected)); \
 	} while (0)
 
@@ -391,9 +430,10 @@ FN_TEST(shutdown_listening)
 	// Shutting down the receiving half disconnects the socket.
 	client = new_tcp_socket();
 	TEST_SUCC(connect(client, (struct sockaddr *)&addr, sizeof(addr)));
+	WAIT_EVENTS(sk, POLLIN);
 	TEST_SUCC(shutdown(sk, SHUT_RD));
 	WAIT_EVENTS(client, POLLIN);
-	TEST_ERRNO(recv(client, buf, sizeof(buf), 0), ECONNRESET);
+	TEST_ERRNO(recv(client, buf, sizeof(buf), MSG_DONTWAIT), ECONNRESET);
 	TEST_ERRNO(accept4(sk, NULL, NULL, SOCK_NONBLOCK), EINVAL);
 	TEST_ERRNO(shutdown(sk, SHUT_RDWR), ENOTCONN);
 	TEST_SUCC(close(client));
@@ -412,12 +452,11 @@ FN_TEST(shutdown_listening)
 	sk = new_listener(&addr);
 	{
 		struct blocked_op op = { .sk = sk };
-		pthread_t tid;
+		pthread_t thread;
 
-		TEST_SUCC(pthread_create(&tid, NULL, blocked_accept, &op));
-		usleep(200 * 1000);
+		start_blocked(&op, blocked_accept, &thread);
 		TEST_SUCC(shutdown(sk, SHUT_RDWR));
-		TEST_SUCC(pthread_join(tid, NULL));
+		TEST_SUCC(pthread_join(thread, NULL));
 		TEST_RES(op.ret, op.ret == -1 && op.err == EINVAL);
 	}
 	TEST_SUCC(close(sk));
