@@ -49,19 +49,48 @@ pub(crate) trait SignalContext {
 
 /// Handles a pending signal for the current process.
 pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
+    if !deliver_pending_signal(user_ctx, ctx) {
+        // No user signal handler runs, so the interrupted syscall is restarted.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/signal.c#L343-L359>
+        if let Some(orig_syscall_ret) = syscall_to_restart(user_ctx, ctx) {
+            restart_syscall(user_ctx, orig_syscall_ret);
+        }
+    }
+}
+
+/// Returns the original syscall return value (i.e., the syscall number on most
+/// architectures) if the current syscall is interrupted and can be restarted.
+//
+// The check is done after ptrace-stops, so that the tracer can see or change the return value.
+fn syscall_to_restart(user_ctx: &UserContext, ctx: &Context) -> Option<usize> {
+    ctx.thread_local
+        .orig_syscall_ret()
+        .filter(|_| user_ctx.syscall_ret() == -(Errno::ERESTARTSYS as i32) as usize)
+}
+
+fn restart_syscall(user_ctx: &mut UserContext, orig_syscall_ret: usize) {
+    #[cfg(target_arch = "x86_64")]
+    const SYSCALL_INSTR_LEN: usize = 2; // syscall
+    #[cfg(target_arch = "riscv64")]
+    const SYSCALL_INSTR_LEN: usize = 4; // ecall
+    #[cfg(target_arch = "loongarch64")]
+    const SYSCALL_INSTR_LEN: usize = 4; // syscall
+    #[cfg(target_arch = "aarch64")]
+    const SYSCALL_INSTR_LEN: usize = 4; // svc
+
+    user_ctx.set_syscall_ret(orig_syscall_ret);
+    user_ctx.set_instruction_pointer(user_ctx.instruction_pointer() - SYSCALL_INSTR_LEN);
+}
+
+/// Delivers a pending signal.
+///
+/// Returns whether a user signal handler is set up (or the thread is exiting),
+/// in which case the interrupted syscall has been handled.
+fn deliver_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> bool {
     // FIXME: This function may handle or suppress only one signal per trap, delaying
     // other pending unmasked signals until the next trap. Consider a looped scan.
     //
     // For details, see <https://github.com/asterinas/asterinas/pull/2984/#discussion_r3137275994>.
-    let syscall_restart = if let Some(orig_syscall_ret) = ctx.thread_local.orig_syscall_ret()
-        && user_ctx.syscall_ret() == -(Errno::ERESTARTSYS as i32) as usize
-    {
-        // We should never return `ERESTARTSYS` to the userspace.
-        user_ctx.set_syscall_ret(-(Errno::EINTR as i32) as usize);
-        Some(orig_syscall_ret)
-    } else {
-        None
-    };
 
     let mut restore_sig_mask = ctx
         .thread_local
@@ -74,7 +103,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
     } else {
         // Fast path: There is no signal mask to restore.
         if restore_sig_mask.is_none() {
-            return;
+            return false;
         }
         // Restore the signal mask first.
         let _ = restore_sig_mask.take();
@@ -83,7 +112,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
         if let Some(dequeued_signal) = dequeue_pending_signal(ctx) {
             dequeued_signal
         } else {
-            return;
+            return false;
         }
     };
 
@@ -102,12 +131,12 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                     //
                     // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/signal.c#L2770>
                     requeue_signal(ctx, dequeued);
-                    return;
+                    return false;
                 }
 
                 (dequeued.unwrap(), get_sig_action(ctx, sig_num))
             }
-            PtraceStopResult::Continued(None) => return,
+            PtraceStopResult::Continued(None) => return false,
             PtraceStopResult::Interrupted => {
                 match dequeue_pending_signal(ctx) {
                     Some((dequeued, action)) if dequeued.num() == SIGKILL => {
@@ -115,7 +144,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                     }
                     // SIGKILL was consumed by a sibling thread; this thread will be
                     // terminated as part of the process-wide exit.
-                    _ => return,
+                    _ => return true,
                 }
             }
             PtraceStopResult::NotTraced(dequeued) => (dequeued.unwrap().unwrap(), sig_action),
@@ -134,6 +163,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
     match handler {
         SigHandler::Ign => {
             debug!("Ignore signal {:?}", sig_num);
+            false
         }
         SigHandler::User(handler_addr) => {
             if flags.contains(SigActionFlags::SA_RESETHAND) {
@@ -146,21 +176,13 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                 sig_dispositions.reset_handler(sig_num);
             }
 
-            if let Some(orig_syscall_ret) = syscall_restart
-                && flags.contains(SigActionFlags::SA_RESTART)
-            {
-                #[cfg(target_arch = "x86_64")]
-                const SYSCALL_INSTR_LEN: usize = 2; // syscall
-                #[cfg(target_arch = "riscv64")]
-                const SYSCALL_INSTR_LEN: usize = 4; // ecall
-                #[cfg(target_arch = "loongarch64")]
-                const SYSCALL_INSTR_LEN: usize = 4; // syscall
-                #[cfg(target_arch = "aarch64")]
-                const SYSCALL_INSTR_LEN: usize = 4; // svc
-
-                user_ctx.set_syscall_ret(orig_syscall_ret);
-                user_ctx
-                    .set_instruction_pointer(user_ctx.instruction_pointer() - SYSCALL_INSTR_LEN);
+            if let Some(orig_syscall_ret) = syscall_to_restart(user_ctx, ctx) {
+                if flags.contains(SigActionFlags::SA_RESTART) {
+                    restart_syscall(user_ctx, orig_syscall_ret);
+                } else {
+                    // We should never return `ERESTARTSYS` to the userspace.
+                    user_ctx.set_syscall_ret(-(Errno::EINTR as i32) as usize);
+                }
             }
 
             if let Err(e) = handle_user_signal(
@@ -183,6 +205,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                 // This can be observed in LTP test `signal06`.
                 do_exit_group(TermStatus::Killed(SIGSEGV), ctx, user_ctx);
             }
+            true
         }
         SigHandler::Dfl if ctx.process.is_init_process() && !signal.is_forced() => {
             // From Linux man pages "kill(2)":
@@ -191,6 +214,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
             //
             // Forced signals are exceptions. Otherwise, init would fault again forever.
             // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/signal.c#L1314-L1319>
+            false
         }
         SigHandler::Dfl => {
             let sig_default_action = SigDefaultAction::from_signum(sig_num);
@@ -205,11 +229,15 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                     );
                     // The signal terminates the current process. Therefore, we should exit here.
                     do_exit_group(TermStatus::Killed(sig_num), ctx, user_ctx);
+                    true
                 }
-                SigDefaultAction::Ign => {}
-                SigDefaultAction::Stop => ctx.process.stop(sig_num),
+                SigDefaultAction::Ign => false,
+                SigDefaultAction::Stop => {
+                    ctx.process.stop(sig_num);
+                    false
+                }
                 // The process has been continued when `SIGCONT` was generated.
-                SigDefaultAction::Cont => {}
+                SigDefaultAction::Cont => false,
             }
         }
     }
