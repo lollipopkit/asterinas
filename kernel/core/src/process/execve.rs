@@ -251,7 +251,7 @@ fn do_execve_no_return(
     set_cpu_context(thread_local, user_context, elf_load_info);
 
     // If this was a vfork child, reset vfork-specific state.
-    reset_vfork_child(process);
+    process.complete_vfork_done();
 
     // Unshare file descriptor table and close files with O_CLOEXEC flag.
     unshare_and_close_files(ctx);
@@ -384,15 +384,6 @@ fn apply_exec_cred(
     credentials.apply_exec_cred(exec_cred)?;
 
     Ok(())
-}
-
-fn reset_vfork_child(process: &Process) {
-    if process.status().is_vfork_child() {
-        // Resumes the parent process.
-        process.status().set_vfork_child(false);
-        let parent = process.parent().lock().process().upgrade().unwrap();
-        parent.children_wait_queue().wake_all();
-    }
 }
 
 fn unshare_and_close_files(ctx: &Context) {

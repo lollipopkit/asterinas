@@ -4,8 +4,11 @@ use core::sync::atomic::Ordering;
 
 use super::{INIT_PROCESS_PID, Pid, Process, pid_table};
 use crate::{
-    events::IoEvents, fs::cgroupfs::CgroupMembership, prelude::*,
-    process::signal::signals::kernel::KernelSignal, security::audit,
+    events::IoEvents,
+    fs::cgroupfs::CgroupMembership,
+    prelude::*,
+    process::{posix_thread::AsPosixThread, signal::signals::kernel::KernelSignal},
+    security::audit,
 };
 
 /// Exits the current POSIX process.
@@ -16,7 +19,7 @@ use crate::{
 /// [`do_exit`]: crate::process::posix_thread::do_exit
 /// [`do_exit_group`]: crate::process::posix_thread::do_exit_group
 pub(super) fn exit_process(current_process: &Process) {
-    current_process.status().set_vfork_child(false);
+    current_process.complete_vfork_done();
 
     // Drop fields in `Process`.
     drop_after!(current_process.lock_vmar().set_vmar(None));
@@ -179,10 +182,22 @@ fn send_parent_death_signal(children: &BTreeMap<Pid, Arc<Process>>) {
 }
 
 /// Sends a child-death signal to the parent.
-fn send_child_death_signal(current_process: &Process) {
+///
+/// If the process is traced by a tracer in another process, the tracer is notified instead,
+/// and the parent will be notified when the tracer reaps or detaches the process.
+pub(super) fn send_child_death_signal(current_process: &Process) {
     let Some(parent) = current_process.parent().lock().process().upgrade() else {
         return;
     };
+
+    if current_process
+        .main_thread()
+        .as_posix_thread()
+        .unwrap()
+        .ptrace_defer_exit_notify(&parent)
+    {
+        return;
+    }
 
     if let Some(signal) = current_process.exit_signal().map(KernelSignal::new) {
         parent.enqueue_signal(Box::new(signal));

@@ -28,7 +28,7 @@ use crate::{
     process::{
         NsProxy, UserNamespace,
         pid_file::PidFile,
-        posix_thread::{PosixThread, ThreadLocal, allocate_posix_tid},
+        posix_thread::{PosixThread, ThreadLocal, allocate_posix_tid, ptrace::PtraceEvent},
         stats::PROCESS_CREATION_COUNTER,
     },
     sched::Nice,
@@ -239,16 +239,6 @@ impl CloneArgs {
             );
         }
 
-        // TODO: Support clone-family ptrace events and remove this check.
-        if !clone_flags.contains(CloneFlags::CLONE_UNTRACED)
-            && ctx.posix_thread.needs_ptrace_clone_stop(self)
-        {
-            return_errno_with_message!(
-                Errno::EOPNOTSUPP,
-                "ptrace clone events are not supported currently"
-            );
-        }
-
         Ok(())
     }
 }
@@ -291,9 +281,13 @@ impl CloneFlags {
 ///
 /// FIXME: currently, the child process or thread will be scheduled to run at once,
 /// but this may not be the expected behavior.
+//
+// A mutable reference to `parent_context` is needed because a traced parent may stop
+// at a clone-family ptrace-event-stop, which snapshots the current user register state
+// and may later restore tracer-updated registers.
 pub(crate) fn clone_child(
     ctx: &Context,
-    parent_context: &UserContext,
+    parent_context: &mut UserContext,
     clone_args: CloneArgs,
 ) -> Result<Tid> {
     clone_args.check(ctx)?;
@@ -301,7 +295,15 @@ pub(crate) fn clone_child(
     if clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
         let child_task = clone_child_task(ctx, parent_context, clone_args)?;
         let child_thread = child_task.as_thread().unwrap();
+        let ptrace_event = ctx
+            .posix_thread
+            .ptrace_init_child(&clone_args, child_thread);
         child_thread.run();
+
+        if let Some(event) = ptrace_event {
+            ctx.posix_thread
+                .ptrace_may_stop_on(event, ctx, parent_context);
+        }
 
         let child_tid = child_thread.as_posix_thread().unwrap().tid();
         Ok(child_tid)
@@ -346,6 +348,10 @@ pub(crate) fn clone_child(
             child_process.status().set_vfork_child(true);
         }
 
+        let ptrace_event = ctx
+            .posix_thread
+            .ptrace_init_child(&clone_args, &child_process.main_thread());
+
         child_process.run();
 
         PROCESS_CREATION_COUNTER
@@ -354,13 +360,26 @@ pub(crate) fn clone_child(
             // Race conditions are fine as we don't really care which CPU creates a process.
             .add_on_cpu(CpuId::current_racy(), 1);
 
-        if child_process.status().is_vfork_child() {
+        let child_pid = child_process.pid();
+
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2785-L2792>
+        if let Some(event) = ptrace_event {
+            ctx.posix_thread
+                .ptrace_may_stop_on(event, ctx, parent_context);
+        }
+
+        if clone_args.flags.contains(CloneFlags::CLONE_VFORK) {
             let cond = || (!child_process.status().is_vfork_child()).then_some(());
             let current = ctx.process.as_ref();
             current.children_wait_queue().wait_until(cond);
+
+            ctx.posix_thread.ptrace_may_stop_on(
+                PtraceEvent::VforkDone(child_pid),
+                ctx,
+                parent_context,
+            );
         }
 
-        let child_pid = child_process.pid();
         Ok(child_pid)
     }
 }

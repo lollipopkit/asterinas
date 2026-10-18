@@ -2,6 +2,7 @@
 
 use super::{
     ExitCode, Pid, Process,
+    exit::send_child_death_signal,
     process_filter::ProcessFilter,
     signal::{constants::SIGCHLD, with_sigmask_changed},
 };
@@ -121,7 +122,7 @@ pub(crate) enum WaitStatus {
     Zombie(Arc<Process>),
     Stop(Arc<Process>, SigNum),
     Continue(Arc<Process>),
-    TraceeExit(Arc<Thread>),
+    TraceeExit(Arc<Thread>, ExitCode),
     TraceeStop(Arc<Thread>, PtraceWaitStatus),
 }
 
@@ -157,7 +158,7 @@ impl WaitStatus {
             WaitStatus::Zombie(process)
             | WaitStatus::Stop(process, _)
             | WaitStatus::Continue(process) => WaitStatusSource::Process(process.as_ref()),
-            WaitStatus::TraceeExit(thread) | WaitStatus::TraceeStop(thread, _) => {
+            WaitStatus::TraceeExit(thread, _) | WaitStatus::TraceeStop(thread, _) => {
                 WaitStatusSource::Thread(thread.as_posix_thread().unwrap())
             }
         }
@@ -232,11 +233,20 @@ fn try_wait_tracees(
                 continue;
             }
 
+            // The exit of a main thread is reported with the exit code of its process,
+            // which may be a group exit code set by another thread.
+            // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1275-L1276>
+            let exit_code = if Arc::ptr_eq(&process.main_thread(), thread) {
+                process.status().exit_code()
+            } else {
+                tracee.exit_code()
+            };
+
             let thread = thread.clone();
             if !wait_options.contains(WaitOptions::WNOWAIT) {
                 cleanup_exited_tracee(&process, &thread, tracees, ctx);
             }
-            return WaitResult::Found(WaitStatus::TraceeExit(thread));
+            return WaitResult::Found(WaitStatus::TraceeExit(thread, exit_code));
         }
 
         // Waiting for ptrace-stops does not require `WaitOptions::WSTOPPED`.
@@ -256,8 +266,15 @@ fn cleanup_exited_tracee(
 ) {
     let tracee = thread.as_posix_thread().unwrap();
     tracees.remove(&tracee.tid());
-    tracee.detach_tracer();
+    let is_exit_notify_deferred = tracee.detach_tracer();
     drop(tracees);
+
+    if is_exit_notify_deferred {
+        // Cascade the exit notification to the real parent.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L1279-L1290>
+        send_child_death_signal(process);
+        return;
+    }
 
     if !process.status().is_zombie() {
         return;
@@ -268,9 +285,6 @@ fn cleanup_exited_tracee(
     let tracee_parent = process.parent().lock().process().clone();
     let is_our_child = core::ptr::eq(Weak::as_ptr(&tracee_parent), Arc::as_ptr(&ctx.process));
     if !is_our_child {
-        if let Some(parent) = tracee_parent.upgrade() {
-            parent.children_wait_queue().wake_all();
-        }
         return;
     }
 

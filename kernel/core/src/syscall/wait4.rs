@@ -5,7 +5,7 @@ use ostd::mm::VmIo;
 use super::{SyscallReturn, getrusage::rusage_t};
 use crate::{
     prelude::*,
-    process::{ProcessFilter, WaitOptions, WaitStatus, do_wait, posix_thread::AsPosixThread},
+    process::{ProcessFilter, WaitOptions, WaitStatus, do_wait},
 };
 
 pub(super) fn sys_wait4(
@@ -65,7 +65,7 @@ fn calculate_status_code(wait_status: &WaitStatus) -> u32 {
         WaitStatus::Zombie(process) => process.status().exit_code(),
         WaitStatus::Stop(_, sig_num) => ((sig_num.as_u8() as u32) << 8) | 0x7f,
         WaitStatus::Continue(_) => 0xffff,
-        WaitStatus::TraceeExit(thread) => thread.as_posix_thread().unwrap().exit_code(),
+        WaitStatus::TraceeExit(_, exit_code) => *exit_code,
         WaitStatus::TraceeStop(_, status) => status.to_wait4_status(),
     }
 }

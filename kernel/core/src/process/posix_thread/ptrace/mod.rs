@@ -14,12 +14,17 @@ use crate::arch::ptrace as arch_ptrace;
 use crate::{
     prelude::*,
     process::{
-        CloneArgs, CloneFlags, Process, WaitOptions,
+        CloneArgs, CloneFlags, Process, Uid, WaitOptions,
+        exit::send_child_death_signal,
         signal::{
             DequeuedSignal, PauseReason,
             c_types::siginfo_t,
-            constants::{CLD_TRAPPED, SIGCHLD, SIGKILL, SIGTRAP},
-            signals::{kernel::KernelSignal, raw::RawSignal, user::UserSignal},
+            constants::{CLD_TRAPPED, SIGCHLD, SIGKILL, SIGSTOP, SIGTRAP},
+            signals::{
+                kernel::KernelSignal,
+                raw::RawSignal,
+                user::{UserSignal, UserSignalKind},
+            },
         },
     },
     thread::{Thread, Tid},
@@ -42,30 +47,60 @@ impl PosixThread {
         self.tracee_status.get().and_then(|status| status.tracer())
     }
 
-    /// Sets the tracer of this thread.
+    /// Sets the tracer of this thread with the given ptrace options.
     ///
     /// # Errors
     ///
     /// Returns `EPERM` if this thread is already being traced.
-    fn set_tracer(&self, tracer: Weak<Thread>) -> Result<()> {
+    fn set_tracer(&self, tracer: Weak<Thread>, options: PtraceOptions) -> Result<()> {
         let status = self.tracee_status.call_once(TraceeStatus::new);
-        status.set_tracer(tracer)
+        status.set_tracer(tracer, options)
     }
 
     /// Detaches the tracer of this thread.
-    pub(in crate::process) fn detach_tracer(&self) {
-        self.detach_tracer_with(|_| {});
+    ///
+    /// Returns whether the exit notification to the real parent has been deferred
+    /// until the detach. If so, the caller should notify the real parent.
+    pub(in crate::process) fn detach_tracer(&self) -> bool {
+        self.detach_tracer_with(|_| {})
     }
 
     /// Detaches the tracer of this thread with a callback.
-    fn detach_tracer_with<F>(&self, detach_callback: F)
+    ///
+    /// Returns the same value as [`Self::detach_tracer`].
+    fn detach_tracer_with<F>(&self, detach_callback: F) -> bool
     where
         F: FnOnce(&TraceeState),
     {
-        if let Some(status) = self.tracee_status.get() {
-            status.detach_tracer_with(detach_callback);
-            self.wake_signalled_waker();
-        }
+        let Some(status) = self.tracee_status.get() else {
+            return false;
+        };
+        let is_exit_notify_deferred = status.detach_tracer_with(detach_callback);
+        self.wake_signalled_waker();
+        is_exit_notify_deferred
+    }
+
+    /// Notifies the tracer of the exit of this thread's process
+    /// if the tracer is not in the `real_parent` process.
+    ///
+    /// Returns whether the exit notification to the real parent is deferred.
+    /// If so, the real parent will be notified when the tracer reaps or detaches the tracee.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/exit.c#L763-L766>
+    pub(in crate::process) fn ptrace_defer_exit_notify(&self, real_parent: &Arc<Process>) -> bool {
+        let Some(tracer) = self
+            .tracee_status
+            .get()
+            .and_then(|status| status.defer_exit_notify(real_parent))
+        else {
+            return false;
+        };
+
+        let tracer = tracer.as_posix_thread().unwrap();
+        tracer.enqueue_signal(Box::new(KernelSignal::new(SIGCHLD)));
+        tracer.process().children_wait_queue().wake_all();
+
+        true
     }
 
     /// Stops this thread by ptrace with the given signal if it is currently traced.
@@ -115,11 +150,44 @@ impl PosixThread {
         }
     }
 
-    /// Returns whether a clone-family ptrace event would be required for `clone_args`.
-    pub(in crate::process) fn needs_ptrace_clone_stop(&self, clone_args: &CloneArgs) -> bool {
-        self.tracee_status
-            .get()
-            .is_some_and(|status| status.needs_clone_stop(clone_args))
+    /// Attaches the new child thread to the tracer of this thread if required by `clone_args`.
+    ///
+    /// Returns the clone-family ptrace event that this thread should report
+    /// (via [`Self::ptrace_may_stop_on`]) after the child starts running.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/fork.c#L2735-L2750>,
+    /// <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/ptrace.h#L201-L220>
+    pub(in crate::process) fn ptrace_init_child(
+        &self,
+        clone_args: &CloneArgs,
+        child_thread: &Arc<Thread>,
+    ) -> Option<PtraceEvent> {
+        let child = child_thread.as_posix_thread().unwrap();
+        let (tracer_thread, options, event) = self
+            .tracee_status
+            .get()?
+            .clone_trace(clone_args, child.tid())?;
+
+        let tracer = tracer_thread.as_posix_thread().unwrap();
+        // The child is newly created, so it cannot have been traced.
+        let is_attached = tracer
+            .link_tracee(&tracer_thread, child_thread.clone(), options)
+            .unwrap();
+        if is_attached {
+            // TODO: Set a pending trap (i.e., `JOBCTL_TRAP_STOP`) instead of `SIGSTOP`
+            // if the tracer has used `PTRACE_SEIZE`, after `PTRACE_SEIZE` is supported.
+            //
+            // Linux adds `SIGSTOP` to the private pending set without a `siginfo`,
+            // which is then reported as a `SI_USER` signal from PID 0 and UID 0.
+            child.enqueue_signal(Box::new(UserSignal::new(
+                SIGSTOP,
+                UserSignalKind::Kill,
+                0,
+                Uid::new_root(),
+            )));
+        }
+
+        event
     }
 
     /// Returns the ptrace-stop status changes for the `wait` syscall.
@@ -269,6 +337,29 @@ impl PosixThread {
         tracer_thread: &Arc<Thread>,
         tracee_thread: Arc<Thread>,
     ) -> Result<()> {
+        self.link_tracee(tracer_thread, tracee_thread, PtraceOptions::empty())?;
+        Ok(())
+    }
+
+    /// Links the given tracee to this tracer with the given ptrace options.
+    ///
+    /// Returns whether the tracee is linked. The tracee is not linked
+    /// if this tracer has already exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EPERM` if the tracee is already being traced.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tracer_thread` and `self` do not point to the same thread,
+    /// or if `tracee_thread` is not a POSIX thread.
+    fn link_tracee(
+        &self,
+        tracer_thread: &Arc<Thread>,
+        tracee_thread: Arc<Thread>,
+        options: PtraceOptions,
+    ) -> Result<bool> {
         debug_assert!(core::ptr::eq(
             tracer_thread.as_posix_thread().unwrap(),
             self
@@ -282,14 +373,14 @@ impl PosixThread {
             // Pretend that the tracer immediately detaches the tracee,
             // if the tracer has already exited.
             // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/ptrace.c#L496-L498>
-            return Ok(());
+            return Ok(false);
         }
 
         let tracee = tracee_thread.as_posix_thread().unwrap();
-        tracee.set_tracer(Arc::downgrade(tracer_thread))?;
+        tracee.set_tracer(Arc::downgrade(tracer_thread), options)?;
         tracees.insert(tracee.tid(), tracee_thread);
 
-        Ok(())
+        Ok(true)
     }
 
     /// Returns the tracee map of this thread if it is a tracer.
@@ -315,19 +406,23 @@ impl PosixThread {
         };
 
         let mut tracees_to_kill = Vec::new();
+        let mut tracees_to_notify = Vec::new();
 
         // Lock order: tracer.tracees -> tracee.tracee_status
         let tracees = tracees.lock();
         for tracee_thread in tracees.values() {
             let tracee = tracee_thread.as_posix_thread().unwrap();
             let mut needs_kill = false;
-            tracee.detach_tracer_with(|state| {
+            let is_exit_notify_deferred = tracee.detach_tracer_with(|state| {
                 if state.options.contains(PtraceOptions::PTRACE_O_EXITKILL) {
                     needs_kill = true;
                 }
             });
             if needs_kill {
                 tracees_to_kill.push(tracee_thread.clone());
+            }
+            if is_exit_notify_deferred {
+                tracees_to_notify.push(tracee.process());
             }
         }
 
@@ -336,6 +431,12 @@ impl PosixThread {
         for tracee in tracees_to_kill {
             let tracee = tracee.as_posix_thread().unwrap();
             tracee.enqueue_signal(Box::new(KernelSignal::new(SIGKILL)));
+        }
+
+        // Cascade the exit notifications of zombie tracees to their real parents.
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/ptrace.c#L563-L587>
+        for tracee_process in tracees_to_notify {
+            send_child_death_signal(&tracee_process);
         }
     }
 }
@@ -357,17 +458,18 @@ impl TraceeStatus {
         self.state.lock().tracer()
     }
 
-    fn set_tracer(&self, tracer: Weak<Thread>) -> Result<()> {
+    fn set_tracer(&self, tracer: Weak<Thread>, options: PtraceOptions) -> Result<()> {
         let mut state = self.state.lock();
         if state.tracer().is_some() {
             return_errno_with_message!(Errno::EPERM, "the thread is already being traced");
         }
         state.tracer = tracer;
+        state.options = options;
 
         Ok(())
     }
 
-    fn detach_tracer_with<F>(&self, detach_callback: F)
+    fn detach_tracer_with<F>(&self, detach_callback: F) -> bool
     where
         F: FnOnce(&TraceeState),
     {
@@ -384,6 +486,21 @@ impl TraceeStatus {
         state.is_tracing_syscall = false;
         detach_callback(&state);
         self.is_stopped.store(false, Ordering::Relaxed);
+
+        core::mem::take(&mut state.is_exit_notify_deferred)
+    }
+
+    fn defer_exit_notify(&self, real_parent: &Arc<Process>) -> Option<Arc<Thread>> {
+        // Hold the lock first to avoid race conditions with `detach_tracer_with`.
+        let mut state = self.state.lock();
+
+        let tracer = state.tracer()?;
+        if Arc::ptr_eq(&tracer.as_posix_thread().unwrap().process(), real_parent) {
+            return None;
+        }
+        state.is_exit_notify_deferred = true;
+
+        Some(tracer)
     }
 
     fn ptrace_stop(
@@ -545,23 +662,34 @@ impl TraceeStatus {
         PtraceStopResult::Continued(signal)
     }
 
-    fn needs_clone_stop(&self, clone_args: &CloneArgs) -> bool {
+    /// Returns the tracer, the ptrace options, and the clone-family event (if enabled)
+    /// if the new child `child_tid` created with `clone_args` should be traced.
+    fn clone_trace(
+        &self,
+        clone_args: &CloneArgs,
+        child_tid: Tid,
+    ) -> Option<(Arc<Thread>, PtraceOptions, Option<PtraceEvent>)> {
         let state = self.state.lock();
-        if state.tracer().is_none() {
-            return false;
-        }
+        let tracer = state.tracer()?;
         let options = state.options;
 
-        if clone_args.flags.contains(CloneFlags::CLONE_VFORK) {
-            return options.contains(PtraceOptions::PTRACE_O_TRACEVFORK)
-                || options.contains(PtraceOptions::PTRACE_O_TRACEVFORKDONE);
+        let flags = clone_args.flags;
+        let event = if flags.contains(CloneFlags::CLONE_UNTRACED) {
+            None
+        } else if flags.contains(CloneFlags::CLONE_VFORK) {
+            Some(PtraceEvent::Vfork(child_tid))
+        } else if clone_args.exit_signal != Some(SIGCHLD) {
+            Some(PtraceEvent::Clone(child_tid))
+        } else {
+            Some(PtraceEvent::Fork(child_tid))
+        };
+        let event = event.filter(|event| options.contains(event.option()));
+
+        if event.is_none() && !flags.contains(CloneFlags::CLONE_PTRACE) {
+            return None;
         }
 
-        if clone_args.exit_signal == Some(SIGCHLD) {
-            return options.contains(PtraceOptions::PTRACE_O_TRACEFORK);
-        }
-
-        options.contains(PtraceOptions::PTRACE_O_TRACECLONE)
+        Some((tracer, options, event))
     }
 
     fn is_ptrace_stopped(&self) -> bool {
@@ -768,6 +896,9 @@ struct TraceeState {
     options: PtraceOptions,
     /// Whether the tracee should stop at the next syscall enter or exit.
     is_tracing_syscall: bool,
+    /// Whether the exit notification of the tracee's process to its real parent
+    /// is deferred until the tracer reaps or detaches the tracee.
+    is_exit_notify_deferred: bool,
     /// The user register context of the tracee at the time of ptrace-stop.
     #[cfg(target_arch = "x86_64")]
     user_context: Option<UserContext>,
@@ -791,6 +922,7 @@ impl TraceeState {
             event: None,
             options: PtraceOptions::empty(),
             is_tracing_syscall: false,
+            is_exit_notify_deferred: false,
             #[cfg(target_arch = "x86_64")]
             user_context: None,
             #[cfg(target_arch = "x86_64")]
