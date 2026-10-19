@@ -308,6 +308,18 @@ syn = { version = "2.0.77", features = ["full", "parsing", "fold", "visit-mut"] 
 [profile.dev]
 panic = "unwind"
 
+# Without optimizations, these crates use stack frames of tens of KiB (e.g., the ChaCha block
+# function behind `getrandom` and the inflate state used to unpack the initramfs), which
+# would dominate the kernel stack usage of debug builds.
+[profile.dev.package.rand_chacha]
+opt-level = 3
+
+[profile.dev.package.ppv-lite86]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 panic = "unwind"
