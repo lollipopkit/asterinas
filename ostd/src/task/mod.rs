@@ -95,6 +95,17 @@ impl Task {
         Some((kstack.range(), kstack.lower_guard_range()))
     }
 
+    /// Records the high watermark of the current task's kernel stack and prints the statistics
+    /// of all recorded kernel stacks.
+    #[cfg(feature = "kstack_watermark")]
+    pub(crate) fn record_current_kernel_stack() {
+        if let Some(task) = current_task() {
+            // SAFETY: The current task is alive while it is running on this CPU.
+            unsafe { task.as_ref() }.kstack.record_watermark();
+        }
+        KernelStack::print_watermark_histogram();
+    }
+
     pub(super) fn ctx(&self) -> &SyncUnsafeCell<TaskContext> {
         &self.ctx
     }

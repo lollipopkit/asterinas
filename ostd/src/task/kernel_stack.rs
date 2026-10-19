@@ -16,6 +16,9 @@ use crate::{
     prelude::*,
 };
 
+#[cfg(feature = "kstack_watermark")]
+mod watermark;
+
 /// The kernel stack size of a task, specified in pages.
 ///
 /// By default, we choose a rather large stack size.
@@ -45,6 +48,8 @@ pub(super) struct KernelStack {
     kvirt_area: KVirtArea,
     tlb_coherent: AtomicCpuSet,
     end_vaddr: Vaddr,
+    #[cfg(feature = "kstack_watermark")]
+    paddr: Paddr,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +70,11 @@ impl KernelStack {
         let pages = FrameAllocOptions::new()
             .zeroed(false)
             .alloc_segment_with(KERNEL_STACK_SIZE / PAGE_SIZE, |_| KernelStackMeta)?;
+        #[cfg(feature = "kstack_watermark")]
+        let paddr = {
+            watermark::fill(pages.paddr(), KERNEL_STACK_SIZE);
+            pages.paddr()
+        };
         let prop = PageProperty {
             flags: PageFlags::RW,
             cache: CachePolicy::Writeback,
@@ -83,6 +93,8 @@ impl KernelStack {
             kvirt_area: new_kvirt_area,
             tlb_coherent: AtomicCpuSet::new(CpuSet::new_empty()),
             end_vaddr: mapped_end,
+            #[cfg(feature = "kstack_watermark")]
+            paddr,
         })
     }
 
@@ -97,6 +109,18 @@ impl KernelStack {
 
     pub(super) fn end_vaddr(&self) -> Vaddr {
         self.end_vaddr
+    }
+
+    /// Records the high watermark of the stack.
+    #[cfg(feature = "kstack_watermark")]
+    pub(super) fn record_watermark(&self) {
+        watermark::record(self.paddr, KERNEL_STACK_SIZE);
+    }
+
+    /// Prints the statistics of the high watermarks of all recorded stacks.
+    #[cfg(feature = "kstack_watermark")]
+    pub(super) fn print_watermark_histogram() {
+        watermark::print_histogram();
     }
 
     /// Returns the mapped range of the stack.
@@ -114,6 +138,8 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
+        #[cfg(feature = "kstack_watermark")]
+        self.record_watermark();
         KERNEL_STACK_PAGES.sub(KERNEL_STACK_SIZE / PAGE_SIZE);
     }
 }
