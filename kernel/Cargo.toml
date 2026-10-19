@@ -10,7 +10,7 @@ ostd.workspace = true
 # High-level component crates.
 #
 # Keep this list in sync with the `extern crate` declarations in `src/lib.rs`.
-aster-agentvm.workspace = true
+aster-agentvm = { workspace = true, optional = true }
 aster-drm.workspace = true
 aster-simpledrm.workspace = true
 aster-uart.workspace = true
@@ -19,7 +19,8 @@ aster-uart.workspace = true
 aster-i8042.workspace = true
 
 [features]
-default = ["cvm_guest"]
+default = ["agentvm", "cvm_guest"]
+agentvm = ["dep:aster-agentvm"]
 coverage = ["aster-core/coverage"]
 cvm_guest = ["aster-core/cvm_guest"]
 kstack_watermark = ["aster-core/kstack_watermark"]
