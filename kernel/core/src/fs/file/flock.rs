@@ -109,13 +109,26 @@ impl FlockList {
     ///
     /// If no conflicting locks exist, the lock is set and the function returns `Ok(())`.
     /// If a conflicting lock exists:
-    /// - If waker is not `None`, it is added to the conflicting lock's waitqueue, and the function returns `EAGAIN`.
-    /// - If waker is `None`, the function returns `EAGAIN`.
-    fn try_set_lock(&self, req_lock: &FlockItem, waker: Option<&Arc<Waker>>) -> Result<()> {
+    /// - If `blocked` is not `None`, the waker is added to the conflicting lock's waitqueue, which
+    ///   is recorded so that the waker can be removed when the wait finishes, and the function
+    ///   returns `EAGAIN`.
+    /// - If `blocked` is `None`, the function returns `EAGAIN`.
+    fn try_set_lock(
+        &self,
+        req_lock: &FlockItem,
+        blocked: Option<(&Arc<Waker>, &mut Option<Arc<WaitQueue>>)>,
+    ) -> Result<()> {
         let mut list = self.inner.lock();
         if let Some(conflict_lock) = list.iter().find(|l| req_lock.conflict_with(l)) {
-            if let Some(waker) = waker {
+            if let Some((waker, blocker)) = blocked {
+                // Wait on one conflicting lock at a time, like `fl_blocker` in Linux.
+                if let Some(old_blocker) =
+                    blocker.take_if(|old| !Arc::ptr_eq(old, &conflict_lock.waitqueue))
+                {
+                    old_blocker.dequeue(waker);
+                }
                 conflict_lock.waitqueue.enqueue(waker.clone());
+                *blocker = Some(conflict_lock.waitqueue.clone());
             }
             return_errno_with_message!(Errno::EAGAIN, "the file is locked");
         } else {
@@ -145,14 +158,19 @@ impl FlockList {
             self.try_set_lock(&req_lock, None)
         } else {
             let (waiter, waker) = Waiter::new_pair();
-            waiter.pause_until(|| {
-                let result = self.try_set_lock(&req_lock, Some(&waker));
+            let mut blocker = None;
+            let res = waiter.pause_until(|| {
+                let result = self.try_set_lock(&req_lock, Some((&waker, &mut blocker)));
                 if result.is_err_and(|err| err.error() == Errno::EAGAIN) {
                     None
                 } else {
                     Some(result)
                 }
-            })?
+            });
+            if let Some(blocker) = blocker {
+                blocker.dequeue(&waker);
+            }
+            res?
         }
     }
 

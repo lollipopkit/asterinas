@@ -202,25 +202,24 @@ impl MessageQueue {
     where
         F: FnMut() -> Result<R>,
     {
-        let (waiter, _) = Waiter::new_pair();
-        waiter
-            .pause_until_or_timeout(
-                || {
-                    self.send_wait_queue.enqueue(waiter.waker());
-                    if !core::ptr::eq(self, sender) {
-                        sender.send_wait_queue.enqueue(waiter.waker());
-                    }
-                    match try_send() {
-                        Err(err) if err.error() == Errno::EAGAIN => None,
-                        result => Some(result),
-                    }
-                },
-                timeout.as_ref(),
-            )
-            .map_err(|err| match err.error() {
-                Errno::ETIME => Error::with_message(Errno::EAGAIN, "the socket timeout expired"),
-                _ => err,
-            })?
+        let (waiter, waker) = Waiter::new_pair();
+        let res = waiter.pause_until_or_timeout(
+            || {
+                self.send_wait_queue.enqueue(waker.clone());
+                sender.send_wait_queue.enqueue(waker.clone());
+                match try_send() {
+                    Err(err) if err.error() == Errno::EAGAIN => None,
+                    result => Some(result),
+                }
+            },
+            timeout.as_ref(),
+        );
+        self.send_wait_queue.dequeue(&waker);
+        sender.send_wait_queue.dequeue(&waker);
+        res.map_err(|err| match err.error() {
+            Errno::ETIME => Error::with_message(Errno::EAGAIN, "the socket timeout expired"),
+            _ => err,
+        })?
     }
 
     /// Returns the send buffer size.

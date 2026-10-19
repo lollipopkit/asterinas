@@ -74,14 +74,16 @@ impl WaitQueue {
             return res;
         }
 
-        let (waiter, _) = Waiter::new_pair();
+        let (waiter, waker) = Waiter::new_pair();
         let cond = || {
-            self.enqueue(waiter.waker());
+            self.enqueue(waker.clone());
             cond()
         };
-        waiter
+        let res = waiter
             .wait_until_or_cancelled(cond, || Ok::<(), ()>(()))
-            .unwrap()
+            .unwrap();
+        self.dequeue(&waker);
+        res
     }
 
     /// Wakes up one waiting thread, if there is one at the point of time when this method is
@@ -98,6 +100,7 @@ impl WaitQueue {
                 return false;
             };
             self.num_wakers.fetch_sub(1, Ordering::Release);
+            waker.num_queued.fetch_sub(1, Ordering::Relaxed);
             // Avoid holding lock when calling `wake_up`
             drop(wakers);
 
@@ -122,6 +125,7 @@ impl WaitQueue {
                 break;
             };
             self.num_wakers.fetch_sub(1, Ordering::Release);
+            waker.num_queued.fetch_sub(1, Ordering::Relaxed);
             // Avoid holding lock when calling `wake_up`
             drop(wakers);
 
@@ -140,12 +144,45 @@ impl WaitQueue {
         self.num_wakers.fetch_add(0, Ordering::Release) == 0
     }
 
-    /// Enqueues the input [`Waker`] to the wait queue.
+    /// Enqueues the input [`Waker`] to the wait queue unless it is already in the queue.
+    ///
+    /// This is like `prepare_to_wait` in Linux, so a waiter that is woken by others and waits
+    /// again does not add another entry. A wait that enqueues a waker must call [`Self::dequeue`]
+    /// when it finishes, like `finish_wait` in Linux.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/sched/wait.c#L249>
     #[doc(hidden)]
     pub fn enqueue(&self, waker: Arc<Waker>) {
         let mut wakers = self.wakers.lock();
+        // Only the waiter enqueues its waker, so a zero count means that the waker is not in any
+        // queue, and the scan is skipped.
+        if waker.num_queued.load(Ordering::Relaxed) != 0
+            && wakers.iter().any(|queued| Arc::ptr_eq(queued, &waker))
+        {
+            return;
+        }
+        waker.num_queued.fetch_add(1, Ordering::Relaxed);
         wakers.push_back(waker);
         self.num_wakers.fetch_add(1, Ordering::Acquire);
+    }
+
+    /// Removes the input [`Waker`] from the wait queue if a wake-up has not removed it.
+    ///
+    /// This is like `finish_wait` in Linux. Without it, a waker whose waiter has finished waiting
+    /// would stay in the queue, together with its task, until the queue is woken or dropped.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/sched/wait.c#L376>
+    #[doc(hidden)]
+    pub fn dequeue(&self, waker: &Arc<Waker>) {
+        if waker.num_queued.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut wakers = self.wakers.lock();
+        if let Some(index) = wakers.iter().position(|queued| Arc::ptr_eq(queued, waker)) {
+            wakers.remove(index);
+            self.num_wakers.fetch_sub(1, Ordering::Release);
+            waker.num_queued.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -173,6 +210,8 @@ impl !Sync for Waiter {}
 /// be used across different threads.
 pub struct Waker {
     has_woken: AtomicBool,
+    /// The number of wait queues that hold this waker.
+    num_queued: AtomicU32,
     task: Arc<Task>,
 }
 
@@ -181,6 +220,7 @@ impl Waiter {
     pub fn new_pair() -> (Self, Arc<Waker>) {
         let waker = Arc::new(Waker {
             has_woken: AtomicBool::new(false),
+            num_queued: AtomicU32::new(0),
             task: Task::current().unwrap().cloned(),
         });
         let waiter = Self {
@@ -324,6 +364,44 @@ mod test {
         queue_wake(|queue| {
             queue.wake_all();
         });
+    }
+
+    #[ktest]
+    fn queue_no_stale_waker() {
+        let queue = WaitQueue::new();
+
+        // The condition turns true after the waker is enqueued, so the wait returns without
+        // being woken.
+        let mut num_checks = 0;
+        queue.wait_until(|| {
+            num_checks += 1;
+            (num_checks >= 2).then_some(())
+        });
+
+        assert_eq!(num_checks, 2);
+        assert!(queue.is_empty());
+        assert!(queue.wakers.lock().is_empty());
+    }
+
+    #[ktest]
+    fn queue_enqueue_dequeue() {
+        let queue = WaitQueue::new();
+        let (_waiter, waker) = Waiter::new_pair();
+
+        // Enqueuing twice adds one entry.
+        queue.enqueue(waker.clone());
+        queue.enqueue(waker.clone());
+        assert_eq!(queue.wakers.lock().len(), 1);
+        queue.dequeue(&waker);
+        assert!(queue.is_empty());
+        assert!(queue.wakers.lock().is_empty());
+
+        // Dequeuing a waker that a wake-up has removed does nothing.
+        queue.enqueue(waker.clone());
+        assert!(queue.wake_one());
+        queue.dequeue(&waker);
+        assert!(queue.is_empty());
+        assert_eq!(waker.num_queued.load(Ordering::Relaxed), 0);
     }
 
     #[ktest]
