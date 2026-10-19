@@ -22,18 +22,17 @@ use x86_64::{
 };
 
 use crate::{
-    arch::mm::tlb_flush_addr_range,
+    arch::{cpu::local::get_base, mm::tlb_flush_addr_range},
     const_assert,
     cpu::{
-        CpuId,
+        CpuId, all_cpus,
         local::{CpuLocal, StaticCpuLocal},
-        num_cpus,
     },
     cpu_local, impl_frame_meta_for,
     irq::DisabledLocalIrqGuard,
     mm::{
         FrameAllocOptions, PAGE_SIZE, Vaddr,
-        kspace::kvirt_area::KVirtArea,
+        kspace::{kvirt_area::KVirtArea, paddr_to_vaddr},
         page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
     },
     util::id_set::Id,
@@ -57,7 +56,8 @@ pub(super) unsafe fn init_on_cpu() {
 
     let df_stack_top = DOUBLE_FAULT_STACKS.get().unwrap()[CpuId::current_racy().as_usize()]
         .range()
-        .end;
+        .end
+        - DOUBLE_FAULT_STACK_RESERVED;
     // SAFETY: The TSS is CPU-local and no other code accesses the IST at this point, since the
     // caller guarantees that no preemption can occur and no traps can occur yet.
     unsafe {
@@ -112,6 +112,12 @@ pub(super) const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/include/asm/page_64_types.h#L18-L19>
 const DOUBLE_FAULT_STACK_SIZE: usize = 4 * PAGE_SIZE;
 
+/// The bytes reserved at the top of each double fault stack, above the IST pointer.
+///
+/// The lowest word holds the CPU-local base (i.e., the kernel GS base) of the CPU, which
+/// `trap.S` loads on double faults. The size keeps the IST pointer 16-byte aligned.
+const DOUBLE_FAULT_STACK_RESERVED: usize = 16;
+
 /// The double fault stacks of all CPUs, indexed by the CPU ID.
 static DOUBLE_FAULT_STACKS: Once<Box<[KVirtArea]>> = Once::new();
 
@@ -132,8 +138,8 @@ pub(in crate::arch) fn alloc_double_fault_stacks() {
             cache: CachePolicy::Writeback,
             priv_flags: PrivilegedPageFlags::empty(),
         };
-        (0..num_cpus())
-            .map(|_| {
+        all_cpus()
+            .map(|cpu| {
                 let pages = FrameAllocOptions::new()
                     .zeroed(false)
                     .alloc_segment_with(DOUBLE_FAULT_STACK_SIZE / PAGE_SIZE, |_| {
@@ -149,6 +155,17 @@ pub(in crate::arch) fn alloc_double_fault_stacks() {
                 // Other CPUs have not activated the kernel page table yet, so only the TLB of
                 // the current CPU may have stale entries of the area.
                 tlb_flush_addr_range(&area.range());
+
+                let gs_base = if cpu.as_usize() == 0 {
+                    get_base() as usize
+                } else {
+                    paddr_to_vaddr(crate::cpu::local::get_ap(cpu))
+                };
+                let slot = (area.range().end - DOUBLE_FAULT_STACK_RESERVED) as *mut usize;
+                // SAFETY: The slot is in the newly mapped stack, which is exclusively owned here
+                // and coherent in the TLB of the current CPU.
+                unsafe { slot.write(gs_base) };
+
                 area
             })
             .collect()

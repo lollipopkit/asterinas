@@ -107,20 +107,22 @@ _trap_from_user:
     jmp trap_syscall_entry
 
 # Double faults are delivered on their own IST stack and never return, so they are always
-# handled like kernel traps. The GS base can still be the user one (e.g., if the fault comes from
-# user mode or right after `syscall`), so like Linux's `paranoid_entry`, check the GS base itself
-# instead of the saved CS: kernel GS bases are kernel (negative) addresses.
+# handled like kernel traps. The GS base may be controlled by user space (e.g., if the fault comes
+# from user mode or right after `syscall`), and with FSGSBASE user space can set any canonical
+# value, so the sign check of Linux's `paranoid_entry` cannot be trusted. Like Linux with
+# FSGSBASE, unconditionally load the kernel GS base, which is stored at the top of the IST stack
+# (see `gdt::alloc_double_fault_stacks`). The user GS base is lost, but nothing returns to it.
 trap_double_fault:
     cld
     push rax
     push rcx
     push rdx
+    # The IST pointer is above the CPU frame (6 words), the vector, and the 3 saved registers.
+    mov rax, [rsp + 10*8]   # rax = kernel GS base
+    mov rdx, rax
+    shr rdx, 32
     mov ecx, 0xc0000101     # IA32_GS_BASE
-    rdmsr
-    test edx, edx
-    js 1f
-    swapgs
-1:
+    wrmsr
     pop rdx
     pop rcx
     jmp _trap_from_kernel
