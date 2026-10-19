@@ -11,11 +11,14 @@ use x86_64::{
     structures::{DescriptorTablePointer, idt::Entry},
 };
 
+use super::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::mm::Vaddr;
 
 global_asm!(include_str!("trap.S"));
 
 const NUM_INTERRUPTS: usize = 256;
+
+const DOUBLE_FAULT_VECTOR: usize = 8;
 
 unsafe extern "C" {
     #[link_name = "trap_handler_table"]
@@ -54,6 +57,14 @@ pub(super) fn init_on_cpu() {
             // Enable `int3` and `into` in the userspace.
             if intr_no == 3 || intr_no == 4 {
                 opt.set_privilege_level(PrivilegeLevel::Ring3);
+            }
+
+            // Like Linux, handle double faults on a known good stack, so that kernel stack
+            // overflows can be reported.
+            if intr_no == DOUBLE_FAULT_VECTOR {
+                // SAFETY: The IST entry is set up in `gdt::init_on_cpu` and used by no other
+                // vector. The double fault handler never returns.
+                unsafe { opt.set_stack_index(DOUBLE_FAULT_IST_INDEX) };
             }
         }
 

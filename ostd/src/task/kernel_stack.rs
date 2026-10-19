@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::Ordering;
+use core::{ops::Range, sync::atomic::Ordering};
 
 use crate::{
     arch::mm::tlb_flush_addr_range,
@@ -97,6 +97,18 @@ impl KernelStack {
 
     pub(super) fn end_vaddr(&self) -> Vaddr {
         self.end_vaddr
+    }
+
+    /// Returns the mapped range of the stack.
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    pub(super) fn range(&self) -> Range<Vaddr> {
+        self.end_vaddr - KERNEL_STACK_SIZE..self.end_vaddr
+    }
+
+    /// Returns the guard pages below the stack, which an overflow hits first.
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    pub(super) fn lower_guard_range(&self) -> Range<Vaddr> {
+        self.kvirt_area.range().start..self.end_vaddr - KERNEL_STACK_SIZE
     }
 }
 

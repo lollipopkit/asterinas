@@ -84,6 +84,7 @@ pub(crate) fn init_cvm_guest(boot_params: &linux_boot_params::BootParams) {
 /// 2. This function must be called after the kernel page table is activated on
 ///    the bootstrapping processor.
 pub(crate) unsafe fn late_init_on_bsp() {
+    trap::gdt::alloc_double_fault_stacks();
     // SAFETY: This is only called once on this BSP in the boot context.
     unsafe { trap::init_on_cpu() };
 

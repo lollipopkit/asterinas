@@ -12,6 +12,7 @@
  * * Adjust some symbol names.
  * * Disable alternate macro mode after using it.
  * * Report the RSP pushed by the CPU in the trap frame.
+ * * Handle double faults on their own entry path.
  *
  * These changes are released under the following license:
  *
@@ -27,7 +28,11 @@
 
 .macro DEF_HANDLER, i
 _trap_handler_\i:
-.if \i == 8 || (\i >= 10 && \i <= 14) || \i == 17
+.if \i == 8
+    # error code (always zero) pushed by CPU
+    push    \i          # interrupt vector
+    jmp     trap_double_fault
+.elseif (\i >= 10 && \i <= 14) || \i == 17
     # error code pushed by CPU
     push    \i          # interrupt vector
     jmp     trap_common
@@ -100,6 +105,25 @@ _trap_from_user:
     mov rax, [rax - 8*8]    # pop rax
 .extern trap_syscall_entry
     jmp trap_syscall_entry
+
+# Double faults are delivered on their own IST stack and never return, so they are always
+# handled like kernel traps. The GS base can still be the user one (e.g., if the fault comes from
+# user mode or right after `syscall`), so like Linux's `paranoid_entry`, check the GS base itself
+# instead of the saved CS: kernel GS bases are kernel (negative) addresses.
+trap_double_fault:
+    cld
+    push rax
+    push rcx
+    push rdx
+    mov ecx, 0xc0000101     # IA32_GS_BASE
+    rdmsr
+    test edx, edx
+    js 1f
+    swapgs
+1:
+    pop rdx
+    pop rcx
+    jmp _trap_from_kernel
 
 _trap_from_kernel:
     # kernel stack:

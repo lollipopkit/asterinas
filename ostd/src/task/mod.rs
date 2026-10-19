@@ -13,7 +13,7 @@ use core::{
     any::Any,
     borrow::Borrow,
     cell::{Cell, SyncUnsafeCell},
-    ops::Deref,
+    ops::{Deref, Range},
     ptr::NonNull,
     sync::atomic::AtomicBool,
 };
@@ -82,6 +82,17 @@ impl Task {
 
         // SAFETY: `current_task` is the current task.
         Some(unsafe { CurrentTask::new(current_task) })
+    }
+
+    /// Returns the mapped range and the lower guard range of the current task's kernel stack.
+    ///
+    /// This is used to report kernel stack overflows. It returns `None` in the
+    /// bootstrap context.
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    pub(crate) fn current_kernel_stack_ranges() -> Option<(Range<Vaddr>, Range<Vaddr>)> {
+        // SAFETY: The current task is alive while it is running on this CPU.
+        let kstack = unsafe { &current_task()?.as_ref().kstack };
+        Some((kstack.range(), kstack.lower_guard_range()))
     }
 
     pub(super) fn ctx(&self) -> &SyncUnsafeCell<TaskContext> {
