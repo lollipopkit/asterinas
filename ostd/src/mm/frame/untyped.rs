@@ -35,11 +35,46 @@ pub trait AnyUFrameMeta: AnyFrameMeta {}
 /// The usage of this frame will not be changed while this object is alive.
 pub type UFrame = Frame<dyn AnyUFrameMeta>;
 
+/// Observes the user mappings of untyped frames.
+///
+/// Metadata types implemented with
+/// `impl_untyped_frame_meta_for!(T, user_mappings)` receive the notifications
+/// of [`AnyFrameMeta::on_map_to_user`] and
+/// [`AnyFrameMeta::on_unmap_from_user`] through this trait.
+pub trait UserMappingObserver {
+    /// See [`AnyFrameMeta::on_map_to_user`].
+    fn on_map_to_user(&self);
+
+    /// See [`AnyFrameMeta::on_unmap_from_user`].
+    fn on_unmap_from_user(&self);
+}
+
 /// Makes a structure usable as untyped frame metadata.
 ///
 /// If this macro is used for built-in typed frame metadata, it won't compile.
 #[macro_export]
 macro_rules! impl_untyped_frame_meta_for {
+    // Implement with the notifications of user mappings forwarded to the
+    // `UserMappingObserver` implementation.
+    ($t:ty, user_mappings) => {
+        // SAFETY: Untyped frames can be safely read.
+        unsafe impl $crate::mm::frame::meta::AnyFrameMeta for $t {
+            fn is_untyped(&self) -> bool {
+                true
+            }
+
+            fn on_map_to_user(&self) {
+                <$t as $crate::mm::frame::untyped::UserMappingObserver>::on_map_to_user(self)
+            }
+
+            fn on_unmap_from_user(&self) {
+                <$t as $crate::mm::frame::untyped::UserMappingObserver>::on_unmap_from_user(self)
+            }
+        }
+        impl $crate::mm::frame::untyped::AnyUFrameMeta for $t {}
+
+        $crate::check_frame_meta_layout!($t);
+    };
     // Implement without specifying the drop behavior.
     ($t:ty) => {
         // SAFETY: Untyped frames can be safely read.

@@ -155,6 +155,7 @@ TEST_TMPDIR=/ext2 ./direct_io/direct_io
 ./procfs/fd
 ./procfs/fs_links
 ./procfs/getdents
+./procfs/meminfo
 ./procfs/mountstats
 ./procfs/pid_mem
 ./procfs/proc_fd_open_fifo_after_setid

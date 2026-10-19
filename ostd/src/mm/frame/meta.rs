@@ -150,6 +150,21 @@ pub unsafe trait AnyFrameMeta: Any + Send + Sync {
     /// Called when the last handle to the frame is dropped.
     fn on_drop(&mut self, _reader: &mut VmReader<Infallible>) {}
 
+    /// Called when a page table entry of a user address space starts to map
+    /// the frame.
+    ///
+    /// Each such page table entry results in exactly one call to this method
+    /// and, when the entry stops mapping the frame, exactly one call to
+    /// [`Self::on_unmap_from_user`]. Implementations can use them to track
+    /// the number of user mappings, like Linux's `_mapcount`.
+    fn on_map_to_user(&self) {}
+
+    /// Called when a page table entry of a user address space stops mapping
+    /// the frame.
+    ///
+    /// See [`Self::on_map_to_user`] for details.
+    fn on_unmap_from_user(&self) {}
+
     /// Whether the metadata's associated frame is untyped.
     ///
     /// If a type implements [`AnyUFrameMeta`], this should be `true`.

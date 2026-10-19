@@ -92,7 +92,8 @@ impl ExfatFs {
             fat_cache: RwLock::new(LruCache::<ClusterID, ClusterID>::new(
                 NonZeroUsize::new(FAT_LRU_CACHE_SIZE).unwrap(),
             )),
-            meta_cache: PageCache::new_with_backend(fs_size, weak_self.clone() as _).unwrap(),
+            meta_cache: PageCache::new_buffer_with_backend(fs_size, weak_self.clone() as _)
+                .unwrap(),
             mutex: Mutex::new(()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             write_state: FsWriteState::new(),

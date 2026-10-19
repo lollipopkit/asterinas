@@ -46,6 +46,7 @@ use crate::{
         frame::{Frame, FrameRef, meta::AnyFrameMeta},
         paddr_to_vaddr,
         page_table::{PteScalar, load_pte, store_pte},
+        stat::{PAGE_TABLE_PAGES, PageCounter, SECONDARY_PAGE_TABLE_PAGES},
     },
     task::atomic_mode::InAtomicMode,
 };
@@ -69,10 +70,12 @@ impl<C: PageTableConfig> PageTableNode<C> {
     /// Allocates a new empty page table node.
     pub(super) fn alloc(level: PagingLevel) -> Self {
         let meta = PageTablePageMeta::new(level);
-        FrameAllocOptions::new()
+        let node = FrameAllocOptions::new()
             .zeroed(true)
             .alloc_frame_with(meta)
-            .expect("Failed to allocate a page table node")
+            .expect("Failed to allocate a page table node");
+        page_table_pages_counter::<C>().add(1);
+        node
     }
 
     /// Activates the page table assuming it is a root page table.
@@ -256,6 +259,15 @@ impl<C: PageTableConfig> Drop for PageTableGuard<'_, C> {
     }
 }
 
+/// Returns the counter of the page table pages of the configuration `C`.
+fn page_table_pages_counter<C: PageTableConfig>() -> &'static PageCounter {
+    if C::IS_SECONDARY {
+        &SECONDARY_PAGE_TABLE_PAGES
+    } else {
+        &PAGE_TABLE_PAGES
+    }
+}
+
 /// The metadata of any kinds of page table pages.
 /// Make sure the the generic parameters don't effect the memory layout.
 #[derive(Debug)]
@@ -294,6 +306,8 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
 // be reasoned in conjunction with the `page_table/cursor` implementation.
 unsafe impl<C: PageTableConfig> AnyFrameMeta for PageTablePageMeta<C> {
     fn on_drop(&mut self, reader: &mut VmReader<Infallible>) {
+        page_table_pages_counter::<C>().sub(1);
+
         let nr_children = self.nr_children.get_mut();
         if *nr_children == 0 {
             return;

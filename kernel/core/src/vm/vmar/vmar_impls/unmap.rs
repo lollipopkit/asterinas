@@ -21,7 +21,7 @@ impl Vmar {
                 rmap.remove(self.weak_self.clone(), vm_mapping.map_to_addr());
             }
         }
-        inner.vm_mappings.clear();
+        inner.clear();
 
         // Keep `inner` locked to avoid race conditions.
         let preempt_guard = disable_preempt();

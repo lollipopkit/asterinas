@@ -24,12 +24,15 @@ use super::{
     interval_set::{Interval, IntervalSet},
     is_userspace_vaddr, is_userspace_vaddr_range,
     util::{self, get_intersected_range},
-    vm_mapping::{MappedMemory, MappedVmo, VmMapping},
+    vm_mapping::{KeptPage, MappedMemory, MappedVmo, VmMapping},
 };
 use crate::{
     prelude::*,
     process::{INIT_STACK_SIZE, Process, ProcessVm, ResourceType},
-    vm::page_cache::Vmo,
+    vm::{
+        page_cache::{PageKind, Vmo},
+        stat::{MemStat, mod_mem_stat},
+    },
 };
 
 /// The upper bound for allocations under the `MAP_32BIT` mmap flag.
@@ -134,9 +137,23 @@ impl Vmar {
 pub(crate) enum RssType {
     File = 0,
     Anon = 1,
+    Shmem = 2,
 }
 
-const NUM_RSS_COUNTERS: usize = 2;
+const NUM_RSS_COUNTERS: usize = 3;
+
+impl From<PageKind> for RssType {
+    /// Returns the RSS type of the pages of the kind.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/mm.h#L3378-L3390>
+    fn from(kind: PageKind) -> Self {
+        match kind {
+            PageKind::Anon => Self::Anon,
+            PageKind::Shmem | PageKind::ShmemReserved => Self::Shmem,
+            PageKind::Kernel | PageKind::File | PageKind::Buffer | PageKind::Ramfs => Self::File,
+        }
+    }
+}
 
 pub(super) struct RssDelta<'a> {
     delta: [isize; NUM_RSS_COUNTERS],
@@ -170,6 +187,22 @@ impl Drop for RssDelta<'_> {
     }
 }
 
+/// Mappings taken out of a [`Vmar`] with their pages that cannot be faulted in
+/// again.
+///
+/// The mappings are dropped with the pages if they are not restored.
+#[derive(Default)]
+#[must_use]
+struct TakenMappings(Vec<TakenMapping>);
+
+struct TakenMapping {
+    vm_mapping: VmMapping,
+    kept_pages: Vec<KeptPage>,
+    /// The number of pages subtracted from the RSS that the kept pages
+    /// restore.
+    num_restorable: usize,
+}
+
 /// A holder for a reverse mapping entry that is to be removed.
 ///
 /// This holds the [`Vmo`] object, so the lock guard for reverse mappings can
@@ -200,6 +233,14 @@ struct VmarInner {
     vm_mappings: IntervalSet<Vaddr, VmMapping>,
     /// The total mapped memory in bytes.
     total_vm: usize,
+    /// The pages of the mappings that are charged to the committed memory.
+    committed_pages: usize,
+}
+
+impl Drop for VmarInner {
+    fn drop(&mut self) {
+        mod_mem_stat(MemStat::Committed, -(self.committed_pages as isize));
+    }
 }
 
 impl VmarInner {
@@ -207,7 +248,34 @@ impl VmarInner {
         Self {
             vm_mappings: IntervalSet::new(),
             total_vm: 0,
+            committed_pages: 0,
         }
+    }
+
+    /// Accounts the mapping that is added to the VMAR.
+    fn account_mapping(&mut self, vm_mapping: &VmMapping) {
+        self.total_vm += vm_mapping.map_size();
+
+        let nr_pages = vm_mapping.nr_committed_pages();
+        self.committed_pages += nr_pages;
+        mod_mem_stat(MemStat::Committed, nr_pages as isize);
+    }
+
+    /// Unaccounts the mapping that is removed from the VMAR.
+    fn unaccount_mapping(&mut self, vm_mapping: &VmMapping) {
+        self.total_vm -= vm_mapping.map_size();
+
+        let nr_pages = vm_mapping.nr_committed_pages();
+        self.committed_pages -= nr_pages;
+        mod_mem_stat(MemStat::Committed, -(nr_pages as isize));
+    }
+
+    /// Removes all mappings without unmapping them from the page table.
+    fn clear(&mut self) {
+        self.vm_mappings.clear();
+        self.total_vm = 0;
+        mod_mem_stat(MemStat::Committed, -(self.committed_pages as isize));
+        self.committed_pages = 0;
     }
 
     /// Returns `Ok` if the calling process may expand its mapped
@@ -257,7 +325,7 @@ impl VmarInner {
         vm_mapping: VmMapping,
         rmap: Option<&mut Rmap>,
     ) {
-        self.total_vm += vm_mapping.map_size();
+        self.account_mapping(&vm_mapping);
 
         if let Some(rmap) = rmap {
             rmap.insert(
@@ -285,7 +353,7 @@ impl VmarInner {
         vm_mapping: VmMapping,
         mut rmap: Option<&mut Rmap>,
     ) {
-        self.total_vm += vm_mapping.map_size();
+        self.account_mapping(&vm_mapping);
         let mut vm_mapping = vm_mapping;
         let addr = vm_mapping.map_to_addr();
 
@@ -327,7 +395,7 @@ impl VmarInner {
     /// Removes a `VmMapping` based on the provided key from the `Vmar`.
     fn remove(&mut self, key: &Vaddr) -> Option<(VmMapping, RmapToRemove)> {
         let vm_mapping = self.vm_mappings.remove(key)?;
-        self.total_vm -= vm_mapping.map_size();
+        self.unaccount_mapping(&vm_mapping);
 
         let rmap_to_remove = RmapToRemove::new(vm_mapping.vmo_for_rmap().cloned());
 
@@ -389,29 +457,105 @@ impl VmarInner {
         }
 
         for vm_mapping_addr in mappings_to_remove {
-            let (vm_mapping, mut rmap_to_remove) = self.remove(&vm_mapping_addr).unwrap();
-            let mut rmap = rmap_to_remove.remove(vmar, vm_mapping_addr);
-
-            let vm_mapping_range = vm_mapping.range();
-            let intersected_range = get_intersected_range(&range, &vm_mapping_range);
-
-            let (left, taken, right) = vm_mapping.split_range(&intersected_range);
-            if let Some(left) = left {
-                self.insert_without_try_merge(vmar, left, rmap.as_deref_mut());
-            }
-            if let Some(right) = right {
-                self.insert_without_try_merge(vmar, right, rmap.as_deref_mut());
-            }
-
-            // Note that `rmap` must be dropped before `taken`. Otherwise,
-            // there is a possibility of a deadlock because a device mapping
-            // may attempt to access its reverse mappings in `Drop`.
-            drop(rmap);
-
+            let taken = self.take_mapping_part(vmar, vm_mapping_addr, &range);
             rss_delta.add(taken.rss_type(), -(taken.unmap(&vmar.vm_space) as isize));
         }
 
         range
+    }
+
+    /// Takes the mappings that intersect with the range out of the `Vmar`, so
+    /// that they can be restored by [`Self::restore_taken_mappings`].
+    ///
+    /// The taken mappings are unmapped from the page table, but the pages
+    /// that cannot be faulted in again are kept.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/mm/vma.c#L2366-L2395>
+    fn take_mappings(
+        &mut self,
+        vmar: &Vmar,
+        range: &Range<Vaddr>,
+        rss_delta: &mut RssDelta,
+    ) -> TakenMappings {
+        let mappings_to_take: Vec<Vaddr> = self
+            .vm_mappings
+            .find(range)
+            .map(|vm_mapping| vm_mapping.map_to_addr())
+            .collect();
+
+        let mut taken_mappings = Vec::with_capacity(mappings_to_take.len());
+        for vm_mapping_addr in mappings_to_take {
+            let taken = self.take_mapping_part(vmar, vm_mapping_addr, range);
+            let (num_unmapped, kept_pages) = taken.unmap_keeping_pages(&vmar.vm_space);
+            rss_delta.add(taken.rss_type(), -(num_unmapped as isize));
+            // Only the kept pages are mapped again on restoration.
+            let num_restorable = if kept_pages.is_empty() {
+                0
+            } else {
+                num_unmapped
+            };
+            taken_mappings.push(TakenMapping {
+                vm_mapping: taken,
+                kept_pages,
+                num_restorable,
+            });
+        }
+
+        TakenMappings(taken_mappings)
+    }
+
+    /// Puts the mappings taken by [`Self::take_mappings`] back.
+    fn restore_taken_mappings(
+        &mut self,
+        vmar: &Vmar,
+        taken_mappings: TakenMappings,
+        rss_delta: &mut RssDelta,
+    ) {
+        for TakenMapping {
+            vm_mapping,
+            kept_pages,
+            num_restorable,
+        } in taken_mappings.0
+        {
+            vm_mapping.restore_pages(&vmar.vm_space, kept_pages);
+            rss_delta.add(vm_mapping.rss_type(), num_restorable as isize);
+
+            let vmo_for_rmap = vm_mapping.vmo_for_rmap().cloned();
+            let mut rmap = vmo_for_rmap.as_ref().map(|vmo| vmo.rmap().lock());
+            self.insert_try_merge(vmar, vm_mapping, rmap.as_deref_mut());
+        }
+    }
+
+    /// Removes the part of the mapping at `vm_mapping_addr` that intersects
+    /// with the range, and returns the removed part.
+    ///
+    /// The other parts are put back into the `Vmar`.
+    fn take_mapping_part(
+        &mut self,
+        vmar: &Vmar,
+        vm_mapping_addr: Vaddr,
+        range: &Range<Vaddr>,
+    ) -> VmMapping {
+        let (vm_mapping, mut rmap_to_remove) = self.remove(&vm_mapping_addr).unwrap();
+        let mut rmap = rmap_to_remove.remove(vmar, vm_mapping_addr);
+
+        let vm_mapping_range = vm_mapping.range();
+        let intersected_range = get_intersected_range(range, &vm_mapping_range);
+
+        let (left, taken, right) = vm_mapping.split_range(&intersected_range);
+        if let Some(left) = left {
+            self.insert_without_try_merge(vmar, left, rmap.as_deref_mut());
+        }
+        if let Some(right) = right {
+            self.insert_without_try_merge(vmar, right, rmap.as_deref_mut());
+        }
+
+        // Note that `rmap` must be dropped before `taken`. Otherwise,
+        // there is a possibility of a deadlock because a device mapping
+        // may attempt to access its reverse mappings in `Drop`.
+        drop(rmap);
+
+        taken
     }
 
     /// Allocates a free region for mapping, searching from high address to low address.

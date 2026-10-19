@@ -124,7 +124,7 @@ mod cache_page;
 mod tests;
 mod vmo;
 
-pub(crate) use cache_page::{CachePage, CachePageExt, CachePageMeta, LockedCachePage};
+pub(crate) use cache_page::{CachePage, CachePageExt, CachePageMeta, LockedCachePage, PageKind};
 pub use vmo::Vmo;
 pub(crate) use vmo::{VmoCommitError, VmoFlags, VmoMapMode, VmoOptions};
 
@@ -163,19 +163,40 @@ pub(crate) use vmo::{VmoCommitError, VmoFlags, VmoMapMode, VmoOptions};
 pub(crate) struct PageCache(Arc<Vmo>);
 
 impl PageCache {
-    /// Creates a page cache with a backend and the specified initial capacity
-    /// in bytes.
+    /// Creates a page cache of file data with a backend and the specified
+    /// initial capacity in bytes.
     pub(crate) fn new_with_backend(
         size: usize,
         backend: Weak<dyn PageCacheBackend>,
     ) -> Result<Self> {
-        Ok(Self(VmoOptions::new_page_cache(size, backend).alloc()?))
+        Ok(Self(
+            VmoOptions::new_page_cache(size, backend, PageKind::File).alloc()?,
+        ))
     }
 
-    /// Creates an anonymous page cache with the specified initial capacity in
-    /// bytes.
+    /// Creates a page cache of block device metadata with a backend and the
+    /// specified initial capacity in bytes.
+    ///
+    /// The cached pages are accounted as buffers, like Linux's buffer cache.
+    pub(crate) fn new_buffer_with_backend(
+        size: usize,
+        backend: Weak<dyn PageCacheBackend>,
+    ) -> Result<Self> {
+        Ok(Self(
+            VmoOptions::new_page_cache(size, backend, PageKind::Buffer).alloc()?,
+        ))
+    }
+
+    /// Creates an anonymous page cache of tmpfs or memfd files with the
+    /// specified initial capacity in bytes.
     pub(crate) fn new_anon(size: usize) -> Result<Self> {
-        Ok(Self(VmoOptions::new_anon(size).alloc()?))
+        Ok(Self(VmoOptions::new_anon(size, PageKind::Shmem).alloc()?))
+    }
+
+    /// Creates an anonymous page cache of ramfs files with the specified
+    /// initial capacity in bytes.
+    pub(crate) fn new_ramfs(size: usize) -> Result<Self> {
+        Ok(Self(VmoOptions::new_anon(size, PageKind::Ramfs).alloc()?))
     }
 
     /// Returns the wrapped [`Vmo`].

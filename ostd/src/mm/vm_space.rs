@@ -368,6 +368,10 @@ impl<'a> CursorMut<'a> {
     ///  - the current virtual address is already mapped;
     ///  - the current virtual address is outside the cursor's range.
     pub fn map(&mut self, frame: UFrame, prop: PageProperty) {
+        // The page table entry is paired with an unmap notification in
+        // `UserPtConfig::item_from_raw`, which is the only way for the entry
+        // to give the frame back.
+        frame.dyn_meta().on_map_to_user();
         let item = VmItem::new_tracked(frame, prop);
 
         // SAFETY: It is safe to map untyped memory into the userspace.
@@ -725,6 +729,9 @@ unsafe impl PageTableConfig for UserPtConfig {
             // `AVAIL1` is clear, this is tracked memory.
             // SAFETY: The caller ensures safety.
             let frame = unsafe { Frame::<dyn AnyUFrameMeta>::from_raw(paddr) };
+            // The page table gives the frame back, so the page table entry no
+            // longer maps the frame. See also `CursorMut::map`.
+            frame.dyn_meta().on_unmap_from_user();
             VmItem::new_tracked(frame, prop)
         }
     }

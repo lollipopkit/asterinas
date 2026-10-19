@@ -138,7 +138,7 @@ impl BlockGroup {
             block_device: block_device.clone(),
         });
         let inode_table_cache =
-            PageCache::new_with_backend(raw_inodes_size, Arc::downgrade(&backend) as _)?;
+            PageCache::new_buffer_with_backend(raw_inodes_size, Arc::downgrade(&backend) as _)?;
 
         Ok(Self {
             group_idx,

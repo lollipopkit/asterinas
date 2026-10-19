@@ -20,6 +20,7 @@ unsafe impl PageTableConfig for IommuPtConfig {
     /// From section 3.6 in "Intel(R) Virtualization Technology for Directed I/O",
     /// only low canonical addresses can be used.
     const TOP_LEVEL_INDEX_RANGE: Range<usize> = 0..256;
+    const IS_SECONDARY: bool = true;
 
     type E = PageTableEntry;
     type C = PagingConsts;

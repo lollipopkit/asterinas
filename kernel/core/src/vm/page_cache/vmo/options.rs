@@ -12,7 +12,8 @@ use super::{Vmo, VmoFlags, WritableMappingStatus};
 use crate::{
     prelude::*,
     vm::{
-        page_cache::{CachePage, CachePageMeta, PageCacheBackend},
+        page_cache::{CachePage, CachePageMeta, PageCacheBackend, PageKind, cache_page::PageState},
+        stat::{MemStat, mod_mem_stat},
         vmar::Rmap,
     },
 };
@@ -35,14 +36,15 @@ use crate::{
 /// ```
 /// use ostd::mm::PAGE_SIZE;
 ///
-/// use crate::vm::page_cache::VmoOptions;
+/// use crate::vm::page_cache::{PageKind, VmoOptions};
 ///
-/// let vmo = VmoOptions::new_anon(10 * PAGE_SIZE).alloc();
+/// let vmo = VmoOptions::new_anon(10 * PAGE_SIZE, PageKind::Shmem).alloc();
 /// assert!(vmo.is_ok());
 /// ```
 pub(crate) struct VmoOptions {
     size: usize,
     flags: VmoFlags,
+    kind: PageKind,
     backend: Option<Weak<dyn PageCacheBackend>>,
 }
 
@@ -59,18 +61,26 @@ impl VmoOptions {
         Self {
             size,
             flags: VmoFlags::empty(),
+            kind: PageKind::Kernel,
             backend: None,
         }
     }
 
     /// Creates options for an anonymous resizable VMO.
-    pub(crate) fn new_anon(size: usize) -> Self {
-        Self::new(size).flags(VmoFlags::RESIZABLE)
+    pub(crate) fn new_anon(size: usize, kind: PageKind) -> Self {
+        Self::new(size).flags(VmoFlags::RESIZABLE).kind(kind)
     }
 
     /// Creates options for a page-cache VMO with a backend.
-    pub(crate) fn new_page_cache(size: usize, backend: Weak<dyn PageCacheBackend>) -> Self {
-        Self::new(size).flags(VmoFlags::RESIZABLE).backend(backend)
+    pub(crate) fn new_page_cache(
+        size: usize,
+        backend: Weak<dyn PageCacheBackend>,
+        kind: PageKind,
+    ) -> Self {
+        Self::new(size)
+            .flags(VmoFlags::RESIZABLE)
+            .kind(kind)
+            .backend(backend)
     }
 
     /// Sets the VMO flags.
@@ -80,6 +90,15 @@ impl VmoOptions {
     /// For more information about the flags, see `VmoFlags`.
     pub(crate) fn flags(mut self, flags: VmoFlags) -> Self {
         self.flags = flags;
+        self
+    }
+
+    /// Sets the kind of the pages in the VMO.
+    ///
+    /// The default value is [`PageKind::Kernel`], whose pages are not
+    /// accounted as page cache or anonymous memory.
+    pub(crate) fn kind(mut self, kind: PageKind) -> Self {
+        self.kind = kind;
         self
     }
 
@@ -96,10 +115,10 @@ impl VmoOptions {
         let VmoOptions {
             size,
             flags,
+            kind,
             backend,
-            ..
         } = self;
-        let vmo = alloc_vmo(size, flags, backend)?;
+        let vmo = alloc_vmo(size, flags, kind, backend)?;
         Ok(Arc::new(vmo))
     }
 }
@@ -107,15 +126,25 @@ impl VmoOptions {
 fn alloc_vmo(
     size: usize,
     flags: VmoFlags,
+    kind: PageKind,
     backend: Option<Weak<dyn PageCacheBackend>>,
 ) -> Result<Vmo> {
     let size = size.align_up(PAGE_SIZE);
-    let pages = committed_pages_if_continuous(flags, size)?;
+    let pages = committed_pages_if_continuous(flags, kind, size)?;
+    if kind == PageKind::ShmemReserved {
+        // The whole size is charged, like Linux's `shmem_acct_size`. It is
+        // uncharged when the VMO is dropped.
+        //
+        // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/mm/shmem.c#L169-L185>
+        assert!(!flags.contains(VmoFlags::RESIZABLE));
+        mod_mem_stat(MemStat::Committed, (size / PAGE_SIZE) as isize);
+    }
     let writable_mapping_status = WritableMappingStatus::default();
     let rmap = Rmap::new();
     Ok(Vmo {
         backend,
         flags,
+        kind,
         pages,
         size: AtomicUsize::new(size),
         writable_mapping_status,
@@ -123,12 +152,16 @@ fn alloc_vmo(
     })
 }
 
-fn committed_pages_if_continuous(flags: VmoFlags, size: usize) -> Result<XArray<CachePage>> {
+fn committed_pages_if_continuous(
+    flags: VmoFlags,
+    kind: PageKind,
+    size: usize,
+) -> Result<XArray<CachePage>> {
     if flags.contains(VmoFlags::CONTIGUOUS) {
         // if the vmo is continuous, we need to allocate frames for the vmo
         let frames_num = size / PAGE_SIZE;
         let segment: Segment<CachePageMeta> = FrameAllocOptions::new()
-            .alloc_segment_with(frames_num, |_| CachePageMeta::default())?;
+            .alloc_segment_with(frames_num, |_| CachePageMeta::new(kind, PageState::Uninit))?;
         let committed_pages = XArray::new();
         let mut locked_pages = committed_pages.lock();
         let mut cursor = locked_pages.cursor_mut(0);

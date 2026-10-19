@@ -20,6 +20,7 @@ pub(crate) mod kspace;
 pub(crate) mod mem_obj;
 pub(crate) mod page_prop;
 pub(crate) mod page_table;
+pub mod stat;
 pub mod tlb;
 pub mod vm_space;
 
@@ -34,7 +35,7 @@ pub use self::{
         allocator::FrameAllocOptions,
         segment::{Segment, USegment},
         unique::UniqueFrame,
-        untyped::{AnyUFrameMeta, UFrame},
+        untyped::{AnyUFrameMeta, UFrame, UserMappingObserver},
     },
     io::{
         Fallible, FallibleVmRead, FallibleVmWrite, Infallible, PodAtomic, PodOnce, VmIo, VmIoFill,
