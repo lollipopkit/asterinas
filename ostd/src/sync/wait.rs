@@ -263,7 +263,7 @@ impl Waker {
         if self.has_woken.swap(true, Ordering::Release) {
             return false;
         }
-        scheduler::unpark_target(self.task.clone());
+        scheduler::unpark_target(&self.task);
 
         true
     }
