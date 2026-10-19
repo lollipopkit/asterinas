@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "../../common/test.h"
@@ -50,9 +51,31 @@ static long field_kb(const char *path, const char *name)
 	return value;
 }
 
+// Linux's per-process RSS counters are per-CPU counters, which are read
+// approximately.
+//
+// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/lib/percpu_counter.c#L255-L264>
+static long rss_tolerance_kb(void)
+{
+#ifdef __asterinas__
+	return 64;
+#else
+	long batch = CHECK(sysconf(_SC_NPROCESSORS_ONLN)) * 2;
+	if (batch < 32)
+		batch = 32;
+	// Anonymous and file pages are counted in separate counters.
+	return batch * 2 * PAGE_KB;
+#endif
+}
+
 static long meminfo_kb(const char *name)
 {
 	return field_kb("/proc/meminfo", name);
+}
+
+static long status_kb(const char *name)
+{
+	return field_kb("/proc/self/status", name);
 }
 
 #define NR_THREADS 64
@@ -121,5 +144,83 @@ FN_TEST(thread_memory)
 	TEST_SUCC(close(block_pipe[1]));
 	TEST_SUCC(close(ready_pipe[0]));
 	TEST_SUCC(close(ready_pipe[1]));
+}
+END_TEST()
+
+// 6 MiB of the 8 MiB stack of the main thread.
+#define NR_STACK_PAGES 1536
+#define STACK_KB (NR_STACK_PAGES * PAGE_KB)
+
+__attribute__((noinline)) static int touch_stack(void)
+{
+	volatile char buf[NR_STACK_PAGES * PAGE_SIZE];
+
+	// Touch the pages downwards, as the stack grows.
+	for (long i = NR_STACK_PAGES - 1; i >= 0; --i)
+		buf[i * PAGE_SIZE] = 1;
+
+	return buf[0];
+}
+
+FN_TEST(init_stack_pages)
+{
+	// Fault in the pages used to read the counters.
+	status_kb("RssAnon");
+	meminfo_kb("MemFree");
+	long rss_anon = status_kb("RssAnon");
+	long anon_pages = meminfo_kb("AnonPages");
+	long mem_free = meminfo_kb("MemFree");
+
+	TEST_RES(touch_stack(), _ret == 1);
+
+	long rss_anon_delta = status_kb("RssAnon") - rss_anon;
+	long anon_pages_delta = meminfo_kb("AnonPages") - anon_pages;
+	long mem_free_delta = mem_free - meminfo_kb("MemFree");
+	fprintf(stderr,
+		"%d stack pages: RssAnon +%ld kB, AnonPages +%ld kB, MemFree -%ld kB\n",
+		NR_STACK_PAGES, rss_anon_delta, anon_pages_delta,
+		mem_free_delta);
+
+	// Each touched stack page is a single anonymous page.
+	TEST_RES(rss_anon_delta, labs(_ret - STACK_KB) <= rss_tolerance_kb());
+	TEST_RES(anon_pages_delta, labs(_ret - STACK_KB) <= TOLERANCE_KB);
+	TEST_RES(mem_free_delta, _ret <= STACK_KB + TOLERANCE_KB);
+}
+END_TEST()
+
+// Returns the start address of the `[stack]` mapping.
+static unsigned long stack_start(void)
+{
+	FILE *file = fopen("/proc/self/maps", "r");
+	if (file == NULL) {
+		perror("fopen");
+		exit(EXIT_FAILURE);
+	}
+
+	char line[512];
+	unsigned long start = 0;
+	while (fgets(line, sizeof(line), file) != NULL) {
+		if (strstr(line, "[stack]") != NULL) {
+			start = strtoul(line, NULL, 16);
+			break;
+		}
+	}
+	fclose(file);
+
+	return start;
+}
+
+FN_TEST(stack_not_merged)
+{
+	unsigned long start = TEST_RES(stack_start(), _ret != 0);
+
+	// Like Linux, an adjacent anonymous mapping with the same permissions is
+	// not merged into the stack.
+	char *below = (char *)start - PAGE_SIZE;
+	TEST_RES(mmap(below, PAGE_SIZE, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0),
+		 _ret == below);
+	TEST_RES(stack_start(), _ret == start);
+	TEST_SUCC(munmap(below, PAGE_SIZE));
 }
 END_TEST()

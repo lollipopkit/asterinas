@@ -148,7 +148,6 @@ impl From<PageKind> for RssType {
     /// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/include/linux/mm.h#L3378-L3390>
     fn from(kind: PageKind) -> Self {
         match kind {
-            PageKind::Anon => Self::Anon,
             PageKind::Shmem | PageKind::ShmemReserved => Self::Shmem,
             PageKind::Kernel | PageKind::File | PageKind::Buffer | PageKind::Ramfs => Self::File,
         }
