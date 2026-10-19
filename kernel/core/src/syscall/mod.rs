@@ -330,18 +330,42 @@ macro_rules! impl_syscall_nums_and_dispatch_fn {
             pub(crate) const $name: u64 = $num;
         )*
 
+        /// Returns the name of the syscall, e.g., `SYS_READ`.
+        pub(crate) fn syscall_name(syscall_number: u64) -> Option<&'static str> {
+            match syscall_number {
+                $(
+                    $name => Some(stringify!($name)),
+                )*
+                _ => None,
+            }
+        }
+
         // Then, define the dispatcher function
+        //
+        // Each handler is called through its own wrapper that is never inlined, so the stack
+        // frame of the dispatcher stays small. Otherwise, the locals of all the arms add up to
+        // tens of KiB of kernel stack for every syscall in debug builds, and the inlined
+        // handlers share the largest frame among them in release builds.
         pub(crate) fn syscall_dispatch(
             syscall_number: u64,
             args: [u64; 6],
             ctx: &crate::context::Context,
             user_ctx: &mut ostd::arch::cpu::context::UserContext,
         ) -> $crate::prelude::Result<$crate::syscall::SyscallReturn> {
+            $crate::syscall::log_syscall_entry(syscall_number);
+
             match syscall_number {
                 $(
-                    $num => {
-                        $crate::syscall::log_syscall_entry!($name);
-                        $crate::syscall::dispatch_fn_inner!(args, ctx, user_ctx, $handler $args)
+                    $name => {
+                        #[inline(never)]
+                        fn handler(
+                            _args: &[u64; 6],
+                            ctx: &crate::context::Context,
+                            _user_ctx: &mut ostd::arch::cpu::context::UserContext,
+                        ) -> $crate::prelude::Result<$crate::syscall::SyscallReturn> {
+                            $crate::syscall::dispatch_fn_inner!(_args, ctx, _user_ctx, $handler $args)
+                        }
+                        handler(&args, ctx, user_ctx)
                     }
                 )*
                 _ => {
@@ -409,27 +433,26 @@ pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
     }
 }
 
-macro_rules! log_syscall_entry {
-    ($syscall_name: tt) => {
-        if ostd::log_enabled!(ostd::log::Level::Info) {
-            let syscall_name_str = stringify!($syscall_name);
-            let pid = $crate::current!().pid();
-            let tid = {
-                use $crate::process::posix_thread::AsPosixThread;
-                $crate::context::current_thread!()
-                    .as_posix_thread()
-                    .unwrap()
-                    .tid()
-            };
-            ostd::info!(
-                "[pid={}][tid={}][id={}][{}]",
-                pid,
-                tid,
-                $syscall_name,
-                syscall_name_str
-            );
-        }
-    };
-}
+fn log_syscall_entry(syscall_number: u64) {
+    use crate::process::posix_thread::AsPosixThread;
 
-use log_syscall_entry;
+    if !ostd::log_enabled!(ostd::log::Level::Info) {
+        return;
+    }
+
+    let Some(syscall_name) = arch::syscall_name(syscall_number) else {
+        return;
+    };
+    let pid = crate::current!().pid();
+    let tid = crate::context::current_thread!()
+        .as_posix_thread()
+        .unwrap()
+        .tid();
+    ostd::info!(
+        "[pid={}][tid={}][id={}][{}]",
+        pid,
+        tid,
+        syscall_number,
+        syscall_name
+    );
+}

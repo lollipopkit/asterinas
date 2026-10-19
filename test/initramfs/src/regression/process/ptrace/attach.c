@@ -321,7 +321,8 @@ FN_TEST(attach_non_main_thread)
 	TEST_RES(waitpid(tid, &status, 0), _ret == tid && WIFSTOPPED(status) &&
 						   WSTOPSIG(status) == SIGSTOP);
 	TEST_ERRNO(ptrace(PTRACE_CONT, pid, 0, 0), ESRCH);
-	TEST_RES(read_state(pid), _ret == 'S');
+	// The main thread may not have reached `pause()` yet.
+	TEST_SUCC(wait_for_state(pid, 'S'));
 
 	TEST_SUCC(ptrace(PTRACE_DETACH, tid, 0, 0));
 	TEST_RES(read_status_field(tid, "TracerPid"), _ret == 0);

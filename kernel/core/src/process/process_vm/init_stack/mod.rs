@@ -22,7 +22,6 @@ use crate::{
     prelude::*,
     util::random::getrandom,
     vm::{
-        page_cache::{PageKind, Vmo, VmoOptions},
         perms::VmPerms,
         vmar::{VMAR_CAP_ADDR, Vmar, VmarMapOffset},
     },
@@ -180,27 +179,27 @@ impl InitStack {
     ) -> Result<()> {
         self.set_uninitialized();
 
-        let vmo = {
-            let vmo_options = VmoOptions::new(self.max_size).kind(PageKind::Anon);
-            vmo_options.alloc()?
-        };
-        let vmar_map_options = {
-            let perms = VmPerms::READ | VmPerms::WRITE;
-            let map_addr = self.initial_top - self.max_size;
-            debug_assert!(map_addr.is_multiple_of(PAGE_SIZE));
-            vmar.new_map(self.max_size, perms)
-                .offset(VmarMapOffset::FixedNoReplace(map_addr))
-                .vmo(vmo.clone())
-        };
-        vmar_map_options.build()?;
+        // Like Linux, the stack is a private anonymous mapping, and the initial contents are
+        // written through it as the new process would, so each touched page is a single
+        // anonymous page.
+        //
+        // Reference:
+        // <https://elixir.bootlin.com/linux/v7.2.10/source/mm/vma_exec.c#L108-L118>
+        // <https://elixir.bootlin.com/linux/v7.2.10/source/fs/exec.c#L145-L175>
+        let map_addr = self.initial_top - self.max_size;
+        debug_assert!(map_addr.is_multiple_of(PAGE_SIZE));
+        vmar.new_map(self.max_size, VmPerms::READ | VmPerms::WRITE)
+            .offset(VmarMapOffset::FixedNoReplace(map_addr))
+            .stack()
+            .build()?;
 
         let writer = InitStackWriter {
             pos: &self.pos,
-            vmo,
+            vmar,
             argv,
             envp,
             auxvec,
-            map_addr: self.initial_top - self.max_size,
+            map_addr,
         };
         let (auxv_range, argv_range, envp_range) = writer.write()?;
 
@@ -241,7 +240,7 @@ impl InitStack {
 /// A writer to initialize the content of an `InitStack`.
 struct InitStackWriter<'a> {
     pos: &'a AtomicUsize,
-    vmo: Arc<Vmo>,
+    vmar: &'a Vmar,
     argv: Vec<CString>,
     envp: Vec<CString>,
     auxvec: AuxVec,
@@ -377,9 +376,7 @@ impl InitStackWriter<'_> {
     /// Returns the writing address.
     fn write_u64(&self, val: u64) -> Result<u64> {
         let new_pos = self.reserve_pos(size_of::<u64>(), align_of::<u64>())?;
-        let bytes = val.to_ne_bytes();
-        let mut reader = VmReader::from(bytes.as_slice()).to_fallible();
-        self.vmo.write(new_pos - self.map_addr, &mut reader)?;
+        self.write_at(new_pos, &val.to_ne_bytes())?;
         Ok(new_pos as u64)
     }
 
@@ -394,9 +391,16 @@ impl InitStackWriter<'_> {
     /// Returns the writing address.
     fn write_bytes(&self, bytes: &[u8]) -> Result<u64> {
         let new_pos = self.reserve_pos(bytes.len(), align_of::<u8>())?;
-        let mut reader = VmReader::from(bytes).to_fallible();
-        self.vmo.write(new_pos - self.map_addr, &mut reader)?;
+        self.write_at(new_pos, bytes)?;
         Ok(new_pos as u64)
+    }
+
+    fn write_at(&self, addr: Vaddr, bytes: &[u8]) -> Result<()> {
+        let mut reader = VmReader::from(bytes).to_fallible();
+        self.vmar
+            .write_alien(addr, &mut reader)
+            .map_err(|(err, _)| err)?;
+        Ok(())
     }
 
     fn reserve_pos(&self, size: usize, align: usize) -> Result<Vaddr> {

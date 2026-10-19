@@ -70,6 +70,8 @@ pub(crate) struct VmarMapOptions<'a, 'b> {
     handle_page_faults_around: bool,
     /// Whether the mapping is created with `MAP_NORESERVE`.
     is_noreserve: bool,
+    /// Whether the mapping is the stack of the main thread.
+    is_stack: bool,
 }
 
 /// An offset within a VMAR where a new mapping will reside.
@@ -120,6 +122,7 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             map_mode: MmapMode::Private,
             handle_page_faults_around: false,
             is_noreserve: false,
+            is_stack: false,
         }
     }
 
@@ -219,6 +222,14 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
         self
     }
 
+    /// Sets the mapping as the stack of the main thread.
+    ///
+    /// Like Linux's `VM_STACK`, the stack is never merged with other mappings.
+    pub(crate) fn stack(mut self) -> Self {
+        self.is_stack = true;
+        self
+    }
+
     /// Sets the mapping to handle surrounding pages when handling page fault.
     pub(crate) fn handle_page_faults_around(mut self) -> Self {
         self.handle_page_faults_around = true;
@@ -277,6 +288,7 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             map_mode,
             handle_page_faults_around,
             is_noreserve,
+            is_stack,
         } = self;
 
         let mut inner = parent.inner.write();
@@ -398,7 +410,8 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             handle_page_faults_around,
             perms | may_perms,
         )
-        .with_noreserve(is_noreserve);
+        .with_noreserve(is_noreserve)
+        .with_stack(is_stack);
 
         let vmo_for_rmap = vm_mapping.vmo_for_rmap().cloned();
         let mut rmap = vmo_for_rmap.as_ref().map(|vmo| vmo.rmap().lock());

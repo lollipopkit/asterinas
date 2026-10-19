@@ -103,6 +103,10 @@ pub fn poweroff(code: ExitCode) -> ! {
     #[cfg(feature = "coverage")]
     crate::coverage::on_system_exit();
 
+    // Long-living tasks (e.g., the ktest runner) are never freed, so record their stacks here.
+    #[cfg(feature = "kstack_watermark")]
+    crate::task::Task::record_current_kernel_stack();
+
     if let Some(handler) = POWEROFF_HANDLER.get() {
         (handler)(code);
     } else {

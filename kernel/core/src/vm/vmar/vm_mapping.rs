@@ -94,6 +94,9 @@ pub(crate) struct VmMapping {
     /// Whether the size of the mapping is charged to the committed memory,
     /// i.e., Linux's `VM_ACCOUNT`.
     is_accounted: bool,
+    /// Whether the mapping is the stack of the main thread, i.e., Linux's
+    /// `VM_STACK`.
+    is_stack: bool,
 }
 
 impl Debug for VmMapping {
@@ -108,6 +111,7 @@ impl Debug for VmMapping {
             .field("perms", &self.perms)
             .field("is_noreserve", &self.is_noreserve)
             .field("is_accounted", &self.is_accounted)
+            .field("is_stack", &self.is_stack)
             .finish()
     }
 }
@@ -140,7 +144,13 @@ impl VmMapping {
             perms,
             is_noreserve: false,
             is_accounted: Self::is_accountable(map_mode, perms, false),
+            is_stack: false,
         }
+    }
+
+    /// Sets whether the new mapping is the stack of the main thread.
+    pub(super) fn with_stack(self, is_stack: bool) -> Self {
+        Self { is_stack, ..self }
     }
 
     /// Sets whether the new mapping is created with `MAP_NORESERVE`.
@@ -1207,6 +1217,7 @@ fn try_merge(left: &VmMapping, right: &VmMapping) -> Option<VmMapping> {
         && left.perms == right.perms
         && left.is_noreserve == right.is_noreserve
         && left.is_accounted == right.is_accounted
+        && left.is_stack == right.is_stack
         && match (&left.file, &right.file) {
             (Some(left_file), Some(right_file)) => Arc::ptr_eq(left_file, right_file),
             (None, None) => true,

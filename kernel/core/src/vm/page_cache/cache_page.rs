@@ -92,8 +92,6 @@ pub(crate) enum PageKind {
     ShmemReserved,
     /// Memory of ramfs files, which can never be reclaimed.
     Ramfs,
-    /// Anonymous memory of private mappings (e.g., the initial stack).
-    Anon,
 }
 
 impl PageKind {
@@ -111,7 +109,7 @@ impl PageKind {
             Self::Shmem => Some(MemStat::Shmem),
             Self::ShmemReserved => Some(MemStat::ShmemReserved),
             Self::Ramfs => Some(MemStat::Ramfs),
-            Self::Kernel | Self::Anon => None,
+            Self::Kernel => None,
         }
     }
 
@@ -136,7 +134,6 @@ impl PageKind {
             Self::File | Self::Buffer | Self::Shmem | Self::ShmemReserved | Self::Ramfs => {
                 Some(MemStat::FileMapped)
             }
-            Self::Anon => Some(MemStat::AnonMapped),
             Self::Kernel => None,
         }
     }

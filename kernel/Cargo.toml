@@ -22,6 +22,7 @@ aster-i8042.workspace = true
 default = ["cvm_guest"]
 coverage = ["aster-core/coverage"]
 cvm_guest = ["aster-core/cvm_guest"]
+kstack_watermark = ["aster-core/kstack_watermark"]
 pvh_boot = ["aster-core/pvh_boot"]
 riscv_sv39_mode = ["aster-core/riscv_sv39_mode"]
 

@@ -2,12 +2,14 @@
 
 //! Configure the Global Descriptor Table (GDT).
 
+use alloc::boxed::Box;
 use core::{
     cell::UnsafeCell,
     mem::offset_of,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use spin::Once;
 use x86_64::{
     PrivilegeLevel, VirtAddr,
     instructions::tables::{lgdt, load_tss},
@@ -20,14 +22,20 @@ use x86_64::{
 };
 
 use crate::{
+    arch::{cpu::local::get_base, mm::tlb_flush_addr_range},
     const_assert,
     cpu::{
-        CpuId,
+        CpuId, all_cpus,
         local::{CpuLocal, StaticCpuLocal},
     },
-    cpu_local,
+    cpu_local, impl_frame_meta_for,
     irq::DisabledLocalIrqGuard,
-    mm::Vaddr,
+    mm::{
+        FrameAllocOptions, PAGE_SIZE, Vaddr,
+        kspace::{kvirt_area::KVirtArea, paddr_to_vaddr},
+        page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
+    },
+    util::id_set::Id,
 };
 
 /// Initializes and loads the GDT and TSS.
@@ -45,6 +53,17 @@ pub(super) unsafe fn init_on_cpu() {
     let gdt = GDT.get_on_cpu(CpuId::current_racy());
 
     let tss_ptr = UnsafeCell::raw_get(LOCAL_TSS.as_ptr());
+
+    let df_stack_top = DOUBLE_FAULT_STACKS.get().unwrap()[CpuId::current_racy().as_usize()]
+        .range()
+        .end
+        - DOUBLE_FAULT_STACK_RESERVED;
+    // SAFETY: The TSS is CPU-local and no other code accesses the IST at this point, since the
+    // caller guarantees that no preemption can occur and no traps can occur yet.
+    unsafe {
+        (*tss_ptr).interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            VirtAddr::new(df_stack_top as u64);
+    }
 
     // FIXME: The segment limit in the descriptor created by `tss_segment_unchecked` does not
     // include the I/O port bitmap.
@@ -78,6 +97,79 @@ pub(super) unsafe fn init_on_cpu() {
     //
     // SAFETY: The selector points to the TSS descriptors in the GDT.
     unsafe { load_tss(TSS_SEL) };
+}
+
+/// The IST index of the double fault handler, i.e., Linux's `IST_INDEX_DF`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/include/asm/page_64_types.h#L27>
+pub(super) const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+
+/// The size of the double fault stack of each CPU.
+///
+/// A kernel stack overflow faults on the guard pages and escalates to a double fault, which
+/// needs a separate stack to report the overflow. Linux uses 8 KiB (`EXCEPTION_STKSZ`) for it.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/include/asm/page_64_types.h#L18-L19>
+const DOUBLE_FAULT_STACK_SIZE: usize = 4 * PAGE_SIZE;
+
+/// The bytes reserved at the top of each double fault stack, above the IST pointer.
+///
+/// The lowest word holds the CPU-local base (i.e., the kernel GS base) of the CPU, which
+/// `trap.S` loads on double faults. The size keeps the IST pointer 16-byte aligned.
+const DOUBLE_FAULT_STACK_RESERVED: usize = 16;
+
+/// The double fault stacks of all CPUs, indexed by the CPU ID.
+static DOUBLE_FAULT_STACKS: Once<Box<[KVirtArea]>> = Once::new();
+
+#[derive(Debug)]
+struct DoubleFaultStackMeta;
+
+impl_frame_meta_for!(DoubleFaultStackMeta);
+
+/// Allocates the double fault stacks of all CPUs.
+///
+/// Each stack has a guard page below it, like Linux's exception stacks in the CPU entry area.
+/// This must be called on the BSP after the kernel page table is activated and before any
+/// call to [`init_on_cpu`].
+pub(in crate::arch) fn alloc_double_fault_stacks() {
+    DOUBLE_FAULT_STACKS.call_once(|| {
+        let prop = PageProperty {
+            flags: PageFlags::RW,
+            cache: CachePolicy::Writeback,
+            priv_flags: PrivilegedPageFlags::empty(),
+        };
+        all_cpus()
+            .map(|cpu| {
+                let pages = FrameAllocOptions::new()
+                    .zeroed(false)
+                    .alloc_segment_with(DOUBLE_FAULT_STACK_SIZE / PAGE_SIZE, |_| {
+                        DoubleFaultStackMeta
+                    })
+                    .expect("failed to allocate the double fault stack");
+                let area = KVirtArea::map_frames(
+                    DOUBLE_FAULT_STACK_SIZE + PAGE_SIZE,
+                    PAGE_SIZE,
+                    pages.into_iter(),
+                    prop,
+                );
+                // Other CPUs have not activated the kernel page table yet, so only the TLB of
+                // the current CPU may have stale entries of the area.
+                tlb_flush_addr_range(&area.range());
+
+                let gs_base = if cpu.as_usize() == 0 {
+                    get_base() as usize
+                } else {
+                    paddr_to_vaddr(crate::cpu::local::get_ap(cpu))
+                };
+                let slot = (area.range().end - DOUBLE_FAULT_STACK_RESERVED) as *mut usize;
+                // SAFETY: The slot is in the newly mapped stack, which is exclusively owned here
+                // and coherent in the TLB of the current CPU.
+                unsafe { slot.write(gs_base) };
+
+                area
+            })
+            .collect()
+    });
 }
 
 /// Returns the current CPU's GDT base address.

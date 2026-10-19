@@ -2,5 +2,6 @@
 
 SUBDIRS := \
 	mmap \
+	stack \
 
 include ../common/Makefile

@@ -187,6 +187,7 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
             crate::mm::fault::handle_user_page_fault(f, &page_fault, raw_page_fault_info.addr);
             disable_local_if(was_irq_enabled);
         }
+        Some(CpuException::DoubleFault) => handle_double_fault(f),
         Some(exception) => {
             enable_local_if(was_irq_enabled);
             panic!(
@@ -202,6 +203,41 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
             );
         }
     }
+}
+
+/// Reports a double fault and halts the system.
+///
+/// Like Linux, a double fault with CR2 on a kernel stack guard page is reported as a kernel
+/// stack overflow. The handler runs on its own IST stack with IRQs disabled. It prints the report
+/// directly and aborts without unwinding, since the interrupted context cannot be resumed and
+/// the overflow may have happened with arbitrary locks (e.g., the heap lock) held.
+///
+/// Reference:
+/// <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/traps.c#L547-L560>
+/// <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/kernel/traps.c#L707-L708>
+fn handle_double_fault(f: &TrapFrame) -> ! {
+    let fault_addr = x86_64::registers::control::Cr2::read_raw() as usize;
+
+    if let Some((stack, guard)) = crate::task::Task::current_kernel_stack_ranges()
+        && guard.contains(&fault_addr)
+    {
+        crate::early_println!(
+            "BUG: kernel stack guard page was hit at {:#x} (stack is {:#x}..{:#x}); \
+            trapframe: {:#x?}",
+            fault_addr,
+            stack.start,
+            stack.end,
+            f
+        );
+    } else {
+        crate::early_println!(
+            "PANIC: double fault, CR2 {:#x}; trapframe: {:#x?}",
+            fault_addr,
+            f
+        );
+    }
+
+    crate::panic::abort();
 }
 
 /// User-space code segment selector value.
