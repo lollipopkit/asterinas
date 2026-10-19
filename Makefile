@@ -16,7 +16,6 @@ RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
 SCHEME ?= ""
 SMP ?= 1
-OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
 FEATURES ?=
 NO_DEFAULT_FEATURES ?= 0
 COVERAGE ?= 0
@@ -167,19 +166,13 @@ export VSOCK=on
 CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_vsock_test.sh"
 endif
 
+# The kernel stack size defaults to `DEFAULT_STACK_SIZE_IN_PAGES` in
+# `ostd/src/task/kernel_stack.rs`, which depends on the profile and the
+# architecture. Set `OSTD_TASK_STACK_SIZE_IN_PAGES` to override it.
 ifeq ($(RELEASE_LTO), 1)
 CARGO_OSDK_COMMON_ARGS += --profile release-lto
-OSTD_TASK_STACK_SIZE_IN_PAGES = 8
 else ifeq ($(RELEASE), 1)
 CARGO_OSDK_COMMON_ARGS += --release
-	ifeq ($(TARGET_ARCH), riscv64)
-	# FIXME: Unwinding in RISC-V seems to cost more stack space, so we increase
-	# the stack size for it. This may need further investigation.
-	# See https://github.com/asterinas/asterinas/pull/2383#discussion_r2307673156
-	OSTD_TASK_STACK_SIZE_IN_PAGES = 16
-	else
-	OSTD_TASK_STACK_SIZE_IN_PAGES = 8
-	endif
 endif
 
 # If the BENCHMARK is set, we will run the benchmark in the kernel mode.

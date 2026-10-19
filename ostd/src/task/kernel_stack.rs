@@ -21,10 +21,8 @@ mod watermark;
 
 /// The kernel stack size of a task, specified in pages.
 ///
-/// By default, we choose a rather large stack size.
-/// OSTD users can choose a smaller size by specifying
-/// the `OSTD_TASK_STACK_SIZE_IN_PAGES` environment variable
-/// at build time.
+/// OSTD users can choose another size by specifying the `OSTD_TASK_STACK_SIZE_IN_PAGES`
+/// environment variable at build time.
 const STACK_SIZE_IN_PAGES: u32 =
     if let Some(size_str) = option_env!("OSTD_TASK_STACK_SIZE_IN_PAGES") {
         match u32::from_str_radix(size_str, 10) {
@@ -39,7 +37,26 @@ const STACK_SIZE_IN_PAGES: u32 =
     };
 
 /// The default kernel stack size of a task, specified in pages.
-const DEFAULT_STACK_SIZE_IN_PAGES: u32 = 128;
+///
+/// Linux uses 16 KiB on x86-64 (`THREAD_SIZE`), but runs IRQs on separate per-CPU stacks. Here
+/// IRQs and softirqs run on the kernel stack of the interrupted task, so the stack must cover
+/// them as well. The sizes keep at least twice the peak usage measured on x86-64 with the
+/// `kstack_watermark` feature over the regression tests, the ktests, a gVisor subset, and a
+/// workload that installs and builds software. The peaks are about 15 KiB in release builds
+/// and about 60 KiB in debug builds, whose frames are not optimized, both in the first kernel
+/// thread, which unpacks the initramfs.
+///
+/// The sizes of other architectures are not measured and remain as before. RISC-V uses larger
+/// stacks in release builds since unwinding seems to cost more stack there.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/arch/x86/include/asm/page_64_types.h#L15-L16>
+const DEFAULT_STACK_SIZE_IN_PAGES: u32 = if cfg!(debug_assertions) {
+    if cfg!(target_arch = "x86_64") { 32 } else { 64 }
+} else if cfg!(target_arch = "riscv64") {
+    16
+} else {
+    8
+};
 
 const KERNEL_STACK_SIZE: usize = STACK_SIZE_IN_PAGES as usize * PAGE_SIZE;
 

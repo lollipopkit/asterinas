@@ -16,3 +16,4 @@ set -e
 ./mmap/mmap_vmrss
 ./mmap/rev_map_ext2
 ./mmap/rev_map_tmpfs
+./stack/stack_memory
