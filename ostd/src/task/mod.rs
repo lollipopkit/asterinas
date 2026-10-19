@@ -31,6 +31,7 @@ use crate::{
     arch::task::TaskContext,
     irq::{DisabledLocalIrqGuard, InterruptLevel},
     prelude::*,
+    sync::{LocalIrqDisabled, SpinLock},
 };
 
 static PRE_SCHEDULE_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
@@ -69,6 +70,13 @@ pub struct Task {
     /// This is to enforce not context switching to an already running task.
     /// See [`processor::switch_to_task`] for more details.
     switched_to_cpu: AtomicBool,
+
+    /// Whether the task has exited, like `TASK_DEAD` in Linux.
+    ///
+    /// A wakeup holds this lock while enqueuing the task, like `pi_lock` in Linux, so that a
+    /// wakeup racing with the exit either finishes before the task is marked dead or sees the mark
+    /// and does nothing. See [`scheduler::unpark_target`] and [`scheduler::exit_current`].
+    is_dead: SpinLock<bool, LocalIrqDisabled>,
 
     schedule_info: TaskScheduleInfo,
 }
@@ -256,6 +264,7 @@ impl TaskOptions {
             ctx: SyncUnsafeCell::new(ctx),
             kstack,
             switched_to_cpu: AtomicBool::new(false),
+            is_dead: SpinLock::new(false),
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },

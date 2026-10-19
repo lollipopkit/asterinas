@@ -239,12 +239,14 @@ impl Pause for WaitQueue {
             return Ok(res);
         }
 
-        let (waiter, _) = Waiter::new_pair();
+        let (waiter, waker) = Waiter::new_pair();
         let cond = || {
-            self.enqueue(waiter.waker());
+            self.enqueue(waker.clone());
             cond()
         };
-        waiter.pause_until_or_timeout_impl(cond, timeout, reason)
+        let res = waiter.pause_until_or_timeout_impl(cond, timeout, reason);
+        self.dequeue(&waker);
+        res
     }
 
     fn pause_timeout(&self, _timeout: &TimeoutExt<'_>) -> Result<()> {

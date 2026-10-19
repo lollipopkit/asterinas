@@ -235,11 +235,13 @@ impl WaitTimeout for WaitQueue {
             return Ok(res);
         }
 
-        let (waiter, _) = Waiter::new_pair();
+        let (waiter, waker) = Waiter::new_pair();
         let cond = || {
-            self.enqueue(waiter.waker());
+            self.enqueue(waker.clone());
             cond()
         };
-        waiter.wait_until_or_timeout_cancelled(cond, cancel_cond, timeout)
+        let res = waiter.wait_until_or_timeout_cancelled(cond, cancel_cond, timeout);
+        self.dequeue(&waker);
+        res
     }
 }

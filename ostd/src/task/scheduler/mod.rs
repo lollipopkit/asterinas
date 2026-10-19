@@ -486,8 +486,19 @@ where
 }
 
 /// Unblocks a target task.
-pub(crate) fn unpark_target(runnable: Arc<Task>) {
-    let preempt_cpu = scheduler_singleton().enqueue(runnable, EnqueueFlags::Wake);
+///
+/// This does nothing if the task has exited. A waker may still hold the task after the waiter has
+/// consumed the wakeup and exited, so the scheduler must not see the enqueue, like
+/// `try_to_wake_up` in Linux skipping a `TASK_DEAD` task under `pi_lock`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/sched/core.c#L4275>
+pub(crate) fn unpark_target(runnable: &Arc<Task>) {
+    let is_dead = runnable.is_dead.lock();
+    if *is_dead {
+        return;
+    }
+    let preempt_cpu = scheduler_singleton().enqueue(runnable.clone(), EnqueueFlags::Wake);
+    drop(is_dead);
     if let Some(preempt_cpu_id) = preempt_cpu {
         set_need_preempt(preempt_cpu_id);
     }
@@ -523,6 +534,14 @@ fn set_need_preempt(cpu_id: CpuId) {
 /// This should only be called if the current is to exit.
 #[track_caller]
 pub(super) fn exit_current() -> ! {
+    // Mark the task dead while it is still the current task, like `do_task_dead` in Linux. Any
+    // wakeup that has enqueued the task before this point has found it running and done nothing,
+    // and any later wakeup sees the mark, so the task is never enqueued again after it is dequeued
+    // below.
+    //
+    // Reference: <https://elixir.bootlin.com/linux/v7.2.10/source/kernel/sched/core.c#L7290>
+    *Task::current().unwrap().is_dead.lock() = true;
+
     let mut is_first_try = true;
 
     reschedule(|local_rq: &mut dyn LocalRunQueue| {
@@ -616,4 +635,36 @@ enum ReschedAction {
     Retry,
     /// Switch to target task.
     SwitchTo(Arc<Task>),
+}
+
+#[cfg(ktest)]
+mod test {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::task::TaskOptions;
+
+    #[ktest]
+    fn exited_task_is_not_woken() {
+        let has_returned = Arc::new(AtomicBool::new(false));
+        let has_returned_cloned = has_returned.clone();
+        let task = TaskOptions::new(move || has_returned_cloned.store(true, Ordering::Release))
+            .data(())
+            .spawn()
+            .unwrap();
+
+        // Wait until `exit_current` has dequeued the task.
+        while !has_returned.load(Ordering::Acquire) || task.schedule_info().cpu.get().is_some() {
+            Task::yield_now();
+        }
+
+        // A waker may finish waking the task after the task has consumed the wakeup and exited.
+        unpark_target(&task);
+        assert!(task.schedule_info().cpu.get().is_none());
+
+        // Let the task run if it was enqueued by mistake, which would panic in `exit_current`.
+        for _ in 0..100 {
+            Task::yield_now();
+        }
+    }
 }
